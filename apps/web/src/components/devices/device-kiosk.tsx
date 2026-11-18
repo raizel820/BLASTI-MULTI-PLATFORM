@@ -8,6 +8,13 @@ import { isRTL } from '@/i18n';
 import { motion, AnimatePresence } from 'framer-motion';
 import { DeviceQrScanner } from './device-qr-scanner';
 import { quickDiscover, type DiscoveredServer } from '@/lib/lan-discovery';
+// 0.6.86 — kiosk LAN base pinning + branch-code → desktop resolution.
+import {
+  setKioskLanBase,
+  getKioskLanBase,
+  resolveBranchLanServer,
+  pinKioskLanBaseFromIp,
+} from '@/lib/kiosk-lan-base';
 import { apiFetch } from '@/lib/api-fetch';
 import { APP_VERSION } from '@/lib/version';
 import { getLocalIp } from '@/lib/get-local-ip';
@@ -174,6 +181,12 @@ export function DeviceKiosk() {
         const server = await quickDiscover();
         if (mounted && server) {
           setLanServer(server);
+          // 0.6.86 — ROOT FIX (store mismatch): pin the device API base to the
+          // discovered desktop so register/pair/heartbeat hit the SAME local
+          // store the desktop Device Manager polls. Without this, production
+          // kiosks kept the baked cloud base and paired against the CLOUD
+          // while the manager watched the LOCAL db — both sides waited forever.
+          setKioskLanBase(`http://${server.ip}:${server.apiPort || server.port || 3080}`);
           console.log(`[Kiosk] Auto-connected to LAN server: ${server.hostname} (${server.ip})`);
         }
       } catch (err) {
@@ -724,13 +737,54 @@ export function DeviceKiosk() {
   };
 
   // ─── Code Submit ───────────────────────────────────────────
-  const handleCodeSubmit = () => {
-    if (agencyCode.trim()) {
-      setRetryCount(0);
-      setShowContactAdmin(false);
-      if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
-      fetchAgency(agencyCode.trim());
+  // 0.6.86 — "connect by branch code" now ACTUALLY connects the kiosk to the
+  // desktop: the entered code is resolved via the cloud lan-topology
+  // registry (the desktop reports its LAN IP there every 30s) and the first
+  // reachable host is pinned as the device API base BEFORE the agency
+  // lookup, so the registration lands in the desktop's local store (the
+  // store the manager's approval strip watches). A bare IPv4 in the same
+  // field connects directly ("192.168.1.10" or "192.168.1.10:3080").
+  const handleCodeSubmit = async () => {
+    const code = agencyCode.trim();
+    if (!code) return;
+    setRetryCount(0);
+    setShowContactAdmin(false);
+    setError(null);
+    if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
+    // Direct desktop IP entry (field accepts "192.168.x.x[:3080]").
+    if (/^\d{1,3}(\.\d{1,3}){3}(:\d{1,5})?$/.test(code)) {
+      setLoading(true);
+      const pinned = await pinKioskLanBaseFromIp(code);
+      setLoading(false);
+      if (pinned) {
+        toast.success(t('kioskPinnedToDesktop') || 'Connected to the desktop on this network');
+        setLanServer(null);
+      } else {
+        toast.error(t('kioskDesktopUnreachable') || 'No BLASTI desktop answered at that address — check the IP and that the desktop app is running');
+      }
+      return;
     }
+    // Branch-code cloud assist — only when no LAN server was discovered yet.
+    if (!lanServer && !getKioskLanBase()) {
+      setLoading(true);
+      const resolved = await resolveBranchLanServer(code);
+      if (resolved.server) {
+        setKioskLanBase(`http://${resolved.server.ip}:${resolved.server.port}`);
+        setLanServer({
+          service: 'blasti-local', version: '', name: resolved.server.name || 'BLASTI Desktop',
+          hostname: resolved.server.hostname || resolved.server.name || 'BLASTI Desktop',
+          ip: resolved.server.ip, port: resolved.server.port, apiPort: resolved.server.port,
+          webPort: 0, platform: '', uptime: 0,
+        });
+        toast.success(t('kioskPinnedToDesktop') || 'Connected to the desktop on this network');
+      } else if (resolved.hosts.length > 0) {
+        setLoading(false);
+        toast.error(t('kioskDesktopUnreachable') || 'The branch desktop is registered but unreachable from this device — make sure both are on the same Wi-Fi network and the desktop app is running');
+        return;
+      }
+      setLoading(false);
+    }
+    fetchAgency(code);
   };
 
   // ─── Discovery Login ───────────────────────────────────────

@@ -439,8 +439,10 @@ interface MethodSelectProps {
 export function KioskMethodSelect({
   t,
   pageVariants,
+  onSelectCode,
   onSelectCredentials,
   onSelectDiscovery,
+  onSelectQr,
   discoveryLoading = false,
   discoveryError = null,
 }: MethodSelectProps) {
@@ -489,6 +491,38 @@ export function KioskMethodSelect({
                   <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5 line-clamp-1">{t('kioskMethodCredDesc')}</p>
                 </div>
                 <ArrowLeft className="h-5 w-5 text-violet-300 group-hover:text-violet-500 flex-shrink-0 -rotate-180" />
+              </div>
+            </motion.button>
+
+            {/* Divider */}
+            <div className="flex items-center gap-3 py-0.5">
+              <div className="flex-1 h-px bg-gray-200" />
+              <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{t('kioskOr') || 'OR'}</span>
+              <div className="flex-1 h-px bg-gray-200" />
+            </div>
+
+            {/* 0.6.86 — Option 3: Branch code (FIXED: the props were declared
+                but never destructured, so this screen was UNREACHABLE and
+                "connecting by branch code" never worked from the landing
+                page). Routes to the agency/branch code + desktop IP entry. */}
+            <motion.button
+              initial={{ opacity: 0, x: 30 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.1, duration: 0.3 }}
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+              onClick={onSelectCode}
+              className="w-full p-3.5 rounded-2xl border-2 border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-start transition-colors group"
+            >
+              <div className="flex items-center gap-3">
+                <div className="h-11 w-11 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-md shadow-emerald-200 flex-shrink-0">
+                  <Building2 className="h-6 w-6 text-white" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="font-bold text-emerald-700 text-base">{t('kioskMethodCodeTitle')}</p>
+                  <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5 line-clamp-1">{t('kioskMethodCodeDesc')}</p>
+                </div>
+                <ArrowLeft className="h-5 w-5 text-emerald-300 group-hover:text-emerald-500 flex-shrink-0 -rotate-180" />
               </div>
             </motion.button>
 

@@ -769,6 +769,7 @@ async function pingSweep(
   for (let i = 1; i <= 254; i++) ips.push(`${subnet}.${i}`)
 
   const alive = []
+  const ttlByIp = new Map() // 0.6.86 — IP → TTL of the reply (OS fingerprint)
   const queue = [...ips]
 
   async function worker() {
@@ -776,18 +777,28 @@ async function pingSweep(
       if (isAborted()) return
       const ip = queue.shift()
       if (!ip) break
-      const ok = await pingHost(ip, timeoutMs)
-      if (ok) alive.push(ip)
+      const res = await pingHost(ip, timeoutMs)
+      if (res.ok) {
+        alive.push(ip)
+        if (res.ttl != null) ttlByIp.set(ip, res.ttl)
+      }
       onProgress()
     }
   }
 
   const workers = Array.from({ length: concurrency }, () => worker())
   await Promise.all(workers)
+  // 0.6.86 — array form kept for backwards compatibility; the TTL map rides
+  // along as a second key on the array (non-enumerable for JSON/print safety).
+  alive.ttlByIp = ttlByIp
   return alive
 }
 
-/** Ping a single host. Returns true if it responds within timeoutMs. */
+/**
+ * Ping a single host. Returns `{ ok, ttl }` — ttl is the reply's TTL value
+ * parsed from the ping output when available (0.6.86 OS fingerprint:
+ * 65-128 → Windows host, ≤64 → Unix-like, >128 → network gear / Apple).
+ */
 function pingHost(ip, timeoutMs = PING_TIMEOUT_MS) {
   return new Promise((resolve) => {
     // Cross-platform ping flags
@@ -803,11 +814,20 @@ function pingHost(ip, timeoutMs = PING_TIMEOUT_MS) {
     }
     const child = spawn('ping', args, { timeout: timeoutMs + 500 })
     let settled = false
+    let stdout = ''
+    try { child.stdout?.on('data', (d) => { stdout += String(d) }) } catch { /* ignore */ }
     const done = (ok) => {
       if (settled) return
       settled = true
       try { child.kill() } catch { /* ignore */ }
-      resolve(ok)
+      // 0.6.86 — parse the reply TTL: Windows prints "TTL=128", iputils and
+      // macOS print "ttl=64". Parse case-insensitively from the first reply.
+      let ttl = null
+      try {
+        const m = stdout.match(/\bTTL[=: ]+(\d{1,3})/i)
+        if (m) ttl = parseInt(m[1], 10)
+      } catch { /* ignore */ }
+      resolve({ ok, ttl })
     }
     child.on('error', () => done(false))
     child.on('close', (code) => done(code === 0))
@@ -3110,6 +3130,31 @@ function classifyDeviceSignals(input) {
     return { category: 'NETWORK', type: 'PC', name }
   }
 
+  // ── 8b. Hostname keyword heuristics (0.6.86) ──
+  // Phones and PCs NAME themselves in DHCP option 12 / rDNS / NetBIOS even
+  // when no mDNS/UPnP advertisement exists — the #1 reason bare office hosts
+  // showed up as "IP only" in the Device Manager. DHCP hostname (Android
+  // sends its product name) > reverse-DNS > NetBIOS (Windows).
+  // Runs BEFORE the vendor-table fallbacks: a real hostname hint beats a
+  // generic OUI guess, but after the port/service evidence above.
+  {
+    const hostHint = (bestSecondaryName || '').toLowerCase()
+    if (hostHint) {
+      const phoneRe = /\b(iphone|ipad|ipod|android|galaxy|pixel|redmi|poco|xiaomi|huawei|honor|oppo|vivo|realme|oneplus|nokia|motog|infinix|tecno|smartphone|mobile)\b/
+      const pcRe = /\b(macbook|imac|mac-mini|macmini|desktop|laptop|notebook|thinkpad|ideapad|elitebook|probook|satellite|pc)\b/
+      const printerRe = /\b(printer|laserjet|pixma|inkjet|deskjet|officejet|epson|brother|ricoh|kyocera|xerox)\b/
+      if (printerRe.test(hostHint)) {
+        return { category: 'NETWORK', type: 'PRINTER', name: bestSecondaryName }
+      }
+      if (phoneRe.test(hostHint)) {
+        return { category: 'NETWORK', type: 'PHONE', name: bestSecondaryName }
+      }
+      if (pcRe.test(hostHint)) {
+        return { category: 'NETWORK', type: 'PC', name: bestSecondaryName }
+      }
+    }
+  }
+
   // ── 9. MAC OUI vendor hint — strong signal for bare ARP entries ──
   // If we have a reverse-DNS or NetBIOS hostname, prefer it over the
   // generic "Vendor Type" label — the hostname is the device's actual name.
@@ -3181,6 +3226,21 @@ function classifyDeviceSignals(input) {
       category: 'NETWORK',
       type: 'PHONE',
       name: bestSecondaryName || `Mobile Device @ ${input.ip}`,
+    }
+  }
+
+  // 0.6.86 — ICMP TTL OS fingerprint (the classic passive technique):
+  //   65-128 → Windows host (default TTL 128; Linux/BSD/Android/iOS ship 64)
+  //   129-255 → network gear / Apple (TTL 255) — too ambiguous to type
+  //   ≤64 with no other evidence stays UNKNOWN (could be phone/IoT/Linux PC)
+  // Only applied when NO other signal exists — any richer evidence above
+  // already classified the device.
+  const pingTtl = Number(input.pingTtl)
+  if (Number.isFinite(pingTtl) && pingTtl >= 65 && pingTtl <= 128) {
+    return {
+      category: 'NETWORK',
+      type: 'PC',
+      name: bestSecondaryName || `Computer @ ${input.ip}`,
     }
   }
 
@@ -3343,6 +3403,7 @@ async function runDiscoveryScan(
         tcpServices: merged.tcpServices,
         blastiMode: merged.blastiMode,
         wsdType: merged.wsdType,
+        pingTtl: merged.pingTtl,
       })
       merged.category = fp.category
       merged.type = fp.type
@@ -3395,6 +3456,8 @@ async function runDiscoveryScan(
         appVersion: patch.appVersion,
         blastiInfo: patch.blastiInfo,
         wsdType: patch.wsdType,
+        // 0.6.86 — ICMP reply TTL (OS fingerprint source for classification)
+        pingTtl: patch.pingTtl,
       }
       // Re-fingerprint using the raw friendlyName, not the display name.
       const fp = fingerprintDevice({
@@ -3409,6 +3472,7 @@ async function runDiscoveryScan(
         tcpServices: device.tcpServices,
         blastiMode: device.blastiMode,
         wsdType: device.wsdType,
+        pingTtl: device.pingTtl,
       })
       device.category = fp.category
       device.type = fp.type
@@ -3484,17 +3548,19 @@ async function runDiscoveryScan(
       let scannedLocal = 0
       for (const subnet of subnets) {
         if (cb.isAborted() || deadlineReached()) break
-        const alive = await pingSweep(subnet, {
+        const pingResult = await pingSweep(subnet, {
           isAborted: cb.isAborted,
           onProgress: () => {
             scannedLocal++
             if (scannedLocal % 16 === 0) emitProgress('ping', scannedLocal, subnet)
           },
         })
-        for (const ip of alive) {
+        // 0.6.86 — ride-along TTL map from the sweep (OS fingerprint source)
+        const ttlByIp = pingResult.ttlByIp || new Map()
+        for (const ip of pingResult) {
           // Task 2-b: skip the host's own IPs from the ping results
           if (selfIps.has(ip)) continue
-          upsertDevice(ip, { source: 'ping', capabilities: ['ICMP'] })
+          upsertDevice(ip, { source: 'ping', capabilities: ['ICMP'], pingTtl: ttlByIp.get(ip) })
         }
       }
       emitProgress('ping', totalIPs)

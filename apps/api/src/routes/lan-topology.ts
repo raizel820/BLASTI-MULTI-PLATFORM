@@ -12,6 +12,15 @@
  *   GET  /            — topology snapshot for the owner dashboard
  *   POST /preference  — owner/manager pins the master PC (instanceId | null)
  *   GET  /preference  — desktops poll this to learn the pin (any member)
+ *   GET  /resolve     — PUBLIC (0.6.86): kiosk/tablet resolves a branch code
+ *                       to the candidate LAN hosts (ip:port) reported by that
+ *                       agency's desktops. This is the CLOUD ASSIST for
+ *                       "kiosk cannot connect by branch code": the kiosk
+ *                       enters the branch code, gets the desktop's LAN IP
+ *                       here, probes it locally and pairs on the LAN store
+ *                       (same DB the desktop Device Manager reads) — no
+ *                       subnet sweep required (works across AP isolation,
+ *                       VLANs with inter-guest routing, or a missed sweep).
  */
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
@@ -28,6 +37,67 @@ const RETENTION_MS = 24 * 60 * 60 * 1000
 const MAX_JOINED_DEVICES = 50
 
 const ROLES = new Set(['CANDIDATE', 'FOLLOWER', 'MASTER'])
+
+// GET /lan-topology/resolve?code=XXX — PUBLIC branch-code → LAN host(s).
+// (0.6.86) The kiosk/tablet "connect by branch code" flow calls this on the
+// CLOUD api, then probes the returned hosts on the LAN (GET /api/discover →
+// service 'blasti-local') and registers/pairs against the FIRST live one —
+// which lands the device in the SAME local store the desktop manager polls.
+app.get('/resolve', async (c) => {
+  try {
+    const code = (c.req.query('code') || '').trim().toUpperCase()
+    if (!code) return c.json({ success: false, error: 'code is required' }, 400)
+    const agency = await db.agency.findUnique({
+      where: { customCode: code },
+      select: {
+        id: true, name: true, nameAr: true, nameFr: true, customCode: true,
+        isActive: true, isQueueOpen: true, logoUrl: true, category: true,
+      },
+    })
+    if (!agency || !agency.isActive) {
+      return c.json({ success: false, error: 'AGENCY_NOT_FOUND' }, 404)
+    }
+    // Reachable window: nodes that reported in the last 5 minutes (2× the
+    // online window — a desktop behind a flaky link is still worth probing).
+    const cutoff = new Date(Date.now() - 5 * 60 * 1000)
+    const nodes = await db.lanNode.findMany({
+      where: {
+        agencyId: agency.id,
+        ipAddress: { not: null },
+        lastReportAt: { gte: cutoff },
+      },
+      orderBy: [
+        { role: 'desc' },   // MASTER first, then FOLLOWER, CANDIDATE (desc alphabetical)
+        { lastReportAt: 'desc' },
+      ],
+      take: 8,
+      select: {
+        name: true, hostname: true, ipAddress: true, lanPort: true,
+        role: true, lastReportAt: true,
+      },
+    })
+    return c.json({
+      success: true,
+      agency: {
+        id: agency.id, name: agency.name, nameAr: agency.nameAr,
+        nameFr: agency.nameFr, customCode: agency.customCode,
+        isQueueOpen: agency.isQueueOpen, logoUrl: agency.logoUrl,
+        category: agency.category,
+      },
+      hosts: nodes.map((n: { name: string; hostname: string | null; ipAddress: string | null; lanPort: number; role: string; lastReportAt: Date }) => ({
+        ip: n.ipAddress,
+        port: n.lanPort,
+        name: n.name,
+        hostname: n.hostname,
+        role: n.role,
+        reportedAt: n.lastReportAt.toISOString(),
+      })),
+    })
+  } catch (error: unknown) {
+    console.error('[lan-topology/resolve] failed:', error)
+    return c.json({ success: false, error: 'Resolve failed' }, 500)
+  }
+})
 
 /** Owner of the agency, SUPER_ADMIN, or active staff of the agency. */
 async function canAccessAgency(user: { id: string; role: string }, agencyId: string): Promise<boolean> {

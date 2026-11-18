@@ -1723,6 +1723,8 @@ const fr: Record<TranslationKeys, string> = {
   kioskDiscoveryRegistering: 'Enregistrement de l\'appareil...',
   kioskDiscoveryPleaseWait: 'Veuillez patienter...',
   kioskMethodQrDesc: 'Scannez un code QR pour obtenir un ticket',
+  kioskPinnedToDesktop: 'Connecté au bureau BLASTI sur ce réseau',
+  kioskDesktopUnreachable: "Le bureau de l'agence est enregistré mais inaccessible depuis cet appareil — assurez-vous que les deux sont sur le même réseau Wi-Fi et que l'application de bureau fonctionne",
   kioskCredLoginTitle: 'Connexion par identifiants',
   kioskCredLoginDesc: "Entrez le code d'association et le jeton d'appareil",
   kioskCredLoggingIn: 'Connexion en cours...',

@@ -765,6 +765,92 @@ const BEACON_INTERVAL_MS = 3000;
 let beaconSocket = null;
 let beaconInterval = null;
 
+// ─── Windows Firewall self-heal (0.6.86) ────────────────────────────────────
+// LAN mode binds 0.0.0.0:3080 and broadcasts UDP :3081, but Windows Defender
+// Firewall blocks INBOUND connections by default — kiosks, tablets, print
+// clients and peer desktops got connection-refused/timeout even though the
+// local API was perfectly healthy. That single block was behind most of the
+// "kiosk cannot connect via discovery OR branch code", "no printer can be
+// linked" and "computers cannot be linked for multi-window" reports. The
+// NSIS installer adds a program rule when it runs elevated; this runtime
+// pass catches per-user installs (no elevation) with ONE opt-in prompt.
+const FIREWALL_RULE_NAME = 'BLASTI Desktop (LAN)';
+let firewallCheckDone = false;
+
+function ensureWindowsFirewallRules() {
+  if (process.platform !== 'win32' || firewallCheckDone) return;
+  firewallCheckDone = true;
+  const exePath = String(process.execPath || '');
+  // Never firewall-touch the unpackaged electron binary in dev.
+  if (!exePath || /electron\.exe$/i.test(exePath)) return;
+
+  const { execFile, spawn } = require('child_process');
+  const runNetsh = (args, timeoutMs = 8000) => new Promise((resolve) => {
+    try {
+      execFile('netsh', args, { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+        resolve({ err, stdout: String(stdout || '') });
+      });
+    } catch (e) { resolve({ err: e, stdout: '' }); }
+  });
+
+  (async () => {
+    try {
+      // 1) Rule already present? (elevated installer path or a previous run)
+      const probe = await runNetsh(['advfirewall', 'firewall', 'show', 'rule', `name=${FIREWALL_RULE_NAME}`]);
+      if (!probe.err && /Rule Name:/i.test(probe.stdout)) {
+        console.log('[BLASTI Desktop] Windows firewall rule already present — LAN inbound allowed');
+        return;
+      }
+      // 2) Silent add (works when this process already runs elevated).
+      const added = await runNetsh(['advfirewall', 'firewall', 'add', 'rule', `name=${FIREWALL_RULE_NAME}`,
+        'dir=in', 'action=allow', `program=${exePath}`, 'enable=yes', 'profile=any']);
+      if (!added.err && /Ok\./i.test(added.stdout)) {
+        console.log('[BLASTI Desktop] Windows firewall rule added silently (elevated context)');
+        return;
+      }
+      // 3) Non-elevated → ONE opt-in dialog, then an elevated batch add.
+      //    The command goes through a temp .cmd file to avoid nested-quote
+      //    loss between Start-Process ArgumentList and the spaced exe path.
+      const { dialog } = require('electron');
+      const wantsIt = await dialog.showMessageBox({
+        type: 'question',
+        buttons: ['Yes', 'No'],
+        defaultId: 0,
+        cancelId: 1,
+        title: 'BLASTI — device connections',
+        message: 'Allow other devices on this network to connect to BLASTI?',
+        detail: 'Kiosk tablets, printers and linked BLASTI computers need inbound access to this PC (local API port 3080 + discovery beacon 3081). Windows may ask for an administrator approval once.',
+      });
+      if (wantsIt.response !== 0) {
+        console.log('[BLASTI Desktop] Firewall rule declined by the user — LAN devices may stay unreachable');
+        return;
+      }
+      const os = require('os');
+      const fs = require('fs');
+      const path = require('path');
+      const scriptPath = path.join(os.tmpdir(), 'blasti-firewall.cmd');
+      fs.writeFileSync(scriptPath,
+        `@echo off\r\nnetsh advfirewall firewall add rule name="${FIREWALL_RULE_NAME}" dir=in action=allow program="${exePath}" enable=yes profile=any\r\n`,
+        'utf8');
+      spawn('powershell.exe', ['-NoProfile', '-Command',
+        `Start-Process -FilePath '${scriptPath}' -Verb RunAs -WindowStyle Hidden`],
+        { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      console.log('[BLASTI Desktop] Elevated firewall rule add requested (UAC)');
+      // Verify once after a grace period — purely informational.
+      setTimeout(async () => {
+        try {
+          const recheck = await runNetsh(['advfirewall', 'firewall', 'show', 'rule', `name=${FIREWALL_RULE_NAME}`]);
+          console.log(recheck.err || !/Rule Name:/i.test(recheck.stdout)
+            ? '[BLASTI Desktop] Firewall rule still absent after elevation attempt'
+            : '[BLASTI Desktop] Firewall rule confirmed — LAN devices can now connect');
+        } catch { /* non-fatal */ }
+      }, 15000);
+    } catch (err) {
+      console.warn('[BLASTI Desktop] Firewall self-heal failed (non-fatal):', err && err.message);
+    }
+  })();
+}
+
 /** Build the beacon payload (mirrors the /api/discover beacon identity). */
 function buildBeaconPayload() {
   // R-21F: merge the offline-authority fields (role/term/specScore/instance/
@@ -810,6 +896,8 @@ function startLanBeacon() {
     console.log('[BLASTI Desktop] Discovery beacon not started (loopback bind — kiosks cannot reach this host)');
     return;
   }
+  // 0.6.86 — make sure Windows actually LETS other devices reach this host.
+  ensureWindowsFirewallRules();
   try {
     const dgram = require('dgram');
     beaconSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
@@ -3813,6 +3901,15 @@ ipcMain.handle('get-printers', async () => {
 // SPA mounts the in-app payment-result view and settles via settle_push /
 // verify_poll. Navigation is allowlisted to the gateway + the cloud origin;
 // anything else is handed to the system browser.
+// 0.6.86 — ROOT FIX for "one page in the browser + one broken in-app page":
+// cloudOrigin was computed from PROD_URL (http://127.0.0.1:3080 — the LOCAL
+// api), so the real cloud result redirect (https://blastidz.online/#/…)
+// never matched `isCloud`. Every return fell into `shell.openExternal`
+// (browser tab #1) while the window ALSO navigated there itself, rendering
+// the foreign result page sessionless and unstyled (page #2). The origin now
+// comes from CLOUD_BASE_URL — the exact origin the renderer sends as
+// returnUrl — and the result redirect is INTERCEPTED in will-navigate
+// (prevented, never rendered) and converted into the blasti:// deep link.
 let paymentWindow = null;
 
 function closePaymentWindow() {
@@ -3827,10 +3924,23 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
     if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
       return { ok: false, error: 'Invalid payment URL' };
     }
-    let cloudOrigin = 'https://blastidz.online';
-    try {
-      cloudOrigin = new URL(PROD_URL || process.env.NEXTAUTH_URL || cloudOrigin).origin;
-    } catch { /* keep default */ }
+    // 0.6.86 — cloudOrigin MUST be the CLOUD the renderer will be returned
+    // to (returnUrl is built from electronAPI.cloudBaseUrl === CLOUD_BASE_URL
+    // in the web app). PROD_URL is the LOCAL api origin and must never be
+    // used here — that mismatch was the double-gateway-page root cause.
+    const cloudOrigins = new Set();
+    const addCloudOrigin = (candidate) => {
+      try {
+        if (candidate && /^https?:\/\//i.test(String(candidate))) {
+          cloudOrigins.add(new URL(String(candidate)).origin);
+        }
+      } catch { /* ignore malformed */ }
+    };
+    addCloudOrigin(CLOUD_BASE_URL);
+    addCloudOrigin(process.env.NEXTAUTH_URL);
+    addCloudOrigin('https://blastidz.online');
+    if (cloudOrigins.size === 0) cloudOrigins.add('https://blastidz.online');
+    const isCloudOrigin = (origin) => cloudOrigins.has(origin);
 
     // One payment at a time — a new checkout replaces the previous window.
     closePaymentWindow();
@@ -3878,10 +3988,11 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
         }
         const target = new URL(u);
         const isGateway = /^https:\/\/([a-z0-9-]+\.)+chargily\.(net|com)([/:?#]|$)/i.test(u);
-        const isCloud = target.origin === cloudOrigin;
+        const isCloud = isCloudOrigin(target.origin);
         if (!isGateway && !isCloud) {
-          // Unexpected target — hand it to the system browser, stay here.
-          shell.openExternal(u);
+          // Unexpected target — hand it to the system browser (deduped),
+          // never render it here.
+          openExternalOnce(u);
           return;
         }
         if (isCloud && (target.hash || '').startsWith('#/payment/result')) {
@@ -3899,16 +4010,29 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
     paymentWindow.webContents.on('did-navigate', (_e, u) => inspectNavigation(u));
     paymentWindow.webContents.on('did-navigate-in-page', (_e, u) => inspectNavigation(u));
     paymentWindow.webContents.on('will-navigate', (event, u) => {
-      // Block protocol/foreign navigations INSIDE this window outright —
-      // the inspectors above have already handled the result signals.
+      // 0.6.86 — the payment window renders ONLY the hosted gateway pages.
+      // Everything else is intercepted BEFORE it can paint: blasti:// bounces
+      // are swallowed (already handled above), and the cloud RESULT redirect
+      // is prevented + converted into the deep link. This is what kills the
+      // "second, broken, unstyled in-app payment page" for good.
       try {
-        if (u && u.toLowerCase().startsWith('blasti://')) event.preventDefault();
+        const low = typeof u === 'string' ? u.toLowerCase() : '';
+        if (low.startsWith('blasti://')) {
+          event.preventDefault();
+          inspectNavigation(u);
+          return;
+        }
+        const isGateway = /^https:\/\/([a-z0-9-]+\.)+chargily\.(net|com)([/:?#]|$)/i.test(u);
+        if (!isGateway) {
+          event.preventDefault();
+          inspectNavigation(u);
+        }
       } catch { /* ignore */ }
     });
     paymentWindow.webContents.setWindowOpenHandler(({ url: childUrl }) => {
-      // Popups from the hosted page go to the system browser, never replace
-      // the payment window.
-      try { shell.openExternal(childUrl); } catch { /* ignore */ }
+      // Popups from the hosted page go to the system browser (deduped), never
+      // replace the payment window.
+      try { openExternalOnce(childUrl); } catch { /* ignore */ }
       return { action: 'deny' };
     });
     paymentWindow.once('ready-to-show', () => {

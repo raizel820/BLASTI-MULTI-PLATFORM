@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { readSessionToken } from '@/lib/auth-storage';
 import { getDeviceId } from '@/lib/device-fingerprint';
+import { quickDiscover } from '@/lib/lan-discovery';
 import {
   clearLanAuthority,
   getLanAuthoritySnapshot,
@@ -213,7 +214,33 @@ export function useLanMode() {
       }
     }
 
-    // 3. Quick subnet scan (192.168.1.x and 192.168.0.x)
+    // 3. 0.6.86 — FULL subnet sweep via quickDiscover (WebRTC-derived subnets,
+    //    48-way concurrency, MASTER-ranked, cached). The historic hardcoded
+    //    16-IP probe list (192.168.1.{1,100,101,...}) missed most real
+    //    deployments — a master PC at 192.168.1.55 or on 10.0.0.x was NEVER
+    //    discovered, so follower desktops could not link for multi-counter
+    //    (multi-window) use. quickDiscover is the same sweep the kiosk uses.
+    const swept = await quickDiscover().catch(() => null);
+    if (swept) {
+      const found: LanServerInfo = {
+        ip: swept.ip,
+        port: swept.apiPort || swept.port || 3080,
+        hostname: swept.hostname,
+        role: swept.role,
+        term: swept.term,
+        specScore: swept.specScore,
+        instanceId: swept.instanceId,
+        lanAuthority: swept.lanAuthority === true,
+      };
+      setGlobalLanServer(found);
+      // A lanAuthority beacon triggers the follower join flow (multi-window).
+      void attemptLanAuthorityJoin(found);
+      setIsDiscovering(false);
+      return found;
+    }
+
+    // 4. Legacy fallback — quickDiscover failed (WebRTC blocked, odd subnet):
+    //    probe the common ranges directly.
     const subnets = ['192.168.1', '192.168.0'];
     const promises: Promise<LanServerInfo | null>[] = [];
 

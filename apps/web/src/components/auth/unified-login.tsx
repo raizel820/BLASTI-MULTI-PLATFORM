@@ -76,6 +76,7 @@ import { MobileDiagnosticsSheet } from '@/components/shared/mobile-diagnostics-s
 import {
   ArrowLeft, ArrowRight, Loader2, Eye, EyeOff, CheckCircle2, KeyRound,
   Users, CloudOff, MonitorPlay, MonitorSmartphone, ShieldCheck, Fingerprint, LifeBuoy, Building2,
+  Monitor,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -134,6 +135,7 @@ const MOBILE_COPY = {
     signingIn: 'جارٍ تسجيل الدخول…',
     showPassword: 'إظهار كلمة المرور',
     hidePassword: 'إخفاء كلمة المرور',
+    kioskMode: 'وضع الكشك',
   },
   en: {
     welcomeSub: 'Sign in to continue to your account',
@@ -149,6 +151,7 @@ const MOBILE_COPY = {
     signingIn: 'Signing in…',
     showPassword: 'Show password',
     hidePassword: 'Hide password',
+    kioskMode: 'Kiosk mode',
   },
 } as const
 
@@ -668,6 +671,22 @@ export function UnifiedLoginForm() {
       {submitButton(size)}
       {biometricButton(size)}
       <div className="text-center">{registerLink(size === 'touch')}</div>
+      {/* 0.6.86 — KIOSK MODE ENTRY (mobile/tablet): phones and tablets run the
+          SAME kiosk shell as a dedicated tablet — discover the branch desktop,
+          pair with the device manager and serve the queue. Native shells only
+          (the web app's landing page has the dedicated device URLs). */}
+      {mode === 'native' && (
+        <button
+          type="button"
+          onClick={() => { window.location.href = '/?mode=device&type=KIOSK' }}
+          className={`w-full flex items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50/70 text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-950/50 transition-colors font-semibold ${
+            size === 'touch' ? 'min-h-[48px] text-sm' : 'min-h-[44px] text-sm'
+          }`}
+        >
+          <Monitor className="h-4 w-4" />
+          {m.kioskMode || 'Kiosk mode'}
+        </button>
+      )}
     </form>
   )
 

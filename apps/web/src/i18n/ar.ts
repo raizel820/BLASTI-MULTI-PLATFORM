@@ -1735,6 +1735,8 @@ const ar = {
   kioskDiscoveryRegistering: 'جاري تسجيل الجهاز...',
   kioskDiscoveryPleaseWait: 'يرجى الانتظار...',
   kioskMethodQrDesc: 'امسح رمز QR للحصول على تذكرة',
+  kioskPinnedToDesktop: 'تم الاتصال بتطبيق BLASTI المكتبي على هذه الشبكة',
+  kioskDesktopUnreachable: 'حاسوب الفرع مسجل لكنه غير قابل للوصول من هذا الجهاز — تأكد من أن الجهازين على نفس شبكة الواي فاي وأن تطبيق سطح المكتب يعمل',
   kioskCredLoginTitle: 'تسجيل الدخول بالبيانات',
   kioskCredLoginDesc: 'أدخل رمز الربط ورمز الجهاز من مدير الوكالة',
   kioskCredLoggingIn: 'جاري الاتصال...',

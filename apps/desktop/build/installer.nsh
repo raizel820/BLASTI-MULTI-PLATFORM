@@ -82,6 +82,31 @@
     WriteRegStr HKCU "Software\Classes\blasti\DefaultIcon" "" "$INSTDIR\BLASTI.exe,0"
     WriteRegStr HKCU "Software\Classes\blasti\shell\open\command" "" '"$INSTDIR\BLASTI.exe" "%1"'
   blasti_reg_done:
+  ; ── 0.6.86 — Windows Firewall inbound rule (LAN device connectivity) ─────
+  ; Kiosks, tablets, printers and peer BLASTI desktops must be able to reach
+  ; this PC's local API (:3080) and hear the discovery beacon (:3081).
+  ; Windows Defender Firewall blocks inbound for unsigned apps by default —
+  ; this ONE program rule (all profiles, TCP+UDP for blasti.exe) removes the
+  ; "kiosk cannot connect / no printer can be linked / computers cannot be
+  ; linked" failure class. Non-fatal when the installer runs per-user
+  ; without elevation: the app re-attempts at first LAN boot with a single
+  ; opt-in prompt (main.js ensureWindowsFirewallRules).
+  DetailPrint "Adding Windows Firewall rule for LAN device connections…"
+  nsExec::ExecToStack 'netsh advfirewall firewall show rule name="BLASTI Desktop (LAN)"'
+  Pop $R0
+  Pop $R1
+  IntCmpU $R0 0 0 blasti_fw_add blasti_fw_add
+  StrCmpS $R1 "" blasti_fw_add
+  Goto blasti_fw_done
+  blasti_fw_add:
+    IfFileExists "$INSTDIR\blasti.exe" 0 blasti_fw_upper
+      nsExec::ExecToLog 'netsh advfirewall firewall add rule name="BLASTI Desktop (LAN)" dir=in action=allow program="$INSTDIR\blasti.exe" enable=yes profile=any'
+      Pop $R0
+      Goto blasti_fw_done
+    blasti_fw_upper:
+      nsExec::ExecToLog 'netsh advfirewall firewall add rule name="BLASTI Desktop (LAN)" dir=in action=allow program="$INSTDIR\BLASTI.exe" enable=yes profile=any'
+      Pop $R0
+  blasti_fw_done:
 !macroend
 
 !macro customUnInstall
@@ -115,4 +140,10 @@
   ;    setAsDefaultProtocolClient writes the SAME keys, so deleting the key
   ;    root removes both registrations in one shot.
   DeleteRegKey HKCU "Software\Classes\blasti"
+
+  ; 8. 0.6.86 — remove the Windows Firewall inbound rule added at install
+  ;    (program rule for the uninstalled exe; non-fatal without elevation).
+  DetailPrint "Removing the Windows Firewall rule…"
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="BLASTI Desktop (LAN)"'
+  Pop $R0
 !macroend

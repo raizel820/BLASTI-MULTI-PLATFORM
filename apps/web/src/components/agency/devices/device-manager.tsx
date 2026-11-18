@@ -1366,14 +1366,28 @@ function DiscoveredCard({
           <span className="truncate" dir="ltr">
             {device.ip ? `${device.ip}${device.port ? `:${device.port}` : ''}` : (device.cupsName || 'USB')}
           </span>
-          {typeCfg && (
-            <span className={`rounded-full px-1.5 py-px text-[9px] ${typeCfg.color}`}>
-              {getLocalizedLabel(typeCfg, lang)}
+          {/* 0.6.86 — ALWAYS surface a type chip (even UNKNOWN) so every scan
+              result answers "is this a computer / phone / printer?". The
+              classifier now types bare hosts via TTL + hostname heuristics. */}
+          <span className={`rounded-full px-1.5 py-px text-[9px] ${typeCfg?.color ?? 'bg-muted text-muted-foreground'}`}>
+            {typeCfg
+              ? getLocalizedLabel(typeCfg, lang)
+              : getLocalizedString('جهاز', 'Appareil', 'Device', lang)}
+          </span>
+          {/* 0.6.86 — manufacturer/model line (HP · LaserJet M404 …) */}
+          {(device.manufacturer || device.model) && (
+            <span className="truncate max-w-[180px]" dir="ltr">
+              {device.manufacturer}{device.manufacturer && device.model ? ' · ' : ''}{device.model}
             </span>
           )}
           {isBlasti && device.blastiMode === 'kiosk' && (
             <span className="rounded-full bg-teal-100 text-teal-700 dark:bg-teal-950/40 dark:text-teal-400 px-1.5 py-px text-[9px]">
               {getLocalizedString('كيوسك', 'kiosque', 'kiosk', lang)}
+            </span>
+          )}
+          {isBlasti && device.blastiMode === 'desktop' && (
+            <span className="rounded-full bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-400 px-1.5 py-px text-[9px]">
+              {getLocalizedString('حاسوب', 'Bureau', 'Desktop', lang)}
             </span>
           )}
           {typeof confidence === 'number' && (

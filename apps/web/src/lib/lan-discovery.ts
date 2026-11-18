@@ -77,7 +77,11 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
 // 10 — the batch loop waited for the slowest IP of each wave (up to one full
 // timeout) before the next wave started, so a /24 took ~13s in the worst case.
 const SCAN_CONCURRENCY = 48; // Probe 48 IPs at once (32–64 recommended band)
-const SCAN_CAP = 128; // Max IPs scanned per subnet — bounds a full sweep
+// 0.6.86 — full /24 coverage: the old cap of 128 silently skipped .129-.254,
+// which is exactly where DHCP placed many desktops/kiosks — those peers were
+// UNDISCOVERABLE ("cannot link computers for multi-window use", "kiosk cannot
+// connect"). 254 hosts × 48-way pool × 800ms timeout bounds the sweep.
+const SCAN_CAP = 254; // Max IPs scanned per subnet — full /24
 const DEFAULT_API_PORT = parseInt(process.env.NEXT_PUBLIC_API_PORT || '3080', 10);
 
 // M27: single-sweep mutex — 0.6.75 restores the actual flag (the check

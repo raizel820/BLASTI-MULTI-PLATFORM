@@ -74,6 +74,14 @@ import {
   setCloudUnreachable,
 } from './lan-authority-client';
 
+// 0.6.86 — Kiosk LAN base override (leaf module — no import cycle):
+// a kiosk/tablet that discovered (or branch-code-resolved) a desktop LAN
+// server routes ALL device API calls to that desktop's local API instead of
+// the baked cloud base. Without it the kiosk registered in the CLOUD store
+// while the desktop Device Manager polled the LOCAL store — both sides
+// waited forever with no error (the "kiosk pairing never works" root).
+import { getKioskLanBase } from './kiosk-lan-base';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /** Configuration for the ApiClient instance. */
@@ -324,6 +332,17 @@ export function getApiBaseUrl(): string {
   // 127.0.0.1:3080 — it can never redirect data requests to the cloud).
   if (isElectronRuntime()) {
     return ELECTRON_LOCAL_API_BASE;
+  }
+
+  // ── 0.6.86: KIOSK LAN base override ──────────────────────────────────────
+  // Set by the kiosk when a desktop LAN server was discovered (HTTP sweep)
+  // or resolved from a branch code (cloud lan-topology resolve + beacon
+  // probe). Kept AFTER the Electron branch (inside the desktop webview the
+  // local API IS the manager's store — never repoint it) and BEFORE the
+  // Capacitor/web branches (those are the ones that bake the cloud base).
+  const kioskLanBase = getKioskLanBase();
+  if (kioskLanBase) {
+    return kioskLanBase;
   }
 
   // Native shell (Capacitor): need absolute URL to the cloud API backend.

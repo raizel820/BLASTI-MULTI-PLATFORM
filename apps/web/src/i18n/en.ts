@@ -1733,6 +1733,8 @@ const en: Record<TranslationKeys, string> = {
   kioskDiscoveryRegistering: 'Registering device...',
   kioskDiscoveryPleaseWait: 'Please wait...',
   kioskMethodQrDesc: 'Scan a QR code to claim a ticket',
+  kioskPinnedToDesktop: 'Connected to the BLASTI desktop on this network',
+  kioskDesktopUnreachable: 'The branch desktop is registered but unreachable from this device — make sure both are on the same Wi-Fi network and the desktop app is running',
   kioskCredLoginTitle: 'Login with Credentials',
   kioskCredLoginDesc: 'Enter the pairing code and device token from your agency admin',
   kioskCredLoggingIn: 'Connecting...',
