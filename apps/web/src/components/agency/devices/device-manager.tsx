@@ -23,6 +23,7 @@ import type { TranslationKeys } from '@/i18n';
 import { useAppStore } from '@/store/use-app-store';
 import { useRealtime } from '@/hooks/use-realtime';
 import { apiFetch } from '@/lib/api-fetch';
+import { getCloudApiBaseUrl } from '@/lib/api-client';
 import { unwrapListPayload } from '@/lib/list-payload';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -79,6 +80,9 @@ interface UnpairedDevice {
   screenLayout: ScreenLayout;
   lastHeartbeatAt?: string | null;
   createdAt: string;
+  // 0.6.95 — cloud-merged orphan (desktop split-brain fix): the pairing
+  // request for this device must go to the CLOUD API, not the local one.
+  cloudDevice?: boolean;
 }
 
 const EMPTY_FORM: DeviceFormState = {
@@ -685,14 +689,30 @@ export function DeviceManager() {
   const handleSendPairingRequest = async (deviceId: string) => {
     setBusyDeviceId(deviceId);
     try {
-      const res = await apiFetch(`${API_BASE}/${deviceId}/pairing-request`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-      const data = await res.json();
-      if (data.success) {
+      // 0.6.95 — cloud-merged orphans (id prefix `cloud-`) live in the CLOUD
+      // store: route their pairing request to the cloud API directly, since
+      // the desktop apiClient always targets the local :3080 base.
+      const isCloudDevice = deviceId.startsWith('cloud-');
+      let data: { success?: boolean; error?: string } | null = null;
+      if (isCloudDevice) {
+        const token = useAppStore.getState().sessionToken;
+        const cloudBase = getCloudApiBaseUrl().replace(/\/+$/, '');
+        const res = await fetch(`${cloudBase}/api/agency-devices/${encodeURIComponent(deviceId.slice('cloud-'.length))}/pairing-request`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: '{}',
+        });
+        data = await res.json().catch(() => null);
+      } else {
+        const res = await apiFetch(`${API_BASE}/${deviceId}/pairing-request`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+        data = await res.json();
+      }
+      if (data?.success) {
         toast.success(getLocalizedString('تم إرسال طلب الربط', 'Demande de jumelage envoyée', 'Pairing request sent', lang));
         setUnpairedDevices((prev) => prev.filter((d) => d.id !== deviceId));
         fetchDevices(true);
       } else {
-        toast.error(data.error || getLocalizedString('فشل إرسال الطلب', "Échec de l'envoi", 'Request failed', lang));
+        toast.error(data?.error || getLocalizedString('فشل إرسال الطلب', "Échec de l'envoi", 'Request failed', lang));
       }
     } catch {
       toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));

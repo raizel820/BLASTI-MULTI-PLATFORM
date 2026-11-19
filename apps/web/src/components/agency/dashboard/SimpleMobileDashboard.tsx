@@ -417,6 +417,14 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
     };
   }, [realtime, fetchData, playSound]);
 
+  // 0.6.95 — instant subscription activation: refetch when a payment settles
+  // so the subscription gate unlocks without waiting for the next poll.
+  useEffect(() => {
+    const onPaymentSettled = () => { fetchData(); };
+    window.addEventListener('blasti:payment-settled', onPaymentSettled);
+    return () => window.removeEventListener('blasti:payment-settled', onPaymentSettled);
+  }, [fetchData]);
+
   // ─── Actions ─────────────────────────────────────────────────────────
   const callNext = useCallback(async () => {
     if (actionLoading) return;

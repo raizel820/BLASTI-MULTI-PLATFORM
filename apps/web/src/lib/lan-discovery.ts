@@ -302,6 +302,42 @@ async function deriveCandidateSubnets(): Promise<string[]> {
 
 // ─── Main Discovery Function ────────────────────────────────────────────────
 
+/**
+ * 0.6.95 — topology-assisted probe. The deterministic shortcut the subnet
+ * sweep never had: the desktop box REPORTS its LAN IP to the cloud every 30s
+ * (lan-status-reporter → POST /api/lan-topology/report). When a signed-in
+ * caller (phone manager, follower desktop, browser) asks the cloud for the
+ * agency's LAN nodes, we get the exact host:port to probe — no sweep, no
+ * subnet guessing, no mDNS obfuscation impact. Best-effort on every failure
+ * (no session, offline, old local API without the route → empty list).
+ */
+async function probeTopologyServers(): Promise<DiscoveredServer | null> {
+  try {
+    const { apiFetch } = await import('./api-fetch');
+    const res = await apiFetch('/api/lan-topology', { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    const nodes: Array<{ ipAddress?: string | null; lanPort?: number | null; online?: boolean; role?: string | null; name?: string | null }> =
+      data?.nodes && Array.isArray(data.nodes) ? data.nodes : [];
+    const candidates = nodes
+      .filter((n) => n.online && typeof n.ipAddress === 'string' && n.ipAddress)
+      .map((n) => ({ ip: n.ipAddress as string, port: Number(n.lanPort) || DEFAULT_API_PORT, role: n.role || undefined, name: n.name || undefined }));
+    if (candidates.length === 0) return null;
+    const probes = await Promise.all(
+      candidates.slice(0, 6).map(async ({ ip, port }) => {
+        try {
+          const alive = await scanIP(ip, port);
+          return alive ? { alive, preferred: (alive.role || '').toUpperCase() === 'MASTER' } : null;
+        } catch { return null; }
+      }),
+    );
+    const hits = probes.filter((p): p is { alive: DiscoveredServer; preferred: boolean } => p !== null);
+    // MASTER first — same ranking idea as the sweep's lanAuthorityRank.
+    hits.sort((a, b) => Number(b.preferred) - Number(a.preferred));
+    return hits[0]?.alive ?? null;
+  } catch { /* no session / offline / unreachable — the sweep still runs */ return null; }
+}
+
 export async function quickDiscover(): Promise<DiscoveredServer | null> {
   // M27: Check isScanning mutex
   if (isScanning) return null;
@@ -335,15 +371,20 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
     })();
     const localhostTask = checkLocalhost();
     const gatewayTask = checkGatewayServers(derived);
+    // 0.6.95 — the topology probe joins the SAME parallel stage 1: when the
+    // desktop reported its LAN IP to the cloud, this finds it in one probe
+    // instead of waiting for the full sweep.
+    const topologyTask = probeTopologyServers();
 
-    const [cachedAlive, localhost, gateway] = await Promise.all([
+    const [cachedAlive, localhost, gateway, topologyHit] = await Promise.all([
       cacheTask,
       localhostTask,
       gatewayTask,
+      topologyTask,
     ]);
 
     // Strict precedence preserved from the sequential version:
-    // a live cached server > localhost > derived-subnet gateway.
+    // a live cached server > localhost > topology-reported desktop > derived-subnet gateway.
     if (cachedAlive) {
       try { logDevice('scan_completed', `LAN discovery found the cached desktop box at ${cachedAlive.ip}:${cachedAlive.apiPort || cachedAlive.port}`, { deviceName: cachedAlive.name || undefined, deviceType: cachedAlive.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
       return cachedAlive;
@@ -352,6 +393,11 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
       cacheServer(localhost); // M26: Cache localhost result
       try { logDevice('scan_completed', `LAN discovery found the local desktop at ${localhost.ip}:${localhost.apiPort || localhost.port}`, { deviceName: localhost.name || undefined, deviceType: localhost.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
       return localhost;
+    }
+    if (topologyHit) {
+      cacheServer(topologyHit); // M26: cache the topology-reported box too
+      try { logDevice('scan_completed', `LAN discovery found the topology-reported desktop at ${topologyHit.ip}:${topologyHit.apiPort || topologyHit.port}`, { deviceName: topologyHit.name || undefined, deviceType: topologyHit.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
+      return topologyHit;
     }
     if (gateway) {
       cacheServer(gateway); // M26: Cache gateway result

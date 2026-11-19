@@ -709,6 +709,16 @@ export function AgencyDashboard() {
     return () => window.removeEventListener('blasti:rate-limited', handler);
   }, [fetchData]);
 
+  // 0.6.95 — instant subscription activation: when a payment settles (the
+  // background watcher, the result view, or the realtime socket push), refetch
+  // immediately so queueLock / subscriptionStatus flip to ACTIVE without
+  // waiting for the next poll cycle.
+  useEffect(() => {
+    const onPaymentSettled = () => { fetchData(); };
+    window.addEventListener('blasti:payment-settled', onPaymentSettled);
+    return () => window.removeEventListener('blasti:payment-settled', onPaymentSettled);
+  }, [fetchData]);
+
   // ─── Track offline/online transitions for auto-refresh ──────────────
   useEffect(() => {
     if (!realtime.isConnected) {

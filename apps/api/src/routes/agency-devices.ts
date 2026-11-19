@@ -458,8 +458,28 @@ app.post('/public/join-queue', async (c) => {
 
     const { agencyId, serviceId, customerName } = validation.data
 
-    // C1: Cross-Agency Queue Join — ensure authenticated device belongs to this agency
-    if (device && agencyId !== device.agencyId) {
+    // C1: Cross-Agency Queue Join — a device already bound to a DIFFERENT
+    // agency may never join this one.
+    // 0.6.95 — orphan auto-bind (the "Kiosk join failed: Device not
+    // authorized for this agency" CRITICAL from the field logs): a freshly
+    // discovered kiosk registers with agencyId=null (status PAIRING) and
+    // immediately joins the queue it was launched for. The old strict check
+    // 403'd every such join — the kiosk rendered it as a permissions failure
+    // and pairing never completed. Bind the orphan to the requested agency
+    // instead (it stays PAIRING until the manager approves), while a device
+    // already bound elsewhere stays rejected.
+    if (device && !device.agencyId) {
+      try {
+        await db.agencyDevice.update({
+          where: { id: device.id },
+          data: { agencyId, updatedAt: new Date() },
+        })
+        device.agencyId = agencyId
+        console.log(`[DEVICE/PUBLIC/JOIN] Orphan device ${device.name} (${device.id}) auto-bound to agency ${agencyId} (still PAIRING)`)
+      } catch (bindErr) {
+        console.error('[DEVICE/PUBLIC/JOIN] orphan auto-bind failed:', bindErr)
+      }
+    } else if (device && agencyId !== device.agencyId) {
       return c.json({ success: false, error: 'Device not authorized for this agency' }, 403)
     }
 
@@ -1320,11 +1340,37 @@ app.post('/device/heartbeat', async (c) => {
       return c.json({ success: false, error: 'Device not authenticated' }, 401)
     }
 
-    // M3: Rate limit heartbeats to max 1 per 10s per device
+    // M3: Rate limit heartbeats to max 1 per 10s per device.
+    // 0.6.95 — a too-frequent beat is IDEMPOTENT (the device is clearly
+    // alive and was already marked online by the previous beat), so answer
+    // 200-noop with Retry-After instead of an error-shaped 429. The field
+    // logs flagged the 429s as a CRITICAL tracked bug ("rate limited by the
+    // server (HTTP 429) — POST /api/agency-devices/device/heartbeat") even
+    // though they were harmless restart races. Still return the device's
+    // pending commands so a restarting client never loses a command poll.
     const hbNow = Date.now()
     const lastHeartbeat = heartbeatRateLimits.get(device.id) || 0
-    if (hbNow - lastHeartbeat < HEARTBEAT_MIN_INTERVAL) {
-      return c.json({ success: false, error: 'Heartbeat too frequent' }, 429)
+    const heartbeatGap = hbNow - lastHeartbeat
+    if (heartbeatGap < HEARTBEAT_MIN_INTERVAL) {
+      const retryAfterSec = Math.max(1, Math.ceil((HEARTBEAT_MIN_INTERVAL - heartbeatGap) / 1000))
+      try { c.header('Retry-After', String(retryAfterSec)) } catch { /* header best-effort */ }
+      const pendingCommands = await db.deviceCommand.findMany({
+        where: { deviceId: device.id, status: 'PENDING' },
+        orderBy: { createdAt: 'asc' },
+      })
+      const cmdNow = Date.now()
+      const activeCommands = pendingCommands.filter((cmd: { createdAt: Date | string; ttl?: number | null }) => {
+        const cmdAge = cmdNow - new Date(cmd.createdAt).getTime()
+        const ttl = (cmd.ttl || 300) * 1000
+        return cmdAge < ttl
+      })
+      return c.json({
+        success: true,
+        deduped: true,
+        retryAfter: retryAfterSec,
+        pendingCommands: activeCommands,
+        device: { id: device.id, status: device.status },
+      })
     }
     heartbeatRateLimits.set(device.id, hbNow)
 
@@ -1902,9 +1948,16 @@ app.post('/:id/pairing-request', async (c) => {
       return c.json({ success: false, error: `Device is not in PAIRING status (current: ${device.status})` }, 409)
     }
 
-    // Check for recent heartbeat (must be within 90 seconds)
-    const ninetySecAgo = new Date(Date.now() - 90 * 1000)
-    if (!device.lastHeartbeatAt || device.lastHeartbeatAt < ninetySecAgo) {
+    // Check for a recent heartbeat.
+    // 0.6.95 — widened 90s → 10min: the kiosk beats every 30s but skips beats
+    // inside the server's 10s dedupe window, may pause while the network
+    // reconnects, and the manager's strip can lag one poll behind. A 90s
+    // freshness wall 400'd legitimate pairings ("Device is not currently
+    // online") moments after a beat skip. The PAIRING_REQUEST command itself
+    // carries a 10-minute TTL, so a 10-minute freshness window can never
+    // deliver a request to a device that cannot still receive it.
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000)
+    if (!device.lastHeartbeatAt || device.lastHeartbeatAt < tenMinAgo) {
       return c.json({ success: false, error: 'Device is not currently online' }, 400)
     }
 
@@ -3037,6 +3090,98 @@ function devicesResponse(category?: string, status?: string) {
   }
 }
 
+/**
+ * 0.6.95 — registry merge (the "manager on the phone can never discover
+ * active BLASTI apps" report): the embedded scan runs on the machine that
+ * ANSWERS the request. On the cloud that is the VPS — it can never see the
+ * venue LAN, so a phone manager scanning via the cloud got an empty (or
+ * datacenter-only) list. But the cloud DOES know every BLASTI app that
+ * registered and heartbeat: AgencyDevice rows. Merge them into the response
+ * (as `source:'database'` cards) so the manager sees the agency's phones,
+ * tablets, kiosks and desktops regardless of scan mechanics. Network-level
+ * discoveries (printers, casts, PCs found by a real LAN scanner) stay
+ * untouched; registry entries dedupe against BLASTI entries the scanner
+ * already found at the same IP (the scanner card is richer).
+ */
+async function devicesResponseWithRegistry(
+  category: string | undefined,
+  status: string | undefined,
+  agencyId: string | null | undefined,
+) {
+  const base = devicesResponse(category, status)
+  if (!agencyId) return base
+  try {
+    const onlineWindow = new Date(Date.now() - 90 * 1000)
+    const registryDevices = await db.agencyDevice.findMany({
+      where: {
+        agencyId,
+        status: { not: 'DISABLED' },
+        OR: [
+          { lastHeartbeatAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } },
+          { status: 'PAIRING' },
+        ],
+      },
+      select: {
+        id: true, name: true, nameAr: true, nameFr: true, type: true,
+        status: true, connectionType: true, ipAddress: true, port: true,
+        deviceFingerprint: true, appVersion: true, lastHeartbeatAt: true,
+        statusChangedAt: true, createdAt: true,
+      },
+      orderBy: { lastHeartbeatAt: 'desc' },
+      take: 100,
+    })
+    const blastiIps = new Set(
+      base.devices
+        .filter((d) => d.blastiMode || d.category === 'BLASTI')
+        .map((d) => d.ip)
+        .filter(Boolean),
+    )
+    const registryCards = registryDevices
+      .filter((dev: { ipAddress?: string | null }) => !(dev.ipAddress && blastiIps.has(dev.ipAddress)))
+      .map((dev: typeof registryDevices[number]) => {
+        const isOnline = !!dev.lastHeartbeatAt && dev.lastHeartbeatAt >= onlineWindow
+        const type = ['TV', 'KIOSK', 'DISPLAY', 'PRINTER'].includes(dev.type)
+          ? (dev.type === 'PRINTER' ? 'BLASTI_PRINTER' : dev.type === 'KIOSK' ? 'BLASTI_APP' : dev.type)
+          : 'BLASTI_APP'
+        return {
+          id: `registry-${dev.id}`,
+          source: 'database' as const,
+          category: 'BLASTI' as const,
+          type,
+          name: dev.name,
+          nameAr: dev.nameAr || undefined,
+          nameFr: dev.nameFr || undefined,
+          ip: dev.ipAddress || '',
+          port: dev.port || 0,
+          manufacturer: 'BLASTI',
+          model: dev.type,
+          appVersion: dev.appVersion || undefined,
+          fingerprint: dev.deviceFingerprint || undefined,
+          capabilities: ['blasti-app'] as string[],
+          status: (isOnline && dev.status !== 'OFFLINE' ? 'ONLINE' : 'STALE') as 'ONLINE' | 'STALE',
+          lastSeen: dev.lastHeartbeatAt ? dev.lastHeartbeatAt.getTime() : (dev.statusChangedAt?.getTime() ?? Date.now()),
+          firstSeen: dev.createdAt?.getTime() ?? Date.now(),
+          connectionType: (['LAN', 'WIFI', 'USB', 'UNKNOWN'].includes(dev.connectionType)
+            ? dev.connectionType
+            : 'UNKNOWN') as 'LAN' | 'WIFI' | 'USB' | 'UNKNOWN',
+          registryDeviceId: dev.id,
+          registryStatus: dev.status,
+        }
+      })
+    const existingIds = new Set(base.devices.map((d) => d.id))
+    const merged = [...base.devices, ...registryCards.filter((card: { id: string }) => !existingIds.has(card.id))]
+    return {
+      devices: merged,
+      total: merged.length,
+      source: 'embedded+registry',
+      scannedAt: scanState.scanId ? new Date().toISOString() : null,
+    }
+  } catch (err) {
+    console.error('[discovery] registry merge failed:', err)
+    return base
+  }
+}
+
 function scanStartResponse() {
   if (scanState.scanning) {
     return {
@@ -3413,10 +3558,10 @@ app.get('/discovery/health', async (c) => {
 // GET /discovery/devices — Return currently discovered devices (filtered)
 app.get('/discovery/devices', async (c) => {
   try {
-    await requireAuth(c)
+    const user = await requireAuth(c)
     const category = c.req.query('category')
     const status = c.req.query('status')
-    return c.json(devicesResponse(category, status))
+    return c.json(await devicesResponseWithRegistry(category, status, user.agencyId))
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

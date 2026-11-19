@@ -1254,6 +1254,12 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   // ═══ Management ══════════════════════════════════════════════════════════
 
   // GET /unpaired — devices broadcasting for pairing (heartbeat ≤ 90 s)
+  // 0.6.95 — split-brain fix: ALSO merge the CLOUD's unpaired orphans. A
+  // kiosk that could not find this desktop on the LAN registers against the
+  // cloud store, so it never appeared here and the desktop manager could not
+  // send a pairing request. Cloud entries arrive prefixed `cloud-` (the
+  // manager routes their pairing requests to the cloud API), deduped against
+  // local entries by deviceFingerprint.
   app.get('/api/agency-devices/unpaired', authMiddleware, async (c) => {
     const db = c.get('db')
     if (!requireAgencyId(c)) return
@@ -1275,7 +1281,30 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         orderBy: { lastHeartbeatAt: 'desc' },
         take: 50,
       })
-      return c.json({ success: true, devices })
+      // Cloud merge (best-effort — an offline desktop just sees local orphans).
+      let cloudDevices = []
+      try {
+        const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
+        if (token && typeof ctx.cloudFetch === 'function') {
+          const cloudRes = await ctx.cloudFetch('/api/agency-devices/unpaired', {
+            headers: { Accept: 'application/json', Authorization: 'Bearer ' + token },
+          }, { timeoutMs: 6000, attempts: 1 })
+          if (cloudRes.ok) {
+            const cloudData = await cloudRes.json().catch(() => null)
+            if (cloudData && cloudData.success && Array.isArray(cloudData.devices)) cloudDevices = cloudData.devices
+          }
+        }
+      } catch (cloudErr) {
+        if (diagLog) diagLog('AGENCY-DEVICE unpaired cloud merge skipped: ' + (cloudErr && cloudErr.message))
+      }
+      const localFingerprints = new Set(devices.map((d) => d.deviceFingerprint).filter(Boolean))
+      const merged = [...devices]
+      for (const cd of cloudDevices) {
+        if (cd.deviceFingerprint && localFingerprints.has(cd.deviceFingerprint)) continue
+        if (devices.some((d) => d.id === cd.id)) continue
+        merged.push({ ...cd, id: 'cloud-' + cd.id, cloudDevice: true })
+      }
+      return c.json({ success: true, devices: merged })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE unpaired error: ' + (err && err.message))
       return c.json({ success: false, error: 'Failed to load unpaired devices' }, 500)
@@ -1782,8 +1811,11 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       if (device.status !== 'PAIRING') {
         return c.json({ success: false, error: `Device is not in PAIRING status (current: ${device.status})` }, 409)
       }
-      const ninetySecAgo = new Date(Date.now() - 90 * 1000)
-      if (!device.lastHeartbeatAt || device.lastHeartbeatAt < ninetySecAgo) {
+      // 0.6.95 — widened 90s → 10min (mirrors the cloud fix): the kiosk
+      // beats every 30s but may skip a beat inside the server's dedupe
+      // window; the PAIRING_REQUEST command TTL (10 min) bounds delivery.
+      const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000)
+      if (!device.lastHeartbeatAt || device.lastHeartbeatAt < tenMinAgo) {
         return c.json({ success: false, error: 'Device is not currently online' }, 400)
       }
       const agency = await db.agency.findUnique({

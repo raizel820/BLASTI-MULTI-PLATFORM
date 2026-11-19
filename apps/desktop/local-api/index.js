@@ -12938,6 +12938,14 @@ function createApp() {
       try { localRealtime.broadcastLocalRealtime(type, payload) } catch { /* non-fatal */ }
     },
     diagLog,
+    // 0.6.95 — split-brain fix: the local /unpaired strip also merges the
+    // CLOUD's unpaired orphan kiosks (a kiosk that could not find this
+    // desktop on the LAN registers against the cloud instead — without the
+    // merge it was invisible to the desktop manager and pairing never
+    // completed). cloudFetch reuses the shared retry proxy; sessionToken is
+    // the local session used to authenticate the cloud call.
+    cloudFetch: (path, init, opts) => cloudFetchWithRetry(path, init, opts),
+    getSessionToken: () => sessionToken,
   })
 
   // ═══ Static UI server (Task 58) ═════════════════════════════════════════

@@ -163,6 +163,16 @@ export function useProfileData() {
 
   useEffect(() => { fetchProfile(); fetchStats(); fetchPurchaseHistory(); }, []);
 
+  // 0.6.95 — instant SMS-credit activation: when a payment settles (SMS pack
+  // or subscription via the result view, the background watcher, or the
+  // realtime push), refetch the profile so freeSmsCount and purchase history
+  // update the moment the gateway confirms.
+  useEffect(() => {
+    const onPaymentSettled = () => { fetchProfile(); fetchStats(); fetchPurchaseHistory(); };
+    window.addEventListener('blasti:payment-settled', onPaymentSettled);
+    return () => window.removeEventListener('blasti:payment-settled', onPaymentSettled);
+  }, []);
+
   const handleLanguageChange = (newLang: string) => {
     const langTyped = newLang as Language;
     updateDocumentDirection(langTyped);

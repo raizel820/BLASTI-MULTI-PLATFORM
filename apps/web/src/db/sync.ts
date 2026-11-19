@@ -141,8 +141,10 @@ class SyncEngine {
   private periodicRunning: boolean = false;
   private consecutiveFailures: number = 0;
   private lastResumeSyncAt: number = 0;
+  private lastPaymentSyncAt: number = 0;
   private lastPullRowCount: number = 0;
   private resumeUnsubscribe: (() => void) | null = null;
+  private paymentSettledHandler: ((e: Event) => void) | null = null;
   private lanProbeIntervalId: ReturnType<typeof setInterval> | null = null;
   private lastError: string | null = null;
 
@@ -1097,6 +1099,20 @@ class SyncEngine {
       console.log('[SyncEngine] App resumed — triggering incremental sync');
       void this.sync(database);
     });
+    // 0.6.95 — instant subscription activation: a settled payment must reach
+    // WatermelonDB surfaces (customer home agency list, subscription chips)
+    // IMMEDIATELY, not on the next 2-min cycle. The settle event fires from
+    // the background watcher / result view / realtime socket push.
+    if (isBrowser && !this.paymentSettledHandler) {
+      this.paymentSettledHandler = () => {
+        const now = Date.now();
+        if (now - this.lastPaymentSyncAt < 2_000) return;
+        this.lastPaymentSyncAt = now;
+        console.log('[SyncEngine] Payment settled — triggering immediate sync');
+        void this.sync(database);
+      };
+      window.addEventListener('blasti:payment-settled', this.paymentSettledHandler);
+    }
   }
 
   /**
@@ -1137,6 +1153,10 @@ class SyncEngine {
     if (this.resumeUnsubscribe) {
       this.resumeUnsubscribe();
       this.resumeUnsubscribe = null;
+    }
+    if (this.paymentSettledHandler) {
+      window.removeEventListener('blasti:payment-settled', this.paymentSettledHandler);
+      this.paymentSettledHandler = null;
     }
   }
 

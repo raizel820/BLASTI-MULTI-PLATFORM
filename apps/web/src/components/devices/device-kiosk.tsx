@@ -263,9 +263,25 @@ export function DeviceKiosk() {
   }, []);
 
   // ─── Device Heartbeat ──────────────────────────────────────
+  // 0.6.95 — heartbeat dedupe (field log: HTTP 429 "Heartbeat too frequent"
+  // on POST /api/agency-devices/device/heartbeat): startDeviceHeartbeat is
+  // restarted from several effects (lanServer discovery, auto-connect,
+  // fetchAgency success incl. its auto-retry loop, accept-pairing) and every
+  // restart fired an IMMEDIATE beat. Two beats <10s apart trip the server's
+  // per-device cap and get logged as tracked bugs. Guard both sides: a
+  // restart with the SAME token keeps the existing timer, and a beat fired
+  // inside the server's 10s window is skipped silently.
+  const lastHeartbeatTokenRef = useRef<string>('');
+  const heartbeatLastSentAtRef = useRef<number>(0);
+
   const startDeviceHeartbeat = useCallback((token: string) => {
+    if (heartbeatTimerRef.current && lastHeartbeatTokenRef.current === token) return;
+    lastHeartbeatTokenRef.current = token;
     if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
     const sendHeartbeat = async () => {
+      const nowMs = Date.now();
+      if (nowMs - heartbeatLastSentAtRef.current < 10_000) return;
+      heartbeatLastSentAtRef.current = nowMs;
       try {
         const res = await apiFetch('/api/agency-devices/device/heartbeat', {
           method: 'POST',
@@ -407,6 +423,8 @@ export function DeviceKiosk() {
     setDeviceId('');
     setIsDeviceRegistered(false);
     if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+    lastHeartbeatTokenRef.current = '';
+    heartbeatLastSentAtRef.current = 0;
     removeDeviceToken();
     // 0.6.91 — device event stream: device forgotten / kiosk logged out.
     try { logDevice('kiosk_exit', 'Kiosk device forgotten — credentials cleared locally', { deviceType: 'KIOSK' }); } catch { /* never block */ }
@@ -671,6 +689,53 @@ export function DeviceKiosk() {
   // ─── Join Queue ────────────────────────────────────────────
   const joiningRef = useRef(false);
 
+  // 0.6.95 — self-heal for the join 403 ("Device not authorized for this
+  // agency"): the persisted token can belong to an orphan registration (a
+  // different store, an old agency, or a pre-pairing discovery). Instead of
+  // surfacing a permissions error, clear the stale credentials, register a
+  // FRESH device against the CURRENT API base, and retry the join once.
+  const reregisterAndRetryJoin = async (
+    agencyId: string,
+    serviceId: string,
+    customerName: string | undefined,
+  ): Promise<{ ok: boolean; data?: any }> => {
+    try {
+      removeDeviceToken();
+      lastHeartbeatTokenRef.current = '';
+      setDeviceToken('');
+      setDeviceId('');
+      setIsDeviceRegistered(false);
+      const regRes = await apiFetch('/api/agency-devices/public/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agencyCode: agency.customCode || agencyCodeRef.current || '',
+          deviceName: 'BLASTI Kiosk',
+          deviceType: 'KIOSK',
+          connectionType: lanServer ? 'LAN' : 'WIFI',
+          deviceFingerprint: generateFingerprint(),
+        }),
+      });
+      const regData = await regRes.json();
+      if (!regData?.success || !regData.deviceToken) return { ok: false };
+      setDeviceToken(regData.deviceToken);
+      setDeviceId(regData.device?.id || '');
+      setIsDeviceRegistered(true);
+      saveDeviceToken(regData.deviceToken);
+      if (regData.device?.id) saveDeviceId(regData.device.id);
+      startDeviceHeartbeat(regData.deviceToken);
+      const retry = await apiFetch('/api/agency-devices/public/join-queue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${regData.deviceToken}` },
+        body: JSON.stringify({ agencyId, serviceId, customerName }),
+      });
+      const retryData = await retry.json();
+      return retryData?.success ? { ok: true, data: retryData } : { ok: false };
+    } catch {
+      return { ok: false };
+    }
+  };
+
   const handleJoinQueue = async () => {
     if (!agency || !selectedService) return;
     if (joiningRef.current) return;
@@ -687,6 +752,39 @@ export function DeviceKiosk() {
       });
       const data = await res.json();
       if (!data.success) {
+        // 0.6.95 — self-heal: a 403 "Device not authorized for this agency"
+        // means the persisted device token is stale/orphaned/cross-agency.
+        // Re-register against the CURRENT base and retry once instead of
+        // showing the kiosk a permissions failure (the field-log CRITICAL).
+        if (res.status === 403 && /not authorized/i.test(String(data.error || ''))) {
+          const healed = await reregisterAndRetryJoin(agency.id, selectedService, customerName.trim() || undefined);
+          if (healed.ok && healed.data) {
+            const rd = healed.data;
+            try {
+              logQueue('ticket_created_kiosk', `Kiosk ticket ${rd.reservation?.ticketNumber || ''} issued (self-healed registration)`.trim(), {
+                agencyId: agency.id,
+                serviceId: selectedService,
+                deviceId: rd.deviceId || deviceId || undefined,
+                ticketId: rd.reservation?.id,
+                ticketNumber: rd.reservation?.ticketNumber,
+                source: 'kiosk',
+              });
+            } catch { /* never block */ }
+            setTicket(rd.reservation);
+            setStep('ticket');
+            setInactivitySeconds(0);
+            setShowQrDetail(false);
+            if (rd.reservation?.importToken) {
+              const baseUrl = window.location.origin;
+              const claimUrl = `${baseUrl}/?claim=${rd.reservation.importToken}`;
+              const qrUrl = await generateQRDataURL(claimUrl, { width: 200 });
+              setTicketQrUrl(qrUrl);
+            } else { setTicketQrUrl(null); }
+            setShowConfetti(true);
+            setTimeout(() => setShowConfetti(false), 3500);
+            return;
+          }
+        }
         // Queue event log — kiosk join failed (endpoint error included).
         try { logQueue('ticket_created_kiosk', `Kiosk join failed: ${data.error || 'rejected'}`, { agencyId: agency.id, serviceId: selectedService, deviceId: data.deviceId || deviceId || undefined, source: 'kiosk' }, 'error'); } catch { /* never block */ }
         setError(data.error || 'Failed to join queue');
@@ -1052,6 +1150,38 @@ export function DeviceKiosk() {
       toast.error('Failed to reject pairing');
     }
   }, [discoveryToken, t]);
+
+  // ─── 0.6.95 — AUTOMATIC PAIRING ────────────────────────────────────────
+  // USER REQUEST: "الأجهزة التي تشغل تطبيق بلاستي في وضع الكشك في انتظار
+  // الربط التلقائي" — a kiosk in standby waits for AUTOMATIC pairing. The
+  // manager's pairing request already arrives here via the device-status
+  // poll (5s); previously a HUMAN TAP on the kiosk was still required, so
+  // unattended kiosks never paired. Now the FIRST incoming request
+  // auto-accepts after a 3-second grace window (enough to read the agency
+  // name, and Reject still wins if tapped in time).
+  const autoPairTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoPairFiredRef = useRef(false);
+  const handleAcceptPairingRef = useRef(handleAcceptPairing);
+  const handleRejectPairingRef = useRef(handleRejectPairing);
+  useEffect(() => { handleAcceptPairingRef.current = handleAcceptPairing; }, [handleAcceptPairing]);
+  useEffect(() => { handleRejectPairingRef.current = handleRejectPairing; }, [handleRejectPairing]);
+
+  useEffect(() => {
+    if (discoveryStatus !== 'waiting' || pairingRequests.length === 0 || autoPairFiredRef.current) return;
+    autoPairFiredRef.current = true;
+    const request = pairingRequests[0];
+    try {
+      logDevice('kiosk_auto_pairing', `Auto-pairing in 3s — agency "${request.agencyName || request.agencyId}" sent a pairing request`, { deviceType: 'KIOSK', status: 'ONLINE' });
+    } catch { /* never block */ }
+    autoPairTimerRef.current = setTimeout(() => {
+      autoPairTimerRef.current = null;
+      void handleAcceptPairingRef.current(request);
+    }, 3_000);
+    return () => {
+      if (autoPairTimerRef.current) { clearTimeout(autoPairTimerRef.current); autoPairTimerRef.current = null; }
+      autoPairFiredRef.current = false;
+    };
+  }, [discoveryStatus, pairingRequests]);
 
   // Cleanup discovery poll on unmount
   useEffect(() => {

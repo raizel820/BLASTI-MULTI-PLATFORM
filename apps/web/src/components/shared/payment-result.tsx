@@ -27,7 +27,6 @@ import {
   openCheckoutUrl,
   type PendingCheckout,
 } from '@/lib/chargily-checkout';
-import { PAYMENT_SUCCESS_EVENT } from '@/lib/payment-settle-watcher';
 import { viewToUrl } from '@/lib/route-map';
 import { logTx } from '@/lib/remote-logger';
 import {
@@ -574,10 +573,10 @@ export function PaymentResult() {
   // confirms the payment: every mounted surface flips to the settled state,
   // the success card shows for a brief beat, then the app navigates STRAIGHT
   // to the view the payment started from (subscription page → ACTIVE
-  // subscription) or the role home. 0.6.90 — the settle ALSO fires
-  // blasti:payment-success so the global success dialog (optional Chargily
-  // verification + home) appears over the activated view. Failed /
-  // unverified states keep their manual CTAs — the payer must read those.
+  // subscription) or the role home. 0.6.95 — no options dialog: the settle
+  // alone refreshes every mounted surface via blasti:payment-settled.
+  // Failed / unverified states keep their manual CTAs — the payer must read
+  // those.
   const autoReturnedRef = useRef(false);
   useEffect(() => {
     if (phase !== 'paid' || autoReturnedRef.current) return;
@@ -595,22 +594,6 @@ export function PaymentResult() {
                 smsPurchaseId: dataRef.current?.smsPurchaseId,
               },
             },
-          },
-        }),
-      );
-    } catch { /* ignore */ }
-    // 0.6.90 — success dialog (optional "verify on the Chargily platform" in
-    // the system browser + return home). verifyUrl rides on the persisted
-    // pending checkout; older markers (pre-0.6.90) simply omit the button.
-    try {
-      window.dispatchEvent(
-        new CustomEvent(PAYMENT_SUCCESS_EVENT, {
-          detail: {
-            checkoutId: dataRef.current?.checkoutId || checkoutId,
-            type: dataRef.current?.type || pending?.type,
-            amount: dataRef.current?.amount ?? pending?.amount,
-            currency: undefined,
-            verifyUrl: pending?.checkoutUrl,
           },
         }),
       );

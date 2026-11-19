@@ -38,6 +38,12 @@ const EVENT_PREFIXES: Record<string, string[]> = {
   'notification:new': ['/api/user/notifications', '/api/notifications', '/api/admin/notifications'],
   'notification:turn-approaching': ['/api/user/notifications', '/api/notifications'],
   'notification:your-turn': ['/api/user/notifications', '/api/notifications'],
+  // Payments (0.6.95 — instant subscription activation): the settle event
+  // must invalidate the agency/subscription/stats/user cache families so
+  // gated features unlock the moment the payment is confirmed, instead of
+  // serving cached pre-payment responses until the next poll.
+  'payment:completed': ['/api/agency', '/api/agency/subscription', '/api/stats', '/api/user', '/api/payment'],
+  'payment:failed': ['/api/payment'],
 };
 
 /** A full local/remote sync landed — everything may have changed. */

@@ -942,8 +942,23 @@ function registerDeviceBoardRoutes(app, ctx) {
       if (!agencyId || typeof agencyId !== 'string') return c.json({ success: false, error: 'Agency ID is required' }, 400)
       if (!serviceId || typeof serviceId !== 'string') return c.json({ success: false, error: 'Service ID is required' }, 400)
 
-      // C1: a trusted device may only join its own agency's queue.
-      if (device && agencyId !== device.agencyId) {
+      // C1: a device already bound to a DIFFERENT agency may never join this
+      // one. 0.6.95 — orphan auto-bind (mirrors the cloud fix): a freshly
+      // discovered kiosk registers with agencyId=null (PAIRING) and joins
+      // immediately — bind it to the requested agency instead of 403ing
+      // ("Device not authorized for this agency" rendered as a permissions
+      // failure on the kiosk and pairing never completed).
+      if (device && !device.agencyId) {
+        try {
+          await db.agencyDevice.update({
+            where: { id: device.id },
+            data: { agencyId, updatedAt: new Date() },
+          })
+          device.agencyId = agencyId
+        } catch (bindErr) {
+          log('orphan auto-bind failed:', errorMessage(bindErr))
+        }
+      } else if (device && agencyId !== device.agencyId) {
         return c.json({ success: false, error: 'Device not authorized for this agency' }, 403)
       }
 
