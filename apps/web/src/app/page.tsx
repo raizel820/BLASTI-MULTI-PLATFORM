@@ -11,6 +11,7 @@ import { isRTL, type Language } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable } from '@/lib/api-client';
+import { logQueue } from '@/lib/remote-logger';
 import { getPendingCheckout } from '@/lib/chargily-checkout';
 // 0.6.89 — the background settlement watcher confirms a checkout the moment
 // it settles; the focus/visibility resume below must not resurrect the
@@ -704,20 +705,30 @@ export default function Home() {
         });
         if (res.ok) {
           const data = await res.json();
+          // Queue event log — walk-in ticket imported via the ?claim= deep link.
+          try {
+            const r = data?.reservation;
+            logQueue('ticket_imported', `Walk-in ticket ${r?.displayNumber || r?.queueNumber || ''} imported via claim link`.trim(), { agencyId: r?.agency?.id || undefined, ticketId: r?.id, ticketNumber: r?.displayNumber || r?.queueNumber, source: 'import' });
+          } catch { /* never block */ }
           toast.success(t('walkInImported') || 'Reservation imported to your queue!');
           setView('customer-queue');
         } else {
           const data = await res.json();
           if (res.status === 401) {
-            // Not logged in — store token for after login
+            // Not logged in — store token for after login (no queue event:
+            // the import did not fail, it is deferred to the post-login path).
             localStorage.setItem('blasti-pending-claim', claimToken);
             toast.info(t('loginToImport') || 'Please login to import this reservation.');
             setView('login');
           } else {
+            // Queue event log — claim-link import failed (endpoint error included).
+            try { logQueue('ticket_imported', `Claim-link import failed: ${data?.error || 'rejected'}`, { source: 'import' }, 'error'); } catch { /* never block */ }
             toast.error(data.error || t('invalidTicket') || 'Invalid or expired ticket.');
           }
         }
       } catch {
+        // Queue event log — claim-link import network failure.
+        try { logQueue('ticket_imported', 'Claim-link import failed — network error', { source: 'import' }, 'error'); } catch { /* never block */ }
         toast.error(t('error') || 'Something went wrong.');
       }
       // Clean URL
@@ -747,12 +758,24 @@ export default function Home() {
       body: JSON.stringify({ token: pending }),
     }).then(res => {
       if (res.ok) {
+        // Queue event log — pending-claim walk-in import after login.
+        res.json().then((data) => {
+          try {
+            const r = data?.reservation;
+            logQueue('ticket_imported', `Walk-in ticket ${r?.displayNumber || r?.queueNumber || ''} imported after login`.trim(), { agencyId: r?.agency?.id || undefined, ticketId: r?.id, ticketNumber: r?.displayNumber || r?.queueNumber, source: 'import' });
+          } catch { /* never block */ }
+        }).catch(() => { /* body unreadable — the event above is best-effort */ });
         toast.success(t('walkInImported') || 'Reservation imported to your queue!');
         setView('customer-queue');
       } else {
+        // Queue event log — pending-claim import failed.
+        try { logQueue('ticket_imported', 'Pending-claim import failed after login', { source: 'import' }, 'error'); } catch { /* never block */ }
         toast.error(t('invalidTicket') || 'Invalid or expired ticket.');
       }
-    }).catch(() => {});
+    }).catch(() => {
+      // Queue event log — pending-claim import network failure.
+      try { logQueue('ticket_imported', 'Pending-claim import failed — network error', { source: 'import' }, 'error'); } catch { /* never block */ }
+    });
   }, [isAuthenticated, user?.role]);
 
   // blasti:// deep links (Capacitor Android) — the hosted Chargily checkout

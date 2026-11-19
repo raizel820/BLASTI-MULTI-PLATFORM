@@ -4201,6 +4201,8 @@ const fr: Record<TranslationKeys, string> = {
   txLogColCheckout: "Checkout",
   logsExportScopeTransactions: "Exporter les événements de transactions",
   logsExportTypeTransactions: "Événements de transactions",
+  logsExportScopeQueue: "Exporter les événements de file d'attente",
+  logsExportTypeQueue: "Événements de file d'attente",
   logsManagerAutoRefresh: "Actualisation auto",
   logsManagerKpiBugs: "Bugs suivis",
   logsManagerKpiLast24h: "Actifs 24 dernières h",

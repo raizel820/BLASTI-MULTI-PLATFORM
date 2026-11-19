@@ -20,6 +20,7 @@ import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 // 0.6.16 — revalidate view data when the app resumes to the foreground
 import { useResumeRefresh } from '@/lib/resume-refresh';
 import { toLocalDateString } from '@/lib/date-utils';
+import { logQueue } from '@/lib/remote-logger';
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
@@ -284,14 +285,29 @@ export function CustomerHistory() {
       });
       const data = await res.json();
       if (res.ok) {
+        // Queue event log — customer rejoined from the history flow.
+        try {
+          const r = data?.reservation;
+          logQueue('ticket_created_online', `Rejoined from history (${r?.displayNumber || r?.queueNumber || 'ticket'})`, {
+            agencyId: pendingRejoinItem.agencyId,
+            serviceId: pendingRejoinItem.serviceId || undefined,
+            ticketId: r?.id,
+            ticketNumber: r?.displayNumber || r?.queueNumber,
+            source: 'online',
+          });
+        } catch { /* never block */ }
         toast.success(t('joinSuccess'));
         setDateDialogOpen(false);
         setPendingRejoinItem(null);
         setView('customer-queue');
       } else {
+        // Queue event log — history rejoin failed (endpoint error included).
+        try { logQueue('ticket_created_online', `History rejoin failed: ${data?.error || 'rejected'}`, { agencyId: pendingRejoinItem.agencyId, serviceId: pendingRejoinItem.serviceId || undefined, source: 'online' }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — history rejoin network failure.
+      try { logQueue('ticket_created_online', 'History rejoin failed — network error', { agencyId: pendingRejoinItem?.agencyId, serviceId: pendingRejoinItem?.serviceId || undefined, source: 'online' }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setJoining(false);

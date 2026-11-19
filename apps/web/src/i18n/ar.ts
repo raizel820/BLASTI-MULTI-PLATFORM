@@ -4199,6 +4199,8 @@ const ar = {
   txLogColCheckout: "Checkout",
   logsExportScopeTransactions: "تصدير أحداث المعاملات",
   logsExportTypeTransactions: "أحداث المعاملات",
+  logsExportScopeQueue: "تصدير أحداث الطابور",
+  logsExportTypeQueue: "أحداث الطابور",
   logsManagerAutoRefresh: "تحديث تلقائي",
   logsManagerKpiBugs: "أخطاء متتبَّعة",
   logsManagerKpiLast24h: "نشطة آخر 24 ساعة",

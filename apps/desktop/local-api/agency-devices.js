@@ -443,6 +443,10 @@ function devicesResponse(category, status) {
   let devices = [...scanDevices]
   if (category) devices = devices.filter((d) => String(d.category).toUpperCase() === String(category).toUpperCase())
   if (status) devices = devices.filter((d) => String(d.status).toUpperCase() === String(status).toUpperCase())
+  // 0.6.92 — routers/gateways NEVER appear in the manager's scan results
+  // (user report: the router shows in the results although there is no need
+  // for it). The scanner still classifies them, but the listing is filtered.
+  devices = devices.filter((d) => String(d.type).toUpperCase() !== 'ROUTER')
   return {
     devices,
     total: devices.length,

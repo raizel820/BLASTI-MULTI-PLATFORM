@@ -10,12 +10,18 @@ import { recordSyncChange } from '../lib/sync-helpers'
 // Task 2-a — kiosk joins create reservations → invalidate cached public GETs
 // that expose reservation-derived numbers (/api/stats, /api/agencies).
 import { invalidateResponseCacheTag } from '../lib/response-cache'
+// Task 4-a — authoritative queue mutations land in the unified queue event
+// stream (appendQueueEvent never throws; additive logging only).
+import { appendQueueEvent } from '../lib/queue-event-log'
 
 const app = new Hono()
 
 // POST /kiosk/join — Kiosk join queue (public, unauthenticated)
 app.post('/join', async (c) => {
   let clientIp: string | undefined
+  // Task 4-a — captured early so the catch-block failure event can carry the
+  // agency scope even when the error fires after validation.
+  let kioskJoinAgencyId: string | null = null
   try {
     clientIp = enforceRateLimit(c, KIOSK_RATE_LIMIT)
 
@@ -27,6 +33,7 @@ app.post('/join', async (c) => {
     }
 
     const { agencyId, serviceId, customerName } = validation.data
+    kioskJoinAgencyId = agencyId
 
     const agency = await db.agency.findUnique({
       where: { id: agencyId, isActive: true },
@@ -119,6 +126,26 @@ app.post('/join', async (c) => {
     emitQueueEvent('queue:walk-in', agencyId, { reservationId: reservation.id, displayNumber: reservation.displayNumber, customerName: customerName || 'Anonymous', serviceId, estimatedWait })
     emitKioskEvent(agencyId, { action: 'kiosk-join', displayNumber: reservation.displayNumber })
 
+    // Task 4-a — kiosk dispensing → queue event stream. deviceId comes from
+    // the x-blasti-device header when the kiosk webview sends it (this route
+    // is public/unauthenticated — there is no kiosk auth context).
+    appendQueueEvent({
+      event: 'ticket_created_kiosk',
+      message: `Kiosk ticket ${reservation.displayNumber} created for ${service.name}`,
+      level: 'info',
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      serviceId,
+      serviceName: service.name,
+      ticketId: reservation.id,
+      ticketNumber: reservation.displayNumber,
+      source: 'kiosk',
+      status: 'WAITING',
+      deviceId: c.req.header('x-blasti-device') || null,
+      data: { position, estimatedWait },
+    })
+
     // Task 2-a — kiosk join is a reservation create.
     invalidateResponseCacheTag('stats', 'agencies')
 
@@ -132,6 +159,16 @@ app.post('/join', async (c) => {
     if (error instanceof Error && error.message === 'FULL') {
       return c.json({ success: false, error: 'Queue is full' }, 400)
     }
+    // Task 4-a — unexpected kiosk join failure (DB error, 5xx) → queue stream.
+    appendQueueEvent({
+      event: 'ticket_created_kiosk',
+      message: `Kiosk join failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+      level: 'error',
+      origin: 'server',
+      platform: 'server',
+      agencyId: kioskJoinAgencyId,
+      data: { route: 'POST /kiosk/join' },
+    })
     const message = 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }

@@ -285,6 +285,18 @@ async function deriveCandidateSubnets(): Promise<string[]> {
     const rtcIp = await getLocalIp();
     if (rtcIp) push(rtcIp);
   } catch { /* WebRTC blocked — fall through to the hardcoded list */ }
+  // 0.6.92 — common-subnet fallbacks. Modern WebViews mDNS-obfuscate WebRTC
+  // ICE candidates (getLocalIp → null), and the page host is 'localhost' in
+  // every shell — derivation then returned NOTHING and the sweep guessed
+  // '192.168.1' only. On a 192.168.0.x / 10.x.x.x office network the desktop
+  // box was never probed at all. The fallbacks sweep CONCURRENTLY with the
+  // derived subnets (same wall time — ~one sweep), and scanSubnet
+  // early-exits on the first MASTER hit, so the common subnets cost nothing
+  // when a derived subnet answers first.
+  const COMMON_FALLBACK_SUBNETS = ['192.168.0', '192.168.1', '10.0.0'];
+  for (const subnet of COMMON_FALLBACK_SUBNETS) {
+    if (!subnets.includes(subnet)) subnets.push(subnet);
+  }
   return subnets;
 }
 
@@ -348,10 +360,10 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
     }
 
     // 0.6.75 — all candidate subnets scan CONCURRENTLY; the sequential loop
-    // paid a full sweep per subnet before even trying the next one. The
-    // common subnet (M25) joins the candidates instead of a second pass;
-    // equal ranks keep candidate order (derived subnets first, stable sort).
-    const candidates = derived.includes('192.168.1') ? derived : [...derived, '192.168.1'];
+    // paid a full sweep per subnet before even trying the next one.
+    // 0.6.92 — deriveCandidateSubnets ALWAYS includes the common fallbacks
+    // (192.168.0 / 192.168.1 / 10.0.0), so no second-pass append is needed.
+    const candidates = derived;
     const found = (
       await Promise.all(candidates.map((subnet) => scanSubnet(subnet, DEFAULT_API_PORT)))
     )

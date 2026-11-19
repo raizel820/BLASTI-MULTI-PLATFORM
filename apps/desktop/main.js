@@ -4206,6 +4206,21 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
           return;
         }
         const target = new URL(u);
+        // 0.6.92 — the SPA result ROUTE is terminal on EVERY origin. Through
+        // 0.6.91 only CLOUD origins were recognized here; the returnUrl the
+        // API bakes into the checkout is normally the cloud origin, but a
+        // shell resolved against a device-local base (offline-first mode, a
+        // LAN-only deployment) produces a LOCAL result redirect — which fell
+        // through to openExternalOnce and opened the "تمت العملية بنجاح" page
+        // in the system browser again. The result route is OUR route: any
+        // http(s) URL whose hash carries it is converted into the in-app deep
+        // link, no matter which origin serves it.
+        if ((target.hash || '').toLowerCase().startsWith('#/payment/result')) {
+          const qIndex = (target.hash || '').indexOf('?');
+          const query = qIndex >= 0 ? target.hash.slice(qIndex + 1) : '';
+          finishWithResult('blasti://payment/result' + (query ? '?' + query : ''));
+          return;
+        }
         const isGateway = GATEWAY_URL_RE.test(u);
         const isCloud = isCloudOrigin(target.origin);
         if (!isGateway && !isCloud) {
@@ -4265,6 +4280,17 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
           return { action: 'deny' };
         }
         const t = new URL(childUrl);
+        // 0.6.92 — the result route is terminal on EVERY origin (same rule as
+        // inspectNavigation): a popup-detoured success redirect whose origin
+        // is device-local (offline/LAN deployment) used to fall through to
+        // openExternalOnce below — the automatic browser tab the payer kept
+        // reporting. OUR route never opens externally.
+        if ((t.hash || '').toLowerCase().startsWith('#/payment/result')) {
+          const qIndex92 = (t.hash || '').indexOf('?');
+          const query92 = qIndex92 >= 0 ? t.hash.slice(qIndex92 + 1) : '';
+          finishWithResult('blasti://payment/result' + (query92 ? '?' + query92 : ''));
+          return { action: 'deny' };
+        }
         if (isCloudOrigin(t.origin)) {
           if ((t.hash || '').startsWith('#/payment/result')) {
             const qIndex = (t.hash || '').indexOf('?');

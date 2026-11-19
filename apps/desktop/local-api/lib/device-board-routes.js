@@ -1057,6 +1057,25 @@ function registerDeviceBoardRoutes(app, ctx) {
         })
       } catch { /* non-fatal */ }
 
+      // 0.6.89 — QUEUE event: the kiosk walk-in ticket was created LOCALLY
+      // (canonical outbox row → the sync engine replays it; the cloud logs
+      // its own copy only when that replay lands).
+      // NOTE: this file lives INSIDE lib/ — the sibling module is './queue-event'.
+      require('./queue-event').queueEvent(
+        'ticket_created_kiosk',
+        'Kiosk ticket created: ' + reservation.displayNumber + ' (queued for cloud push)',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId,
+          serviceName: service.name,
+          source: 'kiosk',
+          status: 'WAITING',
+          deviceId: device ? device.id : undefined,
+        },
+      )
+
       const branchInfo = await branchNamesForDevice(db, device)
 
       return c.json({

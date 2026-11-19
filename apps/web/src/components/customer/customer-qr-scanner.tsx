@@ -1,5 +1,6 @@
 'use client';
 import { apiFetch } from '@/lib/api-fetch';
+import { logQueue } from '@/lib/remote-logger';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import {
@@ -266,6 +267,8 @@ export function CustomerQrScanner({ open, onOpenChange, onAgencyFound }: Custome
       const data = await res.json();
       if (res.ok && data.success) {
         const r = data.reservation;
+        // Queue event log — walk-in ticket imported by scanning its QR.
+        try { logQueue('ticket_imported', `Walk-in ticket ${r?.displayNumber || r?.queueNumber || ''} imported by QR scan`.trim(), { agencyId: r?.agency?.id || undefined, ticketId: r?.id, ticketNumber: r?.displayNumber || r?.queueNumber, source: 'import' }); } catch { /* never block */ }
         setWalkInImportResult({
           displayNumber: r.displayNumber,
           agencyName: r.agency?.name || r.agency?.nameAr || '',
@@ -275,13 +278,19 @@ export function CustomerQrScanner({ open, onOpenChange, onAgencyFound }: Custome
         toast.success(t('walkInImported') || 'Walk-in ticket imported to your queue!');
         setScannerState('result');
       } else if (data.error === 'already_linked') {
+        // Queue event log — import refused: ticket already linked (failure).
+        try { logQueue('ticket_imported', 'QR import failed: ticket already linked to an account', { ticketId: data?.reservation?.id || undefined, ticketNumber: data?.reservation?.displayNumber || undefined, error: 'already_linked', source: 'import' }, 'warn'); } catch { /* never block */ }
         setWalkInImportError(t('ticketAlreadyLinked') || 'This ticket is already linked to an account');
         setScannerState('result');
       } else {
+        // Queue event log — QR import failed (endpoint error included).
+        try { logQueue('ticket_imported', `QR import failed: ${data?.error || 'rejected'}`, { source: 'import' }, 'error'); } catch { /* never block */ }
         setWalkInImportError(data.error || t('invalidTicket'));
         setScannerState('error');
       }
     } catch {
+      // Queue event log — QR import network failure.
+      try { logQueue('ticket_imported', 'QR import failed — network error', { source: 'import' }, 'error'); } catch { /* never block */ }
       setWalkInImportError(t('error'));
       setScannerState('error');
     } finally {

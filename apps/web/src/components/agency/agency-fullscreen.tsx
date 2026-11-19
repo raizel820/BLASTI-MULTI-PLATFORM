@@ -71,6 +71,7 @@ import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { unwrapListPayload } from '@/lib/list-payload';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+import { logQueue } from '@/lib/remote-logger';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
 import { useAgencyAuthority } from '@/hooks/use-agency-authority';
 
@@ -586,6 +587,9 @@ export function AgencyFullscreen() {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
         });
         if (res.status === 403 && !stopped) {
+          // Queue event log — control lease LOST (the routine 60s renewal is
+          // deliberately NOT logged; only this rejection path is).
+          try { logQueue('counter_released', 'counter control lost (heartbeat rejected)', { agencyId, counterId: selectedCounterId }, 'warn'); } catch { /* never block */ }
           releaseLocalControl();
           // 0.6.77 — loss demotes to a banner, not a full-screen gate takeover.
           setControlLostMode(true);
@@ -654,6 +658,18 @@ export function AgencyFullscreen() {
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Queue event log guards — fullscreen enter/exit must log ONCE per actual
+  // transition (the manual exit button AND the fullscreenchange listener can
+  // both fire for the same exit).
+  const fsEnterLoggedRef = useRef(false);
+  const fsExitLoggedRef = useRef(false);
+  /** Queue event log — full-screen exit, emitted at most once per transition. */
+  const logFullscreenExit = useCallback(() => {
+    if (fsExitLoggedRef.current) return;
+    fsExitLoggedRef.current = true;
+    try { logQueue('fullscreen_exit', 'queue display exited full-screen', agencyId ? { agencyId } : undefined); } catch { /* never block */ }
+  }, [agencyId]);
 
   // ─── Fetch Data ────────────────────────────────────────────────────────
 
@@ -764,6 +780,14 @@ export function AgencyFullscreen() {
 
   // ─── Effects ───────────────────────────────────────────────────────────
 
+  // Queue event log — full-screen display entered (once per mount; the ref
+  // guard keeps a later agencyId hydration from double-logging).
+  useEffect(() => {
+    if (fsEnterLoggedRef.current || !agencyId) return;
+    fsEnterLoggedRef.current = true;
+    try { logQueue('fullscreen_enter', 'queue display entered full-screen', { agencyId }); } catch { /* never block */ }
+  }, [agencyId]);
+
   // FIX #17: Offline-aware polling with backoff (was fixed 5s interval)
   useEffect(() => {
     fetchAllWithLoading();
@@ -801,12 +825,15 @@ export function AgencyFullscreen() {
   useEffect(() => {
     const handleFullscreenChange = () => {
       if (!document.fullscreenElement && !walkInOpen && !qrOpen && !ticketOpen && !walkInQrOpen) {
+        // Queue event log — full-screen exited (guarded: the manual exit
+        // button may have already logged this same transition).
+        logFullscreenExit();
         setView('agency-dashboard');
       }
     };
     document.addEventListener('fullscreenchange', handleFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
-  }, [setView, walkInOpen, qrOpen, ticketOpen, walkInQrOpen]);
+  }, [setView, walkInOpen, qrOpen, ticketOpen, walkInQrOpen, logFullscreenExit]);
 
   // Realtime subscription
   useEffect(() => {
@@ -935,6 +962,20 @@ export function AgencyFullscreen() {
       });
       if (res.ok) {
         if (selectedCounterId) localStorage.setItem(`blasti_counter_${agencyId}`, selectedCounterId);
+        // Queue event log — ticket claimed (success; ticket identity comes
+        // from the response's reservation mirror).
+        try {
+          const data = await res.json().catch(() => null);
+          const claimed = data?.reservation;
+          logQueue('ticket_claimed', `Ticket ${claimed?.displayNumber || claimed?.queueNumber || 'next'} called`, {
+            agencyId,
+            counterId: selectedCounterId || claimed?.counterId || undefined,
+            ticketId: claimed?.id,
+            ticketNumber: claimed?.displayNumber || claimed?.queueNumber,
+            serviceId: claimed?.serviceId || undefined,
+            status: 'CALLED',
+          });
+        } catch { /* never block */ }
         toast.success(t('statusCalled')); fetchAll();
       }
       else {
@@ -945,9 +986,15 @@ export function AgencyFullscreen() {
         else if (data.error === 'COUNTER_CONTROL_REQUIRED') errorMsg = t('counterControlRequired');
         else if (data.error === 'COUNTER_CONTROL_LOST') errorMsg = t('counterControlLost');
         else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
+        // Queue event log — call-next failed (endpoint error included).
+        try { logQueue('ticket_claimed', `Call-next failed: ${errorMsg}`, { agencyId, counterId: selectedCounterId || undefined }, 'error'); } catch { /* never block */ }
         toast.error(errorMsg);
       }
-    } catch { toast.error(t('error')); }
+    } catch {
+      // Queue event log — call-next network failure.
+      try { logQueue('ticket_claimed', 'Call-next failed — network error', { agencyId, counterId: selectedCounterId || undefined }, 'error'); } catch { /* never block */ }
+      toast.error(t('error'));
+    }
     finally { setActionLoading(null); }
   };
 
@@ -965,6 +1012,8 @@ export function AgencyFullscreen() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
       });
       if (res.ok) {
+        // Queue event log — counter claimed (success).
+        try { logQueue('counter_claimed', 'Counter claimed', { agencyId, counterId, counterName: counterLabel(counters.find((c) => c.id === counterId)) || undefined }); } catch { /* never block */ }
         setSelectedCounterId(counterId);
         selectedCounterIdRef.current = counterId;
         localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
@@ -974,6 +1023,8 @@ export function AgencyFullscreen() {
         fetchCounters();
       } else {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — counter claim failed (endpoint error included).
+        try { logQueue('counter_claimed', `Counter claim failed: ${data.error || 'rejected'}`, { agencyId, counterId }, 'error'); } catch { /* never block */ }
         if (data.error === 'COUNTER_CONTROLLED' || data.error === 'COUNTER_OCCUPIED') {
           const opt = counters.find((c) => c.id === counterId);
           setControlDialog({
@@ -995,6 +1046,8 @@ export function AgencyFullscreen() {
         }
       }
     } catch {
+      // Queue event log — counter claim network failure.
+      try { logQueue('counter_claimed', 'Counter claim failed — network error', { agencyId, counterId }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setOccupationLoading(null);
@@ -1012,6 +1065,9 @@ export function AgencyFullscreen() {
       });
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — control request sent (or direct grant when the
+        // counter was already free).
+        try { logQueue('counter_control_requested', data.claimed ? 'Counter control granted (counter was free)' : 'Counter control request sent', { agencyId, counterId, counterName, ...(data.requestId ? { requestId: String(data.requestId) } : {}), granted: !!data.claimed }); } catch { /* never block */ }
         if (data.claimed) {
           // The counter freed while we were asking — control granted directly.
           setControlDialog(null);
@@ -1035,9 +1091,13 @@ export function AgencyFullscreen() {
         }
       } else {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — control request failed (endpoint error included).
+        try { logQueue('counter_control_requested', `Control request failed: ${data.error || 'rejected'}`, { agencyId, counterId, counterName }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — control request network failure.
+      try { logQueue('counter_control_requested', 'Control request failed — network error', { agencyId, counterId, counterName }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setRequestControlLoading(false);
@@ -1055,6 +1115,8 @@ export function AgencyFullscreen() {
         body: JSON.stringify({ userId: myUserId }),
       });
       if (res.ok) {
+        // Queue event log — control force-assigned (owner/super-admin path).
+        try { logQueue('counter_assigned', 'Counter control force-assigned', { agencyId, counterId, counterName: controlDialog.counterName, assignedTo: myUserId || undefined }); } catch { /* never block */ }
         setControlDialog(null);
         setSelectedCounterId(counterId);
         selectedCounterIdRef.current = counterId;
@@ -1064,9 +1126,13 @@ export function AgencyFullscreen() {
         fetchCounters();
       } else {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — force takeover failed (endpoint error included).
+        try { logQueue('counter_assigned', `Force takeover failed: ${data.error || 'rejected'}`, { agencyId, counterId, counterName: controlDialog.counterName }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — force takeover network failure.
+      try { logQueue('counter_assigned', 'Force takeover failed — network error', { agencyId, counterId, counterName: controlDialog.counterName }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setRequestControlLoading(false);
@@ -1081,6 +1147,8 @@ export function AgencyFullscreen() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
       });
       if (res.ok) {
+        // Queue event log — counter released (deliberate).
+        try { logQueue('counter_released', 'Counter released', { agencyId, counterId: selectedCounterId }); } catch { /* never block */ }
         releaseLocalControl();
         // 0.6.77 — deliberate release: the user asked for it, so the normal
         // claim gate (not the loss banner) comes back.
@@ -1089,6 +1157,8 @@ export function AgencyFullscreen() {
         fetchCounters();
       } else {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — release failed (endpoint error included).
+        try { logQueue('counter_released', `Counter release failed: ${data.error || 'rejected'}`, { agencyId, counterId: selectedCounterId }, 'error'); } catch { /* never block */ }
         if (res.status === 403 && data.error === 'COUNTER_CONTROL_LOST') {
           // The lease already died server-side — mirror it locally.
           releaseLocalControl();
@@ -1104,6 +1174,8 @@ export function AgencyFullscreen() {
         }
       }
     } catch {
+      // Queue event log — release network failure.
+      try { logQueue('counter_released', 'Counter release failed — network error', { agencyId, counterId: selectedCounterId }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setOccupationLoading(null);
@@ -1117,9 +1189,23 @@ export function AgencyFullscreen() {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'complete' }),
       });
-      if (res.ok) { toast.success(t('statusCompleted') || 'Completed'); fetchAll(); }
-      else { toast.error(t('error')); }
-    } catch { toast.error(t('error')); }
+      if (res.ok) {
+        // Queue event log — ticket completed.
+        try { logQueue('ticket_completed', 'Ticket marked completed', { agencyId, ticketId: reservationId, status: 'COMPLETED' }); } catch { /* never block */ }
+        toast.success(t('statusCompleted') || 'Completed'); fetchAll();
+      }
+      else {
+        try {
+          const d = await res.json().catch(() => null);
+          logQueue('ticket_completed', `Mark-complete failed: ${d?.error || d?.details || 'rejected'}`, { agencyId, ticketId: reservationId }, 'error');
+        } catch { /* never block */ }
+        toast.error(t('error'));
+      }
+    } catch {
+      // Queue event log — mark-complete network failure.
+      try { logQueue('ticket_completed', 'Mark-complete failed — network error', { agencyId, ticketId: reservationId }, 'error'); } catch { /* never block */ }
+      toast.error(t('error'));
+    }
     finally { setActionLoading(null); }
   };
 
@@ -1130,9 +1216,23 @@ export function AgencyFullscreen() {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'no_show' }),
       });
-      if (res.ok) { toast.success(t('statusNoShow') || 'Marked as no-show'); fetchAll(); }
-      else { toast.error(t('error')); }
-    } catch { toast.error(t('error')); }
+      if (res.ok) {
+        // Queue event log — ticket marked no-show.
+        try { logQueue('ticket_no_show', 'Ticket marked no-show', { agencyId, ticketId: reservationId, status: 'NO_SHOW' }); } catch { /* never block */ }
+        toast.success(t('statusNoShow') || 'Marked as no-show'); fetchAll();
+      }
+      else {
+        try {
+          const d = await res.json().catch(() => null);
+          logQueue('ticket_no_show', `Mark no-show failed: ${d?.error || d?.details || 'rejected'}`, { agencyId, ticketId: reservationId }, 'error');
+        } catch { /* never block */ }
+        toast.error(t('error'));
+      }
+    } catch {
+      // Queue event log — mark no-show network failure.
+      try { logQueue('ticket_no_show', 'Mark no-show failed — network error', { agencyId, ticketId: reservationId }, 'error'); } catch { /* never block */ }
+      toast.error(t('error'));
+    }
     finally { setActionLoading(null); }
   };
 
@@ -1143,9 +1243,23 @@ export function AgencyFullscreen() {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'cancel' }),
       });
-      if (res.ok) { toast.success(t('statusCancelled') || 'Cancelled'); fetchAll(); }
-      else { toast.error(t('error')); }
-    } catch { toast.error(t('error')); }
+      if (res.ok) {
+        // Queue event log — ticket cancelled by staff.
+        try { logQueue('ticket_cancelled', 'Ticket cancelled by staff', { agencyId, ticketId: reservationId, status: 'CANCELLED' }); } catch { /* never block */ }
+        toast.success(t('statusCancelled') || 'Cancelled'); fetchAll();
+      }
+      else {
+        try {
+          const d = await res.json().catch(() => null);
+          logQueue('ticket_cancelled', `Cancel failed: ${d?.error || d?.details || 'rejected'}`, { agencyId, ticketId: reservationId }, 'error');
+        } catch { /* never block */ }
+        toast.error(t('error'));
+      }
+    } catch {
+      // Queue event log — cancel network failure.
+      try { logQueue('ticket_cancelled', 'Cancel failed — network error', { agencyId, ticketId: reservationId }, 'error'); } catch { /* never block */ }
+      toast.error(t('error'));
+    }
     finally { setActionLoading(null); }
   };
 
@@ -1157,9 +1271,30 @@ export function AgencyFullscreen() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agencyId }),
       });
-      if (res.ok) fetchStats();
-      else toast.error(t('error'));
-    } catch { toast.error(t('error')); }
+      if (res.ok) {
+        // Queue event log — pause state flipped. The response carries the
+        // authoritative new isPaused; fall back to the pre-toggle mirror.
+        try {
+          const data = await res.json().catch(() => null);
+          const nowPaused = data?.isPaused ?? !isPaused;
+          logQueue(nowPaused ? 'queue_paused' : 'queue_resumed', nowPaused ? 'Queue paused' : 'Queue resumed', { agencyId });
+        } catch { /* never block */ }
+        fetchStats();
+      }
+      else {
+        // Queue event log — toggle failed. The slug reflects the ATTEMPTED
+        // action (isPaused is the pre-toggle state).
+        try {
+          const data = await res.json().catch(() => null);
+          logQueue(isPaused ? 'queue_resumed' : 'queue_paused', `Toggle pause failed: ${data?.error || 'rejected'}`, { agencyId }, 'error');
+        } catch { /* never block */ }
+        toast.error(t('error'));
+      }
+    } catch {
+      // Queue event log — toggle pause network failure.
+      try { logQueue(isPaused ? 'queue_resumed' : 'queue_paused', 'Toggle pause failed — network error', { agencyId }, 'error'); } catch { /* never block */ }
+      toast.error(t('error'));
+    }
     finally { setActionLoading(null); }
   };
 
@@ -1175,6 +1310,9 @@ export function AgencyFullscreen() {
       if (res.ok) {
         const data = await res.json();
         const r = data.reservation;
+        // Queue event log — walk-in ticket created (ONE event covers the
+        // walk-in call and its walk-in-token fallback below).
+        try { logQueue('ticket_created_walkin', `Walk-in ticket created (${r?.queueNumber || r?.displayNumber || 'ticket'})`, { agencyId, serviceId: walkInServiceId, serviceName: r?.service?.name || undefined, ticketId: r?.id, ticketNumber: r?.queueNumber || r?.displayNumber, source: 'walkin' }); } catch { /* never block */ }
         const result: WalkInResult = {
           id: r.id, queueNumber: r.queueNumber, displayNumber: r.displayNumber,
           customerName: walkInName.trim(),
@@ -1202,9 +1340,15 @@ export function AgencyFullscreen() {
         fetchAll();
       } else {
         const data = await res.json();
+        // Queue event log — walk-in creation failed (endpoint error included).
+        try { logQueue('ticket_created_walkin', `Walk-in creation failed: ${data?.error || 'rejected'}`, { agencyId, serviceId: walkInServiceId, source: 'walkin' }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
-    } catch { toast.error(t('error')); }
+    } catch {
+      // Queue event log — walk-in creation network failure.
+      try { logQueue('ticket_created_walkin', 'Walk-in creation failed — network error', { agencyId, serviceId: walkInServiceId, source: 'walkin' }, 'error'); } catch { /* never block */ }
+      toast.error(t('error'));
+    }
     finally { setWalkInLoading(false); }
   };
 
@@ -1251,6 +1395,9 @@ export function AgencyFullscreen() {
   };
 
   const handleExitFullscreen = () => {
+    // Queue event log — guarded: the fullscreenchange listener fires for the
+    // SAME exit and must not log a second event.
+    logFullscreenExit();
     exitBrowserFullscreen();
     setView('agency-dashboard');
   };

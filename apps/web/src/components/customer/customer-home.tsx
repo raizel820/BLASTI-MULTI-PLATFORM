@@ -24,6 +24,7 @@
 import { apiFetch } from '@/lib/api-fetch';
 import { toLocalDateString } from '@/lib/date-utils';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+import { logQueue } from '@/lib/remote-logger';
 // Task 84 — IndexedDB stale-while-revalidate: the home screen paints instantly
 // from the last-known payload (even fully offline) and refreshes silently.
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
@@ -561,6 +562,17 @@ export function CustomerHome() {
 
       const data = await res.json();
       if (res.ok) {
+        // Queue event log — online ticket created from the home join flow.
+        try {
+          const r = data?.reservation;
+          logQueue('ticket_created_online', `Online ticket created (${r?.displayNumber || r?.queueNumber || 'ticket'})`, {
+            agencyId: pendingJoin.agencyId,
+            serviceId: chosenServiceId || undefined,
+            ticketId: r?.id,
+            ticketNumber: r?.displayNumber || r?.queueNumber,
+            source: 'online',
+          });
+        } catch { /* never block */ }
         toast.success(t('joinSuccess'));
         setSelectedAgency(null);
         setDateDialogOpen(false);
@@ -570,6 +582,8 @@ export function CustomerHome() {
         setFixedTimeEnabled(false);
         setView('customer-queue');
       } else {
+        // Queue event log — online join failed (endpoint error included).
+        try { logQueue('ticket_created_online', `Online join failed: ${data?.error || 'rejected'}`, { agencyId: pendingJoin.agencyId, serviceId: chosenServiceId || undefined, source: 'online' }, 'error'); } catch { /* never block */ }
         if (data.error === 'SERVICE_SELECTION_REQUIRED') {
           toast.error(t('selectServiceRequired'));
         } else {
@@ -577,6 +591,8 @@ export function CustomerHome() {
         }
       }
     } catch {
+      // Queue event log — online join network failure.
+      try { logQueue('ticket_created_online', 'Online join failed — network error', { agencyId: pendingJoin?.agencyId, serviceId: pendingJoin?.serviceId || undefined, source: 'online' }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setJoining(false);

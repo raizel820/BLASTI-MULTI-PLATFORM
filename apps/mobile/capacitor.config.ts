@@ -90,10 +90,22 @@ const config: CapacitorConfig = {
 
   // ─── Android Configuration ───────────────────────────────────────────────────
   android: {
-    // Strict-HTTPS: no mixed content. Dev cleartext is handled by the
-    // debug network-security-config + cleartext:isDev / androidScheme above;
-    // production loads https://blastidz.online only.
-    allowMixedContent: false,
+    // 0.6.92 — MIXED CONTENT MUST STAY ENABLED (root fix for "LAN discovery
+    // finished with NO desktop box found after 0s"). The production shell
+    // page is https://localhost (androidScheme below), and EVERY LAN probe —
+    // quickDiscover()'s http://<ip>:3080/api/discover sweep, the kiosk
+    // register/pair/heartbeat calls, LAN ticket printing via
+    // /api/agency-devices/discovery/print — is plain HTTP. With mixed
+    // content blocked the WebView rejects those fetches SYNCHRONOUSLY (no
+    // network wait): the whole 2x254-probe sweep drained in ~80ms and the
+    // log showed "0s (2 subnet(s) swept)". The Android cleartext gate is
+    // separately scoped by network_security_config.xml (release permits
+    // cleartext since 0.6.86 precisely for these LAN calls) — this flag is
+    // the WebView-layer gate that sits above it. NEVER flip this back to
+    // false: apps/mobile/docs/local-api-testing.md documents the same
+    // requirement, and the checked-in built assets config already carried
+    // `true` (cap sync kept regressing it from this source value).
+    allowMixedContent: true,
     backgroundColor: '#FFFFFF',
     buildOptions: {
       keystorePath: undefined,

@@ -34,6 +34,7 @@ import {
   Download,
   FileJson,
   FlaskConical,
+  ListOrdered,
   Loader2,
   RefreshCw,
   ScrollText,
@@ -66,6 +67,8 @@ import { AdminAgentLogsSection } from '@/components/admin/admin-agent-logs-secti
 import { AdminTxLogsSection } from '@/components/admin/admin-tx-logs-section';
 // 0.6.91 — DEVICE EVENT STREAM (scanning / pairing / connections / kiosk).
 import { AdminDeviceLogsSection } from '@/components/admin/admin-device-logs-section';
+// 0.6.94 — QUEUE EVENT STREAM (engine / tickets / counters / LAN sync / full-screen).
+import { AdminQueueLogsSection } from '@/components/admin/admin-queue-logs-section';
 import { AdminLogsExportDialog, type LogsExportScope } from '@/components/admin/admin-logs-export-dialog';
 import { LOG_TRIGGERS } from '@/lib/remote-logger';
 
@@ -197,12 +200,40 @@ const SEVERITIES = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const;
  *  slugs from future call sites are filterable too. */
 const ERROR_TRIGGERS = LOG_TRIGGERS;
 
+/** 0.6.93 — dual "local / UTC" timestamp rendering for human-facing exports.
+ *  The vault stores raw UTC ISO-8601 (Z); readers compared those numbers with
+ *  their wall clock and concluded payments were "logged hours early". The
+ *  client-side report now shows both values side by side. */
+function ymdHmsIn(d: Date, zone?: string): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;
+}
+
+function dualTsClient(iso: string | Date | null | undefined): string {
+  if (iso === null || iso === undefined || iso === '') return '';
+  const d = iso instanceof Date ? iso : new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const raw = d.toISOString();
+  let zone = 'UTC';
+  let loc = raw.slice(0, 19).replace('T', ' ');
+  try {
+    zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    loc = ymdHmsIn(d, zone);
+  } catch { /* keep UTC fallback */ }
+  const utcShort = raw.slice(0, 10) === loc.slice(0, 10) ? raw.slice(11, 19) : raw;
+  return `${loc} (${zone}) / ${utcShort} UTC`;
+}
+
 /** Client-side markdown render of a report payload (copy/download). */
 function reportToMarkdown(r: ReportPayload, lang: { t: (k: never) => string }): string {
   const L = [
     `# BLASTI Logs Analysis Report`,
     '',
-    `- Generated: ${r.generatedAt}`,
+    `- Generated: ${dualTsClient(r.generatedAt)}`,
     `- Scope: ${r.scope}`,
     `- Total tracked bugs: ${r.summary.totalErrors} (last 24h: ${r.summary.last24h})`,
     `- By severity: ${Object.entries(r.summary.bySeverity).map(([k, v]) => `${k}=${v}`).join(', ')}`,
@@ -222,7 +253,7 @@ function reportToMarkdown(r: ReportPayload, lang: { t: (k: never) => string }): 
       '',
       `- Fingerprint: \`${b.fp}\``,
       `- Level: ${b.level} · Severity score: ${b.severityScore}`,
-      `- First seen: ${b.firstSeen} · Last seen: ${b.lastSeen}`,
+      `- First seen: ${dualTsClient(b.firstSeen)} · Last seen: ${dualTsClient(b.lastSeen)}`,
       `- UIDs (${b.affected.uids.length}): ${b.affected.uids.slice(0, 10).join(', ')}${b.affected.uids.length > 10 ? ' …' : ''}`,
       `- Platforms: ${b.affected.platforms.join(', ')} · Roles: ${b.affected.roles.join(', ')}`,
       `- Triggers: ${(b.affected.triggers ?? []).join(', ') || 'n/a'}`,
@@ -237,7 +268,7 @@ function reportToMarkdown(r: ReportPayload, lang: { t: (k: never) => string }): 
       '',
     );
     for (const s of b.samples.slice(0, 3)) {
-      L.push(`- sample @ ${s.ts}: ${s.message.slice(0, 300)}`);
+      L.push(`- sample @ ${dualTsClient(s.ts)}: ${s.message.slice(0, 300)}`);
     }
     L.push('');
   }
@@ -493,6 +524,7 @@ export function AdminLogsManager() {
           <TabsTrigger value="transactions" className="gap-1"><CreditCard className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabTransactions')}</span></TabsTrigger>
           {/* 0.6.91 — DEVICE EVENT STREAM (scanning / pairing / connections / kiosk mode) */}
           <TabsTrigger value="devices" className="gap-1"><MonitorSmartphone className="h-3.5 w-3.5" /><span className="hidden sm:inline">Devices</span></TabsTrigger>
+          <TabsTrigger value="queue" className="gap-1"><ListOrdered className="h-3.5 w-3.5" /><span className="hidden sm:inline">Queue</span></TabsTrigger>
           <TabsTrigger value="raw" className="gap-1"><ScrollText className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabRaw')}</span></TabsTrigger>
         </TabsList>
 
@@ -849,6 +881,9 @@ export function AdminLogsManager() {
         <TabsContent value="devices" className="space-y-4">
           <AdminDeviceLogsSection />
         </TabsContent>
+        <TabsContent value="queue" className="space-y-4">
+          <AdminQueueLogsSection />
+        </TabsContent>
 
         {/* ── Raw logs (the moved vault) ──────────────────────────── */}
         <TabsContent value="raw">
@@ -900,7 +935,7 @@ export function AdminLogsManager() {
               <div>
                 <p className="text-[11px] font-semibold mb-1">{t('logsManagerSamples')}</p>
                 <pre className="text-[11px] leading-4 font-mono whitespace-pre-wrap break-all bg-muted/50 rounded-lg p-3 max-h-56 overflow-y-auto border" dir="ltr">
-                  {detail.samples.map((s) => `[${s.ts}] ${s.message}${s.data ? `\n  data: ${JSON.stringify(s.data).slice(0, 400)}` : ''}`).join('\n\n')}
+                  {detail.samples.map((s) => `[${dualTsClient(s.ts)}] ${s.message}${s.data ? `\n  data: ${JSON.stringify(s.data).slice(0, 400)}` : ''}`).join('\n\n')}
                 </pre>
               </div>
               <div className="flex justify-end gap-2 flex-wrap">
@@ -964,7 +999,7 @@ export function AdminLogsManager() {
                   {copied ? <Check className="h-3.5 w-3.5 me-1" /> : <Copy className="h-3.5 w-3.5 me-1" />}
                   {copied ? t('logsManagerCopied') : t('logsManagerCopy')}
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => downloadText(`blasti-logs-report-${new Date().toISOString().slice(0, 10)}.md`, report.md, 'text/markdown;charset=utf-8')}>
+                <Button variant="outline" size="sm" onClick={() => downloadText(`blasti-logs-report-${new Date().toLocaleDateString('en-CA')}.md`, report.md, 'text/markdown;charset=utf-8')}>
                   <Download className="h-3.5 w-3.5 me-1" />
                   {t('storageDownload')}
                 </Button>

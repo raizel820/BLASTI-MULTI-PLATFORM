@@ -29,6 +29,9 @@ import { appendTxEvent } from '../lib/tx-log'
 // and the shared transaction retry wrapper for status-update conflicts.
 import { claimNextTicket } from '../lib/queue-claim'
 import { withTxRetry } from '../lib/tx-retry'
+// Task 4-a — authoritative queue mutations land in the unified queue event
+// stream (appendQueueEvent never throws; additive logging only).
+import { appendQueueEvent } from '../lib/queue-event-log'
 // r21-7 — counter CONTROL engine: atomic claim / heartbeat / release /
 // transfer + takeover-request lifecycle (lib encodes the state machine;
 // these routes are its HTTP surface).
@@ -1092,7 +1095,7 @@ app.post('/branches/:id/counters', async (c) => {
       return c.json({ success: false, error: 'Branch not found' }, 404)
     }
 
-    await requireAgencyAccess(c, branch.agencyId)
+    const crudUser = await requireAgencyAccess(c, branch.agencyId)
 
     // Task 37-c: counter CRUD is an owner/manager domain — gated to
     // canManageBranches (owner/SUPER_ADMIN pass).
@@ -1169,9 +1172,33 @@ app.post('/branches/:id/counters', async (c) => {
       branchId,
     })
 
+    // Task 4-a — counter CRUD → queue event stream.
+    appendQueueEvent({
+      event: 'counter_created',
+      message: `Counter ${counter.name} (#${counter.number}) created`,
+      level: 'info',
+      identity: { uid: crudUser.id, userId: crudUser.id, username: crudUser.username, role: crudUser.role, agencyId: crudUser.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: branch.agencyId,
+      branchId,
+      counterId: counter.id,
+      counterName: counter.name,
+    })
+
     return c.json({ success: true, counter }, 201)
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_created',
+        message: `Counter create failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /branches/:id/counters' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1188,7 +1215,7 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
       return c.json({ success: false, error: 'Counter not found' }, 404)
     }
 
-    await requireAgencyAccess(c, counter.branch.agencyId)
+    const crudUser = await requireAgencyAccess(c, counter.branch.agencyId)
 
     // Task 37-c: counter CRUD is gated to canManageBranches (owner/SUPER_ADMIN pass).
     await requireAgencyAuthority(c, counter.branch.agencyId, 'canManageBranches')
@@ -1267,6 +1294,20 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
       branchId,
     })
 
+    // Task 4-a — counter CRUD → queue event stream.
+    appendQueueEvent({
+      event: 'counter_updated',
+      message: `Counter ${updated.name || counter.name} updated`,
+      level: 'info',
+      identity: { uid: crudUser.id, userId: crudUser.id, username: crudUser.username, role: crudUser.role, agencyId: crudUser.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: counter.branch.agencyId,
+      branchId,
+      counterId,
+      counterName: updated.name || counter.name,
+    })
+
     return c.json({
       success: true,
       // P2-10 — return the counter WITH its fresh binding so the UI does not
@@ -1280,6 +1321,16 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
     })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_updated',
+        message: `Counter update failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'PATCH /branches/:id/counters/:counterId' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1294,7 +1345,7 @@ app.delete('/branches/:id/counters/:counterId', async (c) => {
       return c.json({ success: false, error: 'Counter not found' }, 404)
     }
 
-    await requireAgencyAccess(c, counter.branch.agencyId)
+    const crudUser = await requireAgencyAccess(c, counter.branch.agencyId)
 
     // Task 37-c: counter CRUD is gated to canManageBranches (owner/SUPER_ADMIN pass).
     await requireAgencyAuthority(c, counter.branch.agencyId, 'canManageBranches')
@@ -1316,9 +1367,33 @@ app.delete('/branches/:id/counters/:counterId', async (c) => {
       branchId,
     })
 
+    // Task 4-a — counter CRUD → queue event stream (soft delete).
+    appendQueueEvent({
+      event: 'counter_deleted',
+      message: `Counter ${counter.name} deactivated`,
+      level: 'info',
+      identity: { uid: crudUser.id, userId: crudUser.id, username: crudUser.username, role: crudUser.role, agencyId: crudUser.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: counter.branch.agencyId,
+      branchId,
+      counterId,
+      counterName: counter.name,
+    })
+
     return c.json({ success: true, counter: updated })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_deleted',
+        message: `Counter delete failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'DELETE /branches/:id/counters/:counterId' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1441,6 +1516,20 @@ async function handleCounterClaim(c: Context) {
         staffId: member.staffId,
         branchId: counter.branchId,
       })
+      // Task 4-a — counter control acquisition → queue event stream.
+      appendQueueEvent({
+        event: 'counter_claimed',
+        message: `Counter ${counter.name} claimed by ${user.username}`,
+        level: 'info',
+        identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+        origin: 'server',
+        platform: 'server',
+        agencyId,
+        branchId: counter.branchId,
+        counterId: counter.id,
+        counterName: counter.name,
+        data: result.refreshed ? { refreshed: true } : undefined,
+      })
       return c.json({
         success: true,
         claimed: true,
@@ -1490,6 +1579,20 @@ async function handleCounterClaim(c: Context) {
             staffId: member.staffId,
             branchId: counter.branchId,
           })
+          // Task 4-a — force takeover (bypass approval) → queue event stream.
+          appendQueueEvent({
+            event: 'counter_claimed',
+            message: `Counter ${counter.name} force-claimed by ${user.username}`,
+            level: 'warn',
+            identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+            origin: 'server',
+            platform: 'server',
+            agencyId,
+            branchId: counter.branchId,
+            counterId: counter.id,
+            counterName: counter.name,
+            data: { forced: true },
+          })
           return c.json({
             success: true,
             claimed: true,
@@ -1508,6 +1611,16 @@ async function handleCounterClaim(c: Context) {
     return c.json({ success: false, error: result.error }, result.status as any)
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_claimed',
+        message: `Counter claim failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /counters/:counterId/claim' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 }
@@ -1522,11 +1635,39 @@ async function handleCounterHeartbeat(c: Context) {
     const user = await requireAuth(c)
     const result = await counterControlHeartbeat({ counterId: counter.id, agencyId: counter.agencyId, userId: user.id })
     if (!result.ok) {
+      // Task 4-a — heartbeat SUCCESS is never logged (far too chatty); only
+      // the lock-loss outcome is: the holder's control was stolen or force-
+      // transferred and its next keepalive failed.
+      if (result.error === 'COUNTER_CONTROL_LOST') {
+        appendQueueEvent({
+          event: 'counter_released',
+          message: `Counter ${counter.name} control lost via heartbeat failure`,
+          level: 'warn',
+          identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+          origin: 'server',
+          platform: 'server',
+          agencyId: counter.agencyId,
+          branchId: counter.branchId,
+          counterId: counter.id,
+          counterName: counter.name,
+          data: { reason: 'heartbeat_lost' },
+        })
+      }
       return c.json({ success: false, error: result.error }, result.status as any)
     }
     return c.json({ success: true, ok: true, counterId: counter.id })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_released',
+        message: `Counter heartbeat failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /counters/:counterId/heartbeat' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 }
@@ -1580,6 +1721,20 @@ async function handleCounterRelease(c: Context) {
       branchId: counter.branchId,
     })
 
+    // Task 4-a — counter control release → queue event stream.
+    appendQueueEvent({
+      event: 'counter_released',
+      message: `Counter ${counter.name} released by ${user.username}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      branchId: counter.branchId,
+      counterId: counter.id,
+      counterName: counter.name,
+    })
+
     const updated = await db.counter.findUnique({
       where: { id: counter.id },
       include: { branch: { select: { id: true, name: true } } },
@@ -1587,6 +1742,16 @@ async function handleCounterRelease(c: Context) {
     return c.json({ success: true, counter: updated })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_released',
+        message: `Counter release failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /counters/:counterId/release' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 }
@@ -1613,10 +1778,33 @@ app.post('/counters/release-mine', async (c) => {
         action: 'counter-released',
         counterId: counter.counterId,
       })
+      // Task 4-a — per-counter release line (logout releases only the caller's
+      // held counters — a handful at most).
+      appendQueueEvent({
+        event: 'counter_released',
+        message: `Counter ${counter.counterName} released (logout/session end)`,
+        level: 'info',
+        identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+        origin: 'server',
+        platform: 'server',
+        agencyId: counter.agencyId,
+        counterId: counter.counterId,
+        counterName: counter.counterName,
+      })
     }
     return c.json({ success: true, released: released.length })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_released',
+        message: `Counter release-mine failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /counters/release-mine' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1667,6 +1855,19 @@ app.post('/counters/:counterId/request-control', async (c) => {
         staffId: member.staffId,
         branchId: counter.branchId,
       })
+      // Task 4-a — a FREE counter claimed through the request-control route.
+      appendQueueEvent({
+        event: 'counter_claimed',
+        message: `Counter ${counter.name} claimed via control request (was free)`,
+        level: 'info',
+        identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+        origin: 'server',
+        platform: 'server',
+        agencyId,
+        branchId: counter.branchId,
+        counterId: counter.id,
+        counterName: counter.name,
+      })
       return c.json({ success: true, claimed: true, counter: claim.counter })
     }
 
@@ -1705,6 +1906,20 @@ app.post('/counters/:counterId/request-control', async (c) => {
         actor,
         holder: claim.controlledBy ?? null,
       })
+      // Task 4-a — takeover request filed → queue event stream.
+      appendQueueEvent({
+        event: 'counter_control_requested',
+        message: `Control of Counter ${counter.name} requested by ${user.username}`,
+        level: 'info',
+        identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+        origin: 'server',
+        platform: 'server',
+        agencyId,
+        branchId: counter.branchId,
+        counterId: counter.id,
+        counterName: counter.name,
+        data: { requestId: request.id },
+      })
       return c.json({
         success: true,
         claimed: false,
@@ -1716,6 +1931,16 @@ app.post('/counters/:counterId/request-control', async (c) => {
     return c.json({ success: false, error: claim.error }, claim.status as any)
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_control_requested',
+        message: `Counter control request failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /counters/:counterId/request-control' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1778,6 +2003,20 @@ async function handleCounterRequestResolve(c: Context, approve: boolean) {
         actor,
         requester: { userId: request.fromUserId },
       })
+      // Task 4-a — takeover approved (control transferred) → queue event stream.
+      appendQueueEvent({
+        event: 'counter_control_approved',
+        message: `Control of Counter ${request.counter.name} approved — transferred to requester`,
+        level: 'info',
+        identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+        origin: 'server',
+        platform: 'server',
+        agencyId: request.agencyId,
+        branchId: request.counter.branchId,
+        counterId: request.counter.id,
+        counterName: request.counter.name,
+        data: { requestId: request.id, requesterUserId: request.fromUserId },
+      })
       return c.json({ success: true, status: 'APPROVED', counter: transferred.counter })
     }
 
@@ -1798,9 +2037,33 @@ async function handleCounterRequestResolve(c: Context, approve: boolean) {
       actor,
       requester: { userId: request.fromUserId },
     })
+    // Task 4-a — takeover rejected → queue event stream.
+    appendQueueEvent({
+      event: 'counter_control_rejected',
+      message: `Control request for Counter ${request.counter.name} rejected by ${user.username}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: request.agencyId,
+      branchId: request.counter.branchId,
+      counterId: request.counter.id,
+      counterName: request.counter.name,
+      data: { requestId: request.id, requesterUserId: request.fromUserId },
+    })
     return c.json({ success: true, status: 'REJECTED' })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_control_rejected',
+        message: `Counter control request resolve failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /counters/requests/:requestId/approve|reject' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 }
@@ -1867,9 +2130,33 @@ app.post('/counters/:counterId/assign', async (c) => {
       counterId: counter.id,
       branchId: counter.branchId,
     })
+    // Task 4-a — owner force-assign → queue event stream.
+    appendQueueEvent({
+      event: 'counter_assigned',
+      message: `Counter ${counter.name} assigned by ${user.username}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      branchId: counter.branchId,
+      counterId: counter.id,
+      counterName: counter.name,
+      data: { assignedToUserId: targetUserId },
+    })
     return c.json({ success: true, claimed: true, assigned: true, counter: transferred.counter })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'counter_assigned',
+        message: `Counter assign failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /counters/:counterId/assign' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -3631,6 +3918,9 @@ app.post('/queue/call-next', async (c) => {
       counterId: effectiveCounterId,
       serviceId: serviceId ?? null,
       actorUserId: user.id,
+      // Task 4-a — identity rides into the shared claim lib so the ONE
+      // ticket_claimed event (emitted there) carries the acting staff.
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
     })
 
     const nextReservation = claim.ok ? (claim.reservation as any) : null
@@ -3757,6 +4047,18 @@ app.post('/queue/call-next', async (c) => {
       )
     }
     const err = authErrorResponse(error)
+    // Task 4-a — unexpected failures (DB errors, 5xx) land in the queue event
+    // stream; rate limits / auth / validation rejections are not logged.
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'claim_failed',
+        message: `Agency call-next failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /queue/call-next' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -3839,9 +4141,31 @@ app.post('/queue/toggle-pause', async (c) => {
       action: newPausedState ? 'paused' : 'resumed',
     })
 
+    // Task 4-a — queue-engine state change → queue event stream (event
+    // dispatched on the RESULTING state).
+    appendQueueEvent({
+      event: newPausedState ? 'queue_paused' : 'queue_resumed',
+      message: `Queue ${newPausedState ? 'paused' : 'resumed'} by ${pauseCaller.username}`,
+      level: 'info',
+      identity: { uid: pauseCaller.id, userId: pauseCaller.id, username: pauseCaller.username, role: pauseCaller.role, agencyId: pauseCaller.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+    })
+
     return c.json({ success: true, isPaused: newPausedState })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'queue_paused',
+        message: `Queue toggle-pause failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /queue/toggle-pause' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -4070,9 +4394,37 @@ app.post('/queue/walk-in', async (c) => {
     // Task 2-a — walk-in creation changes the reservation-derived counts.
     invalidateResponseCacheTag('stats', 'agencies')
 
+    // Task 4-a — walk-in creation → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_created_walkin',
+      message: `Walk-in created: ${reservation.displayNumber} for ${service.name}`,
+      level: 'info',
+      identity: { uid: walkInCaller.id, userId: walkInCaller.id, username: walkInCaller.username, role: walkInCaller.role, agencyId: walkInCaller.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      serviceId: resolvedServiceId,
+      serviceName: service.name,
+      ticketId: reservation.id,
+      ticketNumber: reservation.displayNumber,
+      source: 'walkin',
+      status: 'WAITING',
+      data: estimatedWait != null ? { estimatedWait } : undefined,
+    })
+
     return c.json({ success: true, reservation: { ...reservation, importToken }, importToken }, 201)
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_created_walkin',
+        message: `Walk-in creation failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /queue/walk-in' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -4132,9 +4484,37 @@ app.post('/queue/walk-in-token', async (c) => {
       data: { importToken: token },
     })
 
+    // Task 4-a — QR import-token issuance for a walk-in → queue event stream
+    // (the token import path support needs to trace).
+    appendQueueEvent({
+      event: 'ticket_created_walkin',
+      message: `Walk-in import token issued for ${reservation.displayNumber} (QR claim path)`,
+      level: 'info',
+      identity: { uid: tokenCaller.id, userId: tokenCaller.id, username: tokenCaller.username, role: tokenCaller.role, agencyId: tokenCaller.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      ticketId: reservation.id,
+      ticketNumber: reservation.displayNumber,
+      source: 'walkin',
+      status: reservation.status,
+      data: { tokenIssued: true },
+    })
+
     return c.json({ success: true, token })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_created_walkin',
+        message: `Walk-in token issuance failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /queue/walk-in-token' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -4166,6 +4546,9 @@ app.patch('/queue/:id', async (c) => {
         displayNumber: true,
         userId: true,
         counterId: true,
+        serviceId: true,
+        // Task 4-a — serviceMs on complete needs the call timestamp.
+        calledAt: true,
         agency: { select: { id: true, name: true, nameFr: true, nameAr: true } },
       },
     })
@@ -4287,6 +4670,22 @@ app.patch('/queue/:id', async (c) => {
       return c.json({ error: 'Reservation not found' }, 404)
     }
     if (actionOutcome.kind === 'CONFLICT') {
+      // Task 4-a — a raced status flip (retryable) is a logged failure outcome:
+      // the desk saw success-worthy intent but the row changed underneath it.
+      appendQueueEvent({
+        event: 'ticket_status_changed',
+        message: `Ticket ${reservation.displayNumber} ${action} raced a concurrent update — caller must retry`,
+        level: 'warn',
+        identity: { uid: queueActionCaller.id, userId: queueActionCaller.id, username: queueActionCaller.username, role: queueActionCaller.role, agencyId: queueActionCaller.agencyId },
+        origin: 'server',
+        platform: 'server',
+        agencyId: reservation.agencyId,
+        serviceId: reservation.serviceId,
+        counterId: reservation.counterId,
+        ticketId: id,
+        ticketNumber: reservation.displayNumber,
+        data: { action, route: 'PATCH /queue/:id' },
+      })
       return c.json({
         success: false,
         error: 'Ticket state changed concurrently — please retry',
@@ -4331,9 +4730,53 @@ app.patch('/queue/:id', async (c) => {
       displayNumber: reservation.displayNumber,
     })
 
+    // Task 4-a — dispatched status mutation → queue event stream. Canonical
+    // slugs per action; recall uses ticket_recalled, serve falls back to the
+    // generic ticket_status_changed with the action in data.
+    const actionEvent = action === 'complete' ? 'ticket_completed'
+      : action === 'no_show' ? 'ticket_no_show'
+      : action === 'cancel' ? 'ticket_cancelled'
+      : action === 'recall' ? 'ticket_recalled'
+      : 'ticket_status_changed'
+    const actionVerb = action === 'complete' ? 'completed'
+      : action === 'no_show' ? 'marked no-show'
+      : action === 'cancel' ? 'cancelled'
+      : action === 'recall' ? 'recalled'
+      : `status → ${status}`
+    appendQueueEvent({
+      event: actionEvent,
+      message: `Ticket ${reservation.displayNumber} ${actionVerb} by ${queueActionCaller.username}`,
+      level: 'info',
+      identity: { uid: queueActionCaller.id, userId: queueActionCaller.id, username: queueActionCaller.username, role: queueActionCaller.role, agencyId: queueActionCaller.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      counterId: reservation.counterId,
+      ticketId: id,
+      ticketNumber: reservation.displayNumber,
+      status,
+      // Service duration for completes: calledAt → now (may be absent on
+      // WAITING tickets that were completed directly).
+      serviceMs: action === 'complete' && reservation.calledAt
+        ? Date.now() - new Date(reservation.calledAt).getTime()
+        : undefined,
+      data: actionEvent === 'ticket_status_changed' ? { action } : undefined,
+    })
+
     return c.json({ success: true })
   } catch (error) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_status_changed',
+        message: `Queue action failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'PATCH /queue/:id' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })

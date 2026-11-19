@@ -72,6 +72,7 @@ import { apiFetch } from '@/lib/api-fetch';
 import { apiClient } from '@/lib/api-client';
 import { isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
+import { logQueue } from '@/lib/remote-logger';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 // Task 5-b — per-category terminology scope (owner side).
 import { useCategoryTermScope } from '@/hooks/use-category-terms';
@@ -499,6 +500,21 @@ export function AgencyDashboard() {
         body: JSON.stringify({ agencyId }),
       });
       if (res.ok) {
+        // Queue event log — ticket claimed (success; ticket identity comes
+        // from the response's reservation mirror). This surface sends no
+        // counterId, so the server-assigned one (if any) is used.
+        try {
+          const data = await res.json().catch(() => null);
+          const claimed = data?.reservation;
+          logQueue('ticket_claimed', `Ticket ${claimed?.displayNumber || claimed?.queueNumber || 'next'} called`, {
+            agencyId,
+            counterId: claimed?.counterId || undefined,
+            ticketId: claimed?.id,
+            ticketNumber: claimed?.displayNumber || claimed?.queueNumber,
+            serviceId: claimed?.serviceId || undefined,
+            status: 'CALLED',
+          });
+        } catch { /* never block */ }
         toast.success(t('statusCalled'));
         fetchData();
       } else {
@@ -510,9 +526,13 @@ export function AgencyDashboard() {
         else if (data.error === 'COUNTER_CONTROL_REQUIRED') errorMsg = t('counterControlRequired');
         else if (data.error === 'COUNTER_SETUP_REQUIRED') errorMsg = t('counterSetupRequiredTitle');
         else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
+        // Queue event log — call-next failed (endpoint error included).
+        try { logQueue('ticket_claimed', `Call-next failed: ${errorMsg}`, { agencyId }, 'error'); } catch { /* never block */ }
         toast.error(errorMsg);
       }
     } catch {
+      // Queue event log — call-next network failure.
+      try { logQueue('ticket_claimed', 'Call-next failed — network error', { agencyId }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setActionLoading(null);
@@ -528,10 +548,26 @@ export function AgencyDashboard() {
         body: JSON.stringify({ agencyId }),
       });
       if (res.ok) {
+        // Queue event log — pause state flipped. The response carries the
+        // authoritative new isPaused; fall back to the pre-toggle mirror.
+        try {
+          const data = await res.json().catch(() => null);
+          const nowPaused = data?.isPaused ?? !stats?.isPaused;
+          logQueue(nowPaused ? 'queue_paused' : 'queue_resumed', nowPaused ? 'Queue paused' : 'Queue resumed', { agencyId });
+        } catch { /* never block */ }
         toast.success(stats?.isPaused ? t('queueResumed') : t('queuePaused'));
         fetchData();
+      } else {
+        // Queue event log — toggle failed (endpoint error included). The slug
+        // reflects the ATTEMPTED action (stats.isPaused is the pre-toggle state).
+        try {
+          const data = await res.json().catch(() => null);
+          logQueue(stats?.isPaused ? 'queue_resumed' : 'queue_paused', `Toggle pause failed: ${data?.error || 'rejected'}`, { agencyId }, 'error');
+        } catch { /* never block */ }
       }
     } catch {
+      // Queue event log — toggle pause network failure.
+      try { logQueue(stats?.isPaused ? 'queue_resumed' : 'queue_paused', 'Toggle pause failed — network error', { agencyId }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setActionLoading(null);
@@ -540,6 +576,10 @@ export function AgencyDashboard() {
 
   const handleAction = async (entryId: string, action: 'complete' | 'no_show' | 'cancel') => {
     setActionLoading(`${entryId}-${action}`);
+    // Queue event slugs mirror the PATCH action.
+    const slug = action === 'complete' ? 'ticket_completed' : action === 'no_show' ? 'ticket_no_show' : 'ticket_cancelled';
+    const actionStatus = action === 'complete' ? 'COMPLETED' : action === 'no_show' ? 'NO_SHOW' : 'CANCELLED';
+    const actionLabel = action === 'complete' ? 'Mark-complete' : action === 'no_show' ? 'Mark no-show' : 'Cancel';
     try {
       const res = await apiFetch(`/api/agency/queue/${entryId}`, {
         method: 'PATCH',
@@ -547,13 +587,19 @@ export function AgencyDashboard() {
         body: JSON.stringify({ action }),
       });
       if (res.ok) {
+        // Queue event log — ticket status changed by staff.
+        try { logQueue(slug, `${actionLabel} succeeded`, { agencyId, ticketId: entryId, status: actionStatus }); } catch { /* never block */ }
         toast.success(t('success'));
         fetchData();
       } else {
         const data = await res.json();
+        // Queue event log — action failed (endpoint error included).
+        try { logQueue(slug, `${actionLabel} failed: ${data?.error || 'rejected'}`, { agencyId, ticketId: entryId }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — action network failure.
+      try { logQueue(slug, `${actionLabel} failed — network error`, { agencyId, ticketId: entryId }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setActionLoading(null);
@@ -592,6 +638,15 @@ export function AgencyDashboard() {
           failedCount++;
         }
       }
+      // Queue event log — ONE batch event (never per ticket) with counts.
+      try {
+        logQueue('batch_completed', `Batch complete: ${results.length - failedCount}/${results.length} tickets completed`, {
+          agencyId,
+          total: results.length,
+          successCount: results.length - failedCount,
+          failCount: failedCount,
+        }, failedCount > 0 ? 'warn' : 'info');
+      } catch { /* never block */ }
       if (failedCount === 0) {
         toast.success(t('success'));
       } else if (failedCount < results.length) {
@@ -767,6 +822,17 @@ export function AgencyDashboard() {
       });
       if (res.ok) {
         const data = await res.json();
+        // Queue event log — walk-in ticket created (success).
+        try {
+          const r = data?.reservation;
+          logQueue('ticket_created_walkin', `Walk-in ticket created (${r?.queueNumber || r?.displayNumber || 'ticket'})`, {
+            agencyId,
+            ...(walkInServiceId ? { serviceId: walkInServiceId } : {}),
+            ticketId: r?.id,
+            ticketNumber: r?.queueNumber || r?.displayNumber,
+            source: 'walkin',
+          });
+        } catch { /* never block */ }
         toast.success(t('walkInCustomerAdded'));
         setWalkInOpen(false);
         setWalkInName('');
@@ -785,9 +851,13 @@ export function AgencyDashboard() {
         fetchData();
       } else {
         const data = await res.json();
+        // Queue event log — walk-in creation failed (endpoint error included).
+        try { logQueue('ticket_created_walkin', `Walk-in creation failed: ${data?.error || 'rejected'}`, { agencyId, ...(walkInServiceId ? { serviceId: walkInServiceId } : {}), source: 'walkin' }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — walk-in creation network failure.
+      try { logQueue('ticket_created_walkin', 'Walk-in creation failed — network error', { agencyId, ...(walkInServiceId ? { serviceId: walkInServiceId } : {}), source: 'walkin' }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setWalkInLoading(false);
@@ -999,6 +1069,9 @@ export function AgencyDashboard() {
               variant="outline"
               size="sm"
               onClick={() => {
+                // Queue event log — desktop entry point into the full-screen
+                // display (the display surface itself is AgencyFullscreen).
+                try { logQueue('fullscreen_enter', 'agency console entered full-screen display', { agencyId }); } catch { /* never block */ }
                 try {
                   const el = document.documentElement;
                   if (el.requestFullscreen) el.requestFullscreen();

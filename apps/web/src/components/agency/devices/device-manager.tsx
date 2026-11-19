@@ -250,7 +250,10 @@ export function DeviceManager() {
   const onlineCount = devices.filter((d) => d.status === 'ONLINE').length;
   const needsAttention = devices.filter((d) => d.status === 'OFFLINE' || d.status === 'DISABLED').length;
   const visibleDiscovered = useMemo(
-    () => discoveredDevices.filter((d) => !dismissedIds.has(d.id) && d.ip !== '127.0.0.1'),
+    // 0.6.92 — ROUTER results are dropped here too (defense in depth: the
+    // scan shapers already filter them). The router/gateway is infrastructure
+    // the agency can never pair, print to or cast to — it must not render.
+    () => discoveredDevices.filter((d) => !dismissedIds.has(d.id) && d.ip !== '127.0.0.1' && d.type !== 'ROUTER'),
     [discoveredDevices, dismissedIds],
   );
   const hasDiscoveryContent = scanState.scanning || visibleDiscovered.length > 0 || unpairedDevices.length > 0;
@@ -1340,8 +1343,12 @@ function DiscoveredCard({
 }) {
   const isTv = device.type === 'TV';
   const isPrinter = device.type === 'PRINTER';
-  const isConnectable = !!device.ip && device.connectionType !== 'USB'
-    && ['PC', 'APP', 'KIOSK', 'PHONE', 'ROUTER', 'IOT', 'UNKNOWN'].includes(device.type);
+  const isConnectable = !!device.ip && (device.port ?? 0) > 0 && device.connectionType !== 'USB'
+    // 0.6.92 — ROUTER removed: the gateway is never a connectable peer.
+    // PORT > 0 required: a BLASTI phone announcing itself via the UDP pairing
+    // beacon has NO http server to probe (port 0) — it pairs through the
+    // pairing-request flow, not the connect probe.
+    && ['PC', 'APP', 'KIOSK', 'PHONE', 'IOT', 'UNKNOWN'].includes(device.type);
   const sourceCfg = DISCOVERY_SOURCE_CONFIG[device.source];
   const SourceIcon = sourceCfg?.icon ?? RadioTower;
   const typeCfg = device.type !== 'UNKNOWN' ? DEVICE_TYPE_CONFIG[device.type as keyof typeof DEVICE_TYPE_CONFIG] : null;

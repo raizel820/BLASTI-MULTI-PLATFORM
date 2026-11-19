@@ -17,6 +17,7 @@
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { apiFetch } from '@/lib/api-fetch';
+import { logQueue } from '@/lib/remote-logger';
 import type { Language } from '@/i18n';
 import { useLanguage } from '@/hooks/use-language';
 import { DeviceTvBoardDetailed } from './tv/tv-detailed';
@@ -192,15 +193,27 @@ export function DeviceTvBoard({ agencyId, onBack, currentLang }: DeviceTvBoardPr
 
   // ── Fullscreen (owned here — the data hook stays ref-free) ─────────────
   const shellRef = useRef<HTMLDivElement>(null);
+  // Queue event log guard — enter/exit must log ONCE per actual transition
+  // (the hotkey toggle AND the device-mode auto-request can both fire).
+  const tvFsLoggedRef = useRef<'enter' | 'exit' | null>(null);
   const toggleFullscreen = useCallback(async () => {
     try {
       if (!document.fullscreenElement) {
         await shellRef.current?.requestFullscreen();
+        // Queue event log — TV board entered full-screen (guarded).
+        if (tvFsLoggedRef.current !== 'enter') {
+          tvFsLoggedRef.current = 'enter';
+          try { logQueue('fullscreen_enter', 'TV board full-screen entered', agencyId ? { agencyId } : undefined); } catch { /* never block */ }
+        }
       } else {
         await document.exitFullscreen();
+        if (tvFsLoggedRef.current !== 'exit') {
+          tvFsLoggedRef.current = 'exit';
+          try { logQueue('fullscreen_exit', 'TV board full-screen exited', agencyId ? { agencyId } : undefined); } catch { /* never block */ }
+        }
       }
     } catch { /* user gesture required */ }
-  }, []);
+  }, [agencyId]);
 
   useEffect(() => {
     if (!tvData.isDeviceMode) return;
@@ -208,11 +221,17 @@ export function DeviceTvBoard({ agencyId, onBack, currentLang }: DeviceTvBoardPr
       try {
         if (!document.fullscreenElement && shellRef.current) {
           await shellRef.current.requestFullscreen();
+          // Queue event log — TV board auto-entered full-screen (guarded; the
+          // manual toggle may have logged this transition already).
+          if (tvFsLoggedRef.current !== 'enter') {
+            tvFsLoggedRef.current = 'enter';
+            try { logQueue('fullscreen_enter', 'TV board full-screen entered', agencyId ? { agencyId } : undefined); } catch { /* never block */ }
+          }
         }
       } catch { /* denied — needs a gesture */ }
     }, 1500);
     return () => clearTimeout(timer);
-  }, [tvData.isDeviceMode]);
+  }, [tvData.isDeviceMode, agencyId]);
 
   const lang: string = tvData.displaySettings.language || currentLang || appLang || 'en';
   const rtl = lang === 'ar';

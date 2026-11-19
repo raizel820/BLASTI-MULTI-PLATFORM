@@ -16,6 +16,9 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 // r21-7 — the unified queue authority gate (counter CONTROL) closes the
 // PUT /:id/status hole for staff-targeted transitions (CALLED/COMPLETED/SERVING).
 import { enforceQueueStaffAuthority, queueGateErrorBody } from './agency'
+// Task 4-a — authoritative queue mutations land in the unified queue event
+// stream (appendQueueEvent never throws; additive logging only).
+import { appendQueueEvent } from '../lib/queue-event-log'
 
 const app = new Hono()
 
@@ -274,6 +277,28 @@ app.post('/', async (c) => {
     emitReservationEvent('reservation:created', agencyId, userId, { reservationId: reservation.id, displayNumber: reservation.displayNumber, serviceId: resolvedServiceId, estimatedWait })
     emitNotificationEvent('notification:new', userId, { type: 'QUEUE_JOINED', title: 'Reservation Confirmed', message: `Your ticket ${reservation.displayNumber} for ${agency.name} - ${service.name}. Estimated wait: ${estimatedWait} minutes.` })
 
+    // Task 4-a — customer online booking → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_created_online',
+      message: `Online ticket ${reservation.displayNumber} created for ${service.name}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      serviceId: resolvedServiceId,
+      serviceName: service.name,
+      ticketId: reservation.id,
+      ticketNumber: reservation.displayNumber,
+      source: 'online',
+      status: 'WAITING',
+      data: {
+        ...(preferredTime ? { preferredTime } : {}),
+        ...(reservation.fixedTimeEnabled ? { fixedTimeEnabled: true } : {}),
+        ...(targetDate ? { reservedDate: targetDate } : {}),
+      },
+    })
+
     return c.json({ success: true, reservation }, 201)
   } catch (error: unknown) {
     if (error instanceof Error && error.message === 'DUPLICATE') {
@@ -283,6 +308,16 @@ app.post('/', async (c) => {
       return c.json({ success: false, error: 'Queue is full. Please try again later' }, 400)
     }
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_created_online',
+        message: `Online ticket creation failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -589,12 +624,36 @@ app.post('/reclaim', async (c) => {
     emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId ?? undefined, { reservationId: reservation.id, displayNumber: reservation.displayNumber, action: 'reclaimed' })
     emitQueueEvent('queue:updated', reservation.agencyId, { reservationId: reservation.id, displayNumber: reservation.displayNumber, action: 'reclaimed' })
 
+    // Task 4-a — position reclaim → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_reclaimed',
+      message: `Ticket ${reservation.displayNumber} reclaimed`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      ticketId: reservation.id,
+      ticketNumber: reservation.displayNumber,
+    })
+
     // Task 2-a — reclaim moves a ticket back into the callable set.
     invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_reclaimed',
+        message: `Ticket reclaim failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations/reclaim' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -632,12 +691,38 @@ app.delete('/cancel-active', async (c) => {
     emitQueueEvent('queue:updated', updated.agencyId, { reservationId: updated.id, displayNumber: updated.displayNumber, action: 'cancelled' })
     emitKioskEvent(updated.agencyId, { action: 'reservation-cancelled', displayNumber: updated.displayNumber })
 
+    // Task 4-a — customer self-cancel → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_cancelled',
+      message: `Customer self-cancel: ticket ${updated.displayNumber}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: updated.agencyId,
+      serviceId: updated.serviceId,
+      ticketId: updated.id,
+      ticketNumber: updated.displayNumber,
+      source: 'online',
+      status: 'CANCELLED',
+    })
+
     // Task 2-a — cancel removes a ticket from the waiting set.
     invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true, reservation: updated })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_cancelled',
+        message: `Customer self-cancel failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'DELETE /reservations/cancel-active' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -657,6 +742,10 @@ app.post('/batch-complete', async (c) => {
 
     const { reservationIds, agencyId } = validation.data
 
+    // Task 4-a — caller identity for the batch_completed event (captured at
+    // the auth gate below, consumed after the updateMany succeeds).
+    let batchCallerIdentity: { uid: string; userId: string; username: string; role: string; agencyId: string | null } | null = null
+
     let resolvedAgencyId = agencyId
     if (!resolvedAgencyId) {
       const firstRes = await db.reservation.findFirst({ where: { id: { in: reservationIds } }, select: { agencyId: true } })
@@ -664,7 +753,9 @@ app.post('/batch-complete', async (c) => {
     }
 
     if (resolvedAgencyId) {
-      await requireAgencyAccess(c, resolvedAgencyId)
+      const batchCaller = await requireAgencyAccess(c, resolvedAgencyId)
+      // Task 4-a — identity captured for the batch_completed event below.
+      batchCallerIdentity = { uid: batchCaller.id, userId: batchCaller.id, username: batchCaller.username, role: batchCaller.role, agencyId: batchCaller.agencyId }
     } else {
       return c.json({ error: 'Could not determine agency for these reservations' }, 400)
     }
@@ -702,6 +793,20 @@ app.post('/batch-complete', async (c) => {
       reservations: mergedReservations.map(r => ({ id: r.id, displayNumber: r.displayNumber, serviceId: r.serviceId })),
     })
     emitQueueEvent('queue:updated', resolvedAgencyId, { action: 'batch-completed', completedCount: results.count })
+
+    // Task 4-a — batch completion → ONE summary event with the count in data
+    // (never per-ticket lines inside the loop).
+    appendQueueEvent({
+      event: 'batch_completed',
+      message: `Batch completed ${results.count} ticket(s)${batchCallerIdentity?.username ? ` by ${batchCallerIdentity.username}` : ''}`,
+      level: 'info',
+      identity: batchCallerIdentity ?? undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId: resolvedAgencyId,
+      status: 'COMPLETED',
+      data: { completedCount: results.count },
+    })
     // Phase 3a: Emit kiosk events with merged data (original displayNumber + new status)
     for (const merged of mergedReservations) {
       emitKioskEvent(resolvedAgencyId, { action: 'reservation-completed', displayNumber: merged.displayNumber })
@@ -713,6 +818,16 @@ app.post('/batch-complete', async (c) => {
     return c.json({ success: true, updatedCount: results.count })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'batch_completed',
+        message: `Batch completion failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations/batch-complete' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -945,12 +1060,38 @@ app.post('/:id/postpone', async (c) => {
     emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId ?? undefined, { reservationId: id, displayNumber: reservation.displayNumber, action: 'postponed', positions, newQueueNumber: updated.queueNumber })
     emitQueueEvent('queue:position-changed', reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, action: 'postponed', positions })
 
+    // Task 4-a — position postponement → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_postponed',
+      message: `Ticket ${reservation.displayNumber} postponed ${positions} position(s)`,
+      level: 'info',
+      identity: reservation.userId ? { userId: reservation.userId } : undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      ticketId: id,
+      ticketNumber: reservation.displayNumber,
+      status: 'WAITING',
+      data: { positions, newQueueNumber: updated.queueNumber, postponeCount: updated.postponeCount },
+    })
+
     // Task 2-a — postpone re-orders the waiting set.
     invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true, reservation: updated })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_postponed',
+        message: `Ticket postponement failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations/:id/postpone' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -998,6 +1139,22 @@ app.post('/:id/rate', async (c) => {
 
     emitAgencyEvent('agency:updated', reservation.agencyId, { action: 'rating-submitted', reservationId: reservation.id, rating })
 
+    // Task 4-a — service rating → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_rated',
+      message: `Ticket ${reservation.displayNumber} rated ${rating}/5`,
+      level: 'info',
+      identity: reservation.userId ? { userId: reservation.userId } : undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      ticketId: reservation.id,
+      ticketNumber: reservation.displayNumber,
+      status: 'COMPLETED',
+      data: { rating },
+    })
+
     await db.auditLog.create({
       data: {
         userId: reservation.userId ?? undefined,
@@ -1011,6 +1168,16 @@ app.post('/:id/rate', async (c) => {
     return c.json({ success: true, rating, feedback: feedbackText || null, ratedAt: new Date().toISOString() })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_rated',
+        message: `Ticket rating failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations/:id/rate' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1117,6 +1284,22 @@ app.post('/:id/share', async (c) => {
 
     const displayNumber = `${reservation.service?.name?.substring(0, 1).toUpperCase() || ''}-${String(reservation.queueNumber).padStart(3, '0')}`
 
+    // Task 4-a — ticket status share → queue event stream (POST variant is the
+    // mutating surface clients call when a share link is issued).
+    appendQueueEvent({
+      event: 'ticket_shared',
+      message: `Ticket ${reservation.displayNumber} status shared`,
+      level: 'info',
+      identity: reservation.userId ? { userId: reservation.userId } : undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      ticketId: id,
+      ticketNumber: reservation.displayNumber,
+      status: reservation.status,
+    })
+
     return c.json({
       displayNumber,
       agencyName: reservation.agency.name,
@@ -1179,12 +1362,38 @@ app.post('/:id/cancel', async (c) => {
     emitQueueEvent('queue:updated', reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, action: 'cancelled' })
     emitKioskEvent(reservation.agencyId, { action: 'reservation-cancelled', displayNumber: reservation.displayNumber })
 
+    // Task 4-a — ticket cancellation (customer self-cancel or staff via the
+    // customer surface) → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_cancelled',
+      message: `Ticket ${reservation.displayNumber} cancelled via reservations API`,
+      level: 'info',
+      identity: reservation.userId ? { userId: reservation.userId } : undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      ticketId: id,
+      ticketNumber: reservation.displayNumber,
+      status: 'CANCELLED',
+    })
+
     // Task 2-a — customer-side cancel removes a ticket from the waiting set.
     invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_cancelled',
+        message: `Ticket cancellation failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations/:id/cancel' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1328,12 +1537,48 @@ app.put('/:id/status', async (c) => {
       emitKioskEvent(reservation.agencyId, { action: `reservation-${status.toLowerCase()}`, displayNumber: reservation.displayNumber })
     }
 
+    // Task 4-a — unified status transition → queue event stream. COMPLETED and
+    // NO_SHOW get their canonical slugs; everything else is ticket_status_changed
+    // with the from→to transition in the message.
+    appendQueueEvent({
+      event: status === 'COMPLETED' ? 'ticket_completed'
+        : status === 'NO_SHOW' ? 'ticket_no_show'
+        : 'ticket_status_changed',
+      message: `Ticket ${reservation.displayNumber}: ${reservation.status} → ${status}`,
+      level: 'info',
+      identity: reservation.userId ? { userId: reservation.userId } : undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      serviceName: reservation.service.name,
+      counterId: reservation.counterId,
+      counterName: reservation.counter?.name ?? null,
+      ticketId: id,
+      ticketNumber: reservation.displayNumber,
+      status,
+      serviceMs: status === 'COMPLETED' && reservation.calledAt
+        ? Date.now() - new Date(reservation.calledAt).getTime()
+        : undefined,
+      data: { previousStatus: reservation.status },
+    })
+
     // Task 2-a — status transitions change every reservation-derived count.
     invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true, reservation: updatedReservation })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_status_changed',
+        message: `Ticket status update failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'PUT /reservations/:id/status' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1391,9 +1636,35 @@ app.post('/:id/toggle-fixed-time', async (c) => {
 
     emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId ?? undefined, { reservationId: id, displayNumber: reservation.displayNumber, action: fixedTimeEnabled ? 'fixed-time-enabled' : 'fixed-time-disabled', fixedTimeEnabled, preferredTime: reservation.preferredTime })
 
+    // Task 4-a — fixed-time toggle → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_fixed_time_toggled',
+      message: `Fixed time ${fixedTimeEnabled ? 'enabled' : 'disabled'} for ${reservation.displayNumber}`,
+      level: 'info',
+      identity: reservation.userId ? { userId: reservation.userId } : undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      ticketId: id,
+      ticketNumber: reservation.displayNumber,
+      status: 'WAITING',
+      data: { fixedTimeEnabled, preferredTime: reservation.preferredTime },
+    })
+
     return c.json({ success: true, reservation: updated })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_fixed_time_toggled',
+        message: `Fixed-time toggle failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations/:id/toggle-fixed-time' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
@@ -1587,6 +1858,23 @@ app.post('/import-walk-in', async (c) => {
       console.warn('[Import-WalkIn] Failed to emit realtime event:', emitErr)
     }
 
+    // Task 4-a — QR walk-in import → queue event stream.
+    appendQueueEvent({
+      event: 'ticket_imported',
+      message: `Walk-in ticket ${reservation.displayNumber} imported to customer account`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId: reservation.agencyId,
+      serviceId: reservation.serviceId,
+      serviceName: reservation.service.name,
+      ticketId: reservation.id,
+      ticketNumber: reservation.displayNumber,
+      source: 'import',
+      status: reservation.status,
+    })
+
     return c.json({
       success: true,
       message: 'Walk-in reservation imported to your queue',
@@ -1604,6 +1892,16 @@ app.post('/import-walk-in', async (c) => {
     })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'ticket_imported',
+        message: `Walk-in import failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        data: { route: 'POST /reservations/import-walk-in' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })

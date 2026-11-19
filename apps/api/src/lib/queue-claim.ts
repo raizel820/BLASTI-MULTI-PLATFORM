@@ -42,6 +42,11 @@ import { db } from '@blasti/db'
 import { partitionWaiting, WAITING_CRITERIA_SELECT } from './queue-waiting'
 import { recordSyncChange } from './sync-helpers'
 import { withTxRetry } from './tx-retry'
+// Task 4-a — server-authoritative queue mutations land in the unified queue
+// event stream (logs/_queue/<day>.ndjson). This lib is THE choke point for
+// every call-next surface, so the claim lifecycle (claimed / contention /
+// failed) is logged here ONCE — callers only pass the acting identity.
+import { appendQueueEvent, type QueueEventIdentity } from './queue-event-log'
 
 export interface ClaimNextTicketParams {
   agencyId: string
@@ -51,6 +56,8 @@ export interface ClaimNextTicketParams {
   serviceId?: string | null
   /** Authenticated staff id for the QUEUE_CALL audit row. */
   actorUserId?: string | null
+  /** Caller identity for the queue event stream (who pressed call-next). */
+  identity?: QueueEventIdentity | null
 }
 
 export interface ClaimCounts {
@@ -96,8 +103,8 @@ export async function claimNextTicketTx(
   if (counterId) {
     const counterCalled = (await tx.reservation.findMany({
       where: { counterId, status: 'CALLED' },
-      select: { id: true, displayNumber: true },
-    })) as { id: string; displayNumber: string }[]
+      select: { id: true, displayNumber: true, calledAt: true },
+    })) as { id: string; displayNumber: string; calledAt: Date | null }[]
     for (const called of counterCalled) {
       await tx.reservation.update({
         where: { id: called.id },
@@ -118,6 +125,23 @@ export async function claimNextTicketTx(
         },
       })
       autoCompleted.push({ id: called.id, displayNumber: called.displayNumber })
+      // Task 4-a — the implicit auto-complete is an authoritative mutation:
+      // log it (service duration = called → auto-completed) so the ticket
+      // timeline never shows a gap between CALLED and the next claim.
+      appendQueueEvent({
+        event: 'ticket_completed',
+        message: `Auto-completed ${called.displayNumber} when the counter called next`,
+        level: 'info',
+        identity: params.identity ?? undefined,
+        origin: 'server',
+        platform: 'server',
+        agencyId,
+        counterId,
+        ticketId: called.id,
+        ticketNumber: called.displayNumber,
+        status: 'COMPLETED',
+        serviceMs: called.calledAt ? Date.now() - new Date(called.calledAt).getTime() : undefined,
+      })
     }
   }
 
@@ -157,9 +181,33 @@ export async function claimNextTicketTx(
   if (serviceId) {
     if (boundServiceIds) {
       if (!boundServiceIds.includes(serviceId)) {
+        appendQueueEvent({
+          event: 'claim_failed',
+          message: 'Call-next found no callable ticket — service is not bound to this counter',
+          level: 'warn',
+          identity: params.identity ?? undefined,
+          origin: 'server',
+          platform: 'server',
+          agencyId,
+          serviceId,
+          counterId,
+          data: { scope: 'counter-binding' },
+        })
         return { ok: false, kind: 'NO_CALLABLE', counts: { waitingCount: 0, callableCount: 0, scheduledCount: 0 } }
       }
     } else if (agencyBoundServiceIds.includes(serviceId)) {
+      appendQueueEvent({
+        event: 'claim_failed',
+        message: 'Call-next found no callable ticket — service is bound to another counter',
+        level: 'warn',
+        identity: params.identity ?? undefined,
+        origin: 'server',
+        platform: 'server',
+        agencyId,
+        serviceId,
+        counterId,
+        data: { scope: 'agency-binding' },
+      })
       return { ok: false, kind: 'NO_CALLABLE', counts: { waitingCount: 0, callableCount: 0, scheduledCount: 0 } }
     }
   }
@@ -195,10 +243,30 @@ export async function claimNextTicketTx(
   }
 
   if (callable.length === 0) {
+    // Task 4-a — "empty queue claim" is a logged failure outcome: staff pressed
+    // call-next and nothing was callable. Distinguish scheduled-only queues
+    // (tickets booked for later) from a genuinely empty queue.
+    appendQueueEvent({
+      event: 'claim_failed',
+      message: scheduled.length > 0
+        ? `Call-next found no callable ticket — ${scheduled.length} waiting booked for a later time`
+        : 'Call-next found no callable ticket',
+      level: 'warn',
+      identity: params.identity ?? undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      serviceId: serviceId ?? null,
+      counterId,
+      data: { waitingCount: waiting.length, callableCount: 0, scheduledCount: scheduled.length },
+    })
     return { ok: false, kind: 'NO_CALLABLE', counts }
   }
 
   // ── OCC claim loop: first candidate whose WAITING row we atomically win ──
+  // Task 4-a — every candidate taken by a concurrent desk mid-transaction is
+  // claim contention; the count is reported once per claim (below).
+  let candidatesLost = 0
   for (const cand of callable) {
     const occ = await tx.reservation.updateMany({
       where: { id: cand.id, status: 'WAITING' },
@@ -211,6 +279,7 @@ export async function claimNextTicketTx(
     if (occ.count === 0) {
       // Another desk/cron won THIS ticket between our read and our write —
       // DB-level mutual exclusion held; advance to the next candidate.
+      candidatesLost++
       continue
     }
 
@@ -282,11 +351,67 @@ export async function claimNextTicketTx(
       },
     })
 
+    // Task 4-a — ONE queue-event-stream line per claim (both call-next
+    // surfaces share this lib, so the emission cannot drift between them).
+    // waitMs = joinedAt → now (Reservation has NO createdAt column — Task 24).
+    const claimCounterLabel = claimed.counter?.name
+      ? `Counter ${claimed.counter.name}`
+      : claimed.counter ? `Counter #${claimed.counter.number}` : 'counter'
+    const staffLabel = params.identity?.username ? ` (${params.identity.username})` : ''
+    appendQueueEvent({
+      event: 'ticket_claimed',
+      message: `Call-next: ${claimed.displayNumber} assigned to ${claimCounterLabel}${staffLabel}`,
+      level: candidatesLost > 0 ? 'warn' : 'info',
+      identity: params.identity ?? undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      serviceId: claimed.serviceId,
+      serviceName: claimed.service?.name ?? null,
+      counterId: counterId ?? claimed.counterId ?? null,
+      counterName: claimed.counter?.name ?? null,
+      ticketId: claimed.id,
+      ticketNumber: claimed.displayNumber,
+      source: claimed.isWalkIn ? 'walkin' : 'online',
+      status: 'CALLED',
+      waitMs: claimed.joinedAt ? Date.now() - new Date(claimed.joinedAt).getTime() : undefined,
+      data: candidatesLost > 0 ? { candidatesLost } : undefined,
+    })
+    if (candidatesLost > 0) {
+      appendQueueEvent({
+        event: 'claim_contention',
+        message: `Call-next contention: ${candidatesLost} ticket(s) taken by concurrent desks — next candidate claimed`,
+        level: 'warn',
+        identity: params.identity ?? undefined,
+        origin: 'server',
+        platform: 'server',
+        agencyId,
+        counterId,
+        ticketId: claimed.id,
+        ticketNumber: claimed.displayNumber,
+        data: { candidatesLost },
+      })
+    }
+
     return { ok: true, reservation: claimed, autoCompleted, counts }
   }
 
   // Every callable candidate was taken by a concurrent claimant between our
   // read and our write. Surface CONFLICT so the caller can retry cleanly —
   // falling back to any local state here could double-call a ticket.
+  if (candidatesLost > 0) {
+    appendQueueEvent({
+      event: 'claim_contention',
+      message: `Call-next contention: ${candidatesLost} callable ticket(s) taken by concurrent desks — caller must retry`,
+      level: 'warn',
+      identity: params.identity ?? undefined,
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      serviceId: serviceId ?? null,
+      counterId,
+      data: { candidatesLost, callableCount: counts.callableCount },
+    })
+  }
   return { ok: false, kind: 'CONFLICT', counts }
 }

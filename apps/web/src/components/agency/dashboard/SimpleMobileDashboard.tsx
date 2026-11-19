@@ -14,6 +14,7 @@ import {
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+import { logQueue } from '@/lib/remote-logger';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
 import { CreateAgencyForm } from '@/components/agency/create-agency-form';
 
@@ -443,6 +444,20 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
 
       if (res.ok) {
         const data = await res.json();
+        // Queue event log — ticket claimed from the mobile surface (success;
+        // ticket identity comes from the response's reservation mirror).
+        try {
+          const claimed = data?.reservation;
+          logQueue('ticket_claimed', `Ticket ${claimed?.displayNumber || claimed?.queueNumber || 'next'} called`, {
+            agencyId,
+            counterId: myControlledCounter?.id || claimed?.counterId || undefined,
+            counterName: myControlledCounter?.name || undefined,
+            ticketId: claimed?.id,
+            ticketNumber: claimed?.displayNumber || claimed?.queueNumber,
+            serviceId: claimed?.serviceId || undefined,
+            status: 'CALLED',
+          });
+        } catch { /* never block */ }
         toast.success(t('statusCalled') || 'Customer called!');
         setIsPulsing(true);
         playSound();
@@ -450,6 +465,8 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
         fetchData();
       } else {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — call-next failed (endpoint error included).
+        try { logQueue('ticket_claimed', `Call-next failed: ${data.error || 'rejected'}`, { agencyId, counterId: myControlledCounter?.id || undefined }, 'error'); } catch { /* never block */ }
         // r21-8 — control-model 403 gates (lost lease / gate rename).
         if (data.error === 'COUNTER_CONTROL_LOST') {
           setMyControlledCounter(null);
@@ -464,6 +481,8 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
         }
       }
     } catch {
+      // Queue event log — call-next network failure.
+      try { logQueue('ticket_claimed', 'Call-next failed — network error', { agencyId, counterId: myControlledCounter?.id || undefined }, 'error'); } catch { /* never block */ }
       toast.error(t('error') || 'Failed to call next');
     } finally {
       setActionLoading(null);
@@ -481,14 +500,20 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
       });
 
       if (res.ok) {
+        // Queue event log — ticket completed from the mobile surface.
+        try { logQueue('ticket_completed', 'Ticket marked completed', { agencyId, ticketId: currentlyServing.id, ticketNumber: currentlyServing.displayNumber || undefined, status: 'COMPLETED' }); } catch { /* never block */ }
         toast.success(t('markCompleted') || 'Marked as completed');
         setCurrentlyServing(null);
         fetchData();
       } else {
         const data = await res.json();
+        // Queue event log — mark-complete failed (endpoint error included).
+        try { logQueue('ticket_completed', `Mark-complete failed: ${data?.error || 'rejected'}`, { agencyId, ticketId: currentlyServing.id }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error') || 'Failed to update');
       }
     } catch {
+      // Queue event log — mark-complete network failure.
+      try { logQueue('ticket_completed', 'Mark-complete failed — network error', { agencyId, ticketId: currentlyServing?.id }, 'error'); } catch { /* never block */ }
       toast.error(t('error') || 'Failed to update status');
     } finally {
       setActionLoading(null);
@@ -506,14 +531,20 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
       });
 
       if (res.ok) {
+        // Queue event log — ticket marked no-show from the mobile surface.
+        try { logQueue('ticket_no_show', 'Ticket marked no-show', { agencyId, ticketId: currentlyServing.id, ticketNumber: currentlyServing.displayNumber || undefined, status: 'NO_SHOW' }); } catch { /* never block */ }
         toast.success(t('statusNoShow') || 'Marked as no-show');
         setCurrentlyServing(null);
         fetchData();
       } else {
         const data = await res.json();
+        // Queue event log — mark no-show failed (endpoint error included).
+        try { logQueue('ticket_no_show', `Mark no-show failed: ${data?.error || 'rejected'}`, { agencyId, ticketId: currentlyServing.id }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error') || 'Failed to update');
       }
     } catch {
+      // Queue event log — mark no-show network failure.
+      try { logQueue('ticket_no_show', 'Mark no-show failed — network error', { agencyId, ticketId: currentlyServing?.id }, 'error'); } catch { /* never block */ }
       toast.error(t('error') || 'Failed to update status');
     } finally {
       setActionLoading(null);
@@ -533,13 +564,21 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
       });
 
       if (res.ok) {
+        // Queue event log — pause state flipped (the legacy endpoint itself
+        // selects pause vs resume).
+        try { logQueue(isCurrentlyPaused ? 'queue_resumed' : 'queue_paused', isCurrentlyPaused ? 'Queue resumed' : 'Queue paused', { agencyId }); } catch { /* never block */ }
         toast.success(stats?.isPaused ? (t('queueResumed') || 'Queue resumed') : (t('queuePaused') || 'Queue paused'));
         fetchData();
       } else {
         const data = await res.json();
+        // Queue event log — toggle failed (endpoint error included). The slug
+        // reflects the ATTEMPTED action.
+        try { logQueue(isCurrentlyPaused ? 'queue_resumed' : 'queue_paused', `Toggle pause failed: ${data?.error || 'rejected'}`, { agencyId }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error') || 'Failed to update');
       }
     } catch {
+      // Queue event log — toggle pause network failure.
+      try { logQueue(stats?.isPaused ? 'queue_resumed' : 'queue_paused', 'Toggle pause failed — network error', { agencyId }, 'error'); } catch { /* never block */ }
       toast.error(t('error') || 'Failed to update queue');
     } finally {
       setActionLoading(null);

@@ -3023,6 +3023,12 @@ function devicesResponse(category?: string, status?: string) {
   let devices = [...scanDevices]
   if (category) devices = devices.filter((d) => d.category === category.toUpperCase())
   if (status) devices = devices.filter((d) => d.status === status.toUpperCase())
+  // 0.6.92 — routers/gateways NEVER appear in the manager's scan results
+  // (user report: "يظهر الرواتر أيضا رغم أنه لا داعي لإظهاره في النتائج").
+  // The scanner still classifies them (evidence for OTHER devices), but the
+  // listing is infrastructure the agency cannot pair, print to or cast to —
+  // pure noise in the results strip.
+  devices = devices.filter((d) => d.type !== 'ROUTER')
   return {
     devices,
     total: devices.length,

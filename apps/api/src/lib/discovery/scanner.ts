@@ -291,7 +291,11 @@ const SSDP_PORT = 1900
 // port every few seconds; the scanner listens for it and turns those
 // announcements into high-confidence BLASTI devices without any probing.
 const BEACON_UDP_PORT = 3081
-const BEACON_LISTEN_MS = 2000
+// 0.6.92 — 2s missed the phone beacon too often (phone broadcasts every
+// 1.5s; a 2s window catches ONE packet and any loss/desync silently drops
+// the phone from the scan). 6s catches ~4 packets, still far inside the
+// 25s scan deadline (the listener runs CONCURRENTLY with ping/TCP/mDNS).
+const BEACON_LISTEN_MS = 6000
 
 /** mDNS service types we actively query for.
  *
@@ -3169,11 +3173,14 @@ function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCateg
   // ── 1. BLASTI app detection ──
   // 0.6.78: the mDNS TXT record / /api/discover marker can distinguish the
   // app running in KIOSK mode from the desktop / counter-PC shell.
+  // 0.6.92: the mobile app's UDP pairing beacon arrives with mode 'phone' —
+  // classified as a PHONE device so the manager's card reads "BLASTI app".
   const isBlasti = joined.includes('blasti') || joined.includes('blast') || !!input.blastiMode
   if (isBlasti) {
     const kioskMode = input.blastiMode === 'kiosk' || /kiosk/i.test(joined)
+    const phoneMode = input.blastiMode === 'phone'
     const name = safeFriendlyName || input.httpTitle || bestSecondaryName || `BLASTI @ ${input.ip}`
-    return { category: 'BLASTI', type: kioskMode ? 'KIOSK' : 'APP', name }
+    return { category: 'BLASTI', type: kioskMode ? 'KIOSK' : phoneMode ? 'PHONE' : 'APP', name }
   }
 
   // ── 2. UPnP category (any SSDP response counts) ──
@@ -3859,23 +3866,34 @@ export async function runDiscoveryScan(
 
     // ── Harvest STAGE A results ──
 
-    // Beacon announcements — self-identified BLASTI shells. The payload may
-    // carry mode ('kiosk'/'desktop'), appVersion and LAN-authority extras.
+    // Beacon announcements — self-identified BLASTI shells AND (0.6.92)
+    // phones announcing readiness for pairing. The payload may carry mode
+    // ('kiosk'/'desktop'/'phone'), appVersion and LAN-authority extras.
     for (const b of beacons) {
       if (cb.isAborted()) break
       if (!subnets.some((s) => b.ip.startsWith(s + '.'))) continue
+      const isPhone = b.service === 'blasti-phone' || b.mode === 'phone'
       upsertDevice(b.ip, {
         source: 'udp-beacon',
         port: b.port || 0,
-        httpServer: 'blasti-local',
+        // The phone runs no http server — only shells carry the marker.
+        httpServer: isPhone ? undefined : 'blasti-local',
         friendlyName: b.name,
-        name: b.name,
-        blastiMode: b.mode === 'kiosk' ? 'kiosk' : b.mode === 'desktop' ? 'desktop' : undefined,
+        name: isPhone && b.status ? `${b.name} — ${b.status}` : b.name,
+        blastiMode: b.mode === 'kiosk'
+          ? 'kiosk'
+          : b.mode === 'desktop'
+            ? 'desktop'
+            : isPhone
+              ? 'phone'
+              : undefined,
         appVersion: b.appVersion,
         blastiInfo: b.instanceId
           ? { instanceId: b.instanceId, master: !!b.master, role: b.role }
-          : undefined,
-        capabilities: ['UDP_BEACON'],
+          : isPhone && b.uid
+            ? { role: `pairing:${b.status || 'ready'}` }
+            : undefined,
+        capabilities: isPhone ? ['UDP_BEACON', 'BLASTI_PHONE'] : ['UDP_BEACON'],
       })
     }
 
@@ -4336,6 +4354,11 @@ interface UdpBeaconRecord {
   instanceId?: string
   master: boolean
   role?: string
+  /** 0.6.92 — 'blasti-local' (shell) or 'blasti-phone' (mobile pairing beacon). */
+  service?: string
+  /** 0.6.92 — blasti-phone payload extras (uid fingerprint, pairing status). */
+  uid?: string
+  status?: string
 }
 
 /**
@@ -4372,7 +4395,14 @@ function listenForUdpBeacons(
     sock.on('message', (msg: Buffer, rinfo: dgram.RemoteInfo) => {
       try {
         const payload = JSON.parse(msg.toString('utf8'))
-        if (!payload || payload.service !== 'blasti-local' || !rinfo || !rinfo.address) return
+        // 0.6.92 — TWO announcer families now share this channel:
+        //   'blasti-local' — desktop/kiosk shells (main.js startLanBeacon),
+        //   'blasti-phone' — the mobile app's native pairing beacon
+        //     (BlastiNativeStatus.startPairingBeacon — the phone announcing
+        //     "I am here and ready for pairing"; user request 0.6.92).
+        if (!payload || !rinfo || !rinfo.address) return
+        const svc = typeof payload.service === 'string' ? payload.service : ''
+        if (svc !== 'blasti-local' && svc !== 'blasti-phone') return
         if (selfIps && selfIps.has(rinfo.address)) return // our own broadcast
         const name = typeof payload.name === 'string' && payload.name.trim()
           ? payload.name.trim().slice(0, 100)
@@ -4381,7 +4411,10 @@ function listenForUdpBeacons(
             : `BLASTI @ ${rinfo.address}`)
         found.set(rinfo.address, {
           ip: rinfo.address,
-          port: Number(payload.httpPort) || Number(payload.port) || 3080,
+          // The phone runs NO http server — port stays 0 (never probed).
+          port: svc === 'blasti-phone'
+            ? 0
+            : Number(payload.httpPort) || Number(payload.port) || 3080,
           name,
           // 0.6.78 — pass through the BLASTI identity fields so the scan can
           // mark kiosk vs desktop mode, version and LAN-authority role.
@@ -4390,6 +4423,9 @@ function listenForUdpBeacons(
           instanceId: typeof payload.instanceId === 'string' ? payload.instanceId : undefined,
           master: !!payload.master,
           role: typeof payload.role === 'string' ? payload.role : undefined,
+          service: svc,
+          uid: typeof payload.uid === 'string' ? payload.uid.slice(0, 64) : undefined,
+          status: typeof payload.status === 'string' ? payload.status.slice(0, 40) : undefined,
         })
       } catch { /* non-JSON packet — ignore */ }
     })

@@ -4199,6 +4199,8 @@ const en: Record<TranslationKeys, string> = {
   txLogColCheckout: "Checkout",
   logsExportScopeTransactions: "Export transaction events",
   logsExportTypeTransactions: "Transaction events",
+  logsExportScopeQueue: "Export queue events",
+  logsExportTypeQueue: "Queue events",
   logsManagerAutoRefresh: "Auto-refresh",
   logsManagerKpiBugs: "Tracked bugs",
   logsManagerKpiLast24h: "Active last 24h",

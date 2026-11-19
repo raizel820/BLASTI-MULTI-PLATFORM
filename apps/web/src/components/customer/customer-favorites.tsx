@@ -19,6 +19,7 @@ import { toLocalDateString } from '@/lib/date-utils';
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 // 0.6.16 — revalidate view data when the app resumes to the foreground
 import { useResumeRefresh } from '@/lib/resume-refresh';
+import { logQueue } from '@/lib/remote-logger';
 
 import { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -185,6 +186,18 @@ export function CustomerFavorites() {
         body: JSON.stringify(body),
       });
       if (res.ok) {
+        // Queue event log — online ticket created from the favorites flow.
+        try {
+          const d = await res.json().catch(() => null);
+          const r = d?.reservation;
+          logQueue('ticket_created_online', `Online ticket created (${r?.displayNumber || r?.queueNumber || 'ticket'})`, {
+            agencyId: pendingAgencyId || undefined,
+            ticketId: r?.id,
+            ticketNumber: r?.displayNumber || r?.queueNumber,
+            serviceId: r?.serviceId || undefined,
+            source: 'online',
+          });
+        } catch { /* never block */ }
         toast.success(t('joinSuccess'));
         setDateDialogOpen(false);
         setPendingAgencyId(null);
@@ -193,6 +206,8 @@ export function CustomerFavorites() {
         const data = await res.json();
         // r23 — the agency serves several services: the API refuses a
         // service-less join; point the customer at the agency page picker.
+        // Queue event log — online join failed (endpoint error included).
+        try { logQueue('ticket_created_online', `Online join failed: ${data?.error || 'rejected'}`, { agencyId: pendingAgencyId || undefined, source: 'online' }, 'error'); } catch { /* never block */ }
         if (data.error === 'SERVICE_SELECTION_REQUIRED') {
           toast.error(t('selectServiceRequired'));
         } else {
@@ -200,6 +215,8 @@ export function CustomerFavorites() {
         }
       }
     } catch {
+      // Queue event log — online join network failure.
+      try { logQueue('ticket_created_online', 'Online join failed — network error', { agencyId: pendingAgencyId || undefined, source: 'online' }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setJoining(false);

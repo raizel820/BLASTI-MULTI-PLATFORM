@@ -80,6 +80,12 @@ import {
   summarizeDeviceEntries,
   type DeviceFilters,
 } from '../lib/device-event-log'
+import {
+  appendQueueEvent,
+  readQueueEntries,
+  summarizeQueueEntries,
+  type QueueFilters,
+} from '../lib/queue-event-log'
 
 const app = new Hono()
 
@@ -194,7 +200,9 @@ function sanitizeEntry(raw: IncomingEntry): Record<string, unknown> | null {
   ), ...(
     // 0.6.81 — the transaction channel survives sanitization so the ingest
     // mirror can route these entries into the dedicated tx stream.
-    raw.channel === 'transactions' ? { channel: 'transactions' as const } : {}
+    raw.channel === 'transactions' || raw.channel === 'device' || raw.channel === 'queue'
+    ? (raw.channel as 'transactions' | 'device' | 'queue')
+    : {}
   ) }
 }
 
@@ -520,6 +528,59 @@ app.post('/', async (c) => {
           deviceType: typeof d.deviceType === 'string' ? d.deviceType : undefined,
           sessionId: typeof d.sessionId === 'string' ? d.sessionId : undefined,
           status: typeof d.status === 'string' ? d.status : undefined,
+        })
+      } catch { /* the mirror never fails the ingestion */ }
+    }
+  }
+
+  // ── 0.6.94 — QUEUE CHANNEL MIRROR (one pipeline, one store) ──
+  // Entries tagged channel:'queue' (client queue-engine funnel logger) are
+  // mirrored into the dedicated cross-account stream
+  // logs/_queue/<date>.ndjson — the Logs Manager "Queue" tab reads exactly
+  // that stream. The account-vault write above is untouched.
+  const queueMirrored = sanitized.filter((e) => (e as { channel?: string }).channel === 'queue')
+  if (queueMirrored.length > 0) {
+    for (const e of queueMirrored) {
+      const d = (e.data && typeof e.data === 'object' ? e.data : {}) as Record<string, unknown>
+      try {
+        appendQueueEvent({
+          event: typeof d.event === 'string' ? d.event : 'unknown',
+          message: String(e.message ?? ''),
+          level: typeof e.level === 'string' && ['debug', 'info', 'warn', 'error'].includes(e.level)
+            ? (e.level as 'debug' | 'info' | 'warn' | 'error')
+            : 'info',
+          data: d.event !== undefined
+            ? Object.fromEntries(Object.entries(d).filter(([k]) => ![
+              'event', 'agencyId', 'branchId', 'serviceId', 'serviceName', 'counterId',
+              'counterName', 'ticketId', 'ticketNumber', 'source', 'status', 'waitMs',
+              'serviceMs', 'sessionId', 'deviceId', 'deviceName',
+            ].includes(k)))
+            : d,
+          identity: {
+            uid: (uploader.meta.uid as string | null) ?? null,
+            userId: (uploader.meta.userId as string | null) ?? null,
+            username: (uploader.meta.username as string | null) ?? null,
+            role: (uploader.meta.role as string | null) ?? null,
+            agencyId: (d.agencyId as string | undefined) ?? null,
+          },
+          origin: 'client',
+          platform,
+          appVersion: body.appVersion,
+          agencyId: typeof d.agencyId === 'string' ? d.agencyId : undefined,
+          branchId: typeof d.branchId === 'string' ? d.branchId : undefined,
+          serviceId: typeof d.serviceId === 'string' ? d.serviceId : undefined,
+          serviceName: typeof d.serviceName === 'string' ? d.serviceName : undefined,
+          counterId: typeof d.counterId === 'string' ? d.counterId : undefined,
+          counterName: typeof d.counterName === 'string' ? d.counterName : undefined,
+          ticketId: typeof d.ticketId === 'string' ? d.ticketId : undefined,
+          ticketNumber: typeof d.ticketNumber === 'string' ? d.ticketNumber : undefined,
+          source: typeof d.source === 'string' ? d.source : undefined,
+          status: typeof d.status === 'string' ? d.status : undefined,
+          waitMs: typeof d.waitMs === 'number' ? d.waitMs : undefined,
+          serviceMs: typeof d.serviceMs === 'number' ? d.serviceMs : undefined,
+          sessionId: typeof d.sessionId === 'string' ? d.sessionId : undefined,
+          deviceId: typeof d.deviceId === 'string' ? d.deviceId : undefined,
+          deviceName: typeof d.deviceName === 'string' ? d.deviceName : undefined,
         })
       } catch { /* the mirror never fails the ingestion */ }
     }
@@ -863,13 +924,64 @@ app.get('/analysis/export', async (c) => {
   }
   const q = (name: string) => (c.req.query(name) || '').trim()
 
+  // ── Viewer timezone (0.6.93) ──
+  // "I paid at 13:15 but the log says 10:15" — the whole vault stores raw UTC
+  // ISO-8601 (Z) and every export used to print those raw numbers, so the file
+  // always disagreed with the reader's wall clock by exactly the UTC offset.
+  // The Logs Manager dialog now sends its IANA timezone (?tz=…) and every
+  // HUMAN-facing surface (markdown body, filename stamp, JSON metadata) renders
+  // "local / UTC" side by side. Machine formats (json/csv/ndjson ts fields)
+  // intentionally keep raw UTC so scripts never see a shifted value.
+  const tzQuery = q('tz')
+  let tz = 'UTC'
+  if (tzQuery && tzQuery.length <= 64) {
+    try { new Intl.DateTimeFormat('en-CA', { timeZone: tzQuery }); tz = tzQuery } catch { /* invalid IANA name → UTC */ }
+  }
+  const tzNamePart = (opts: Intl.DateTimeFormatOptions): string => {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, ...opts }).formatToParts(new Date())
+      return parts.find((p) => p.type === 'timeZoneName')?.value ?? tz
+    } catch { return tz }
+  }
+  const tzOffsetLabel = (() => {
+    const short = tzNamePart({ timeZoneName: 'shortOffset' })
+    if (short && short !== tz) return short
+    return tzNamePart({ timeZoneName: 'short' })
+  })()
+  /** "2026-11-18 15:15:45" inside the given IANA zone. */
+  const ymdHmsIn = (d: Date, zone: string): string => {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).formatToParts(d)
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? ''
+    return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`
+  }
+  /** Local wall-clock stamp in the viewer timezone ('' when unparseable). */
+  const localStamp = (iso: string | Date | null | undefined): string => {
+    if (iso === null || iso === undefined || iso === '') return ''
+    const d = iso instanceof Date ? iso : new Date(iso)
+    if (Number.isNaN(d.getTime())) return ''
+    try { return ymdHmsIn(d, tz) } catch { return '' }
+  }
+  /** Dual rendering for humans: "2026-11-18 15:15:45 GMT+3 / 10:15:45 UTC". */
+  const dualTs = (iso: string | Date | null | undefined): string => {
+    if (iso === null || iso === undefined || iso === '') return ''
+    const d = iso instanceof Date ? iso : new Date(iso)
+    if (Number.isNaN(d.getTime())) return String(iso)
+    const raw = d.toISOString()
+    const loc = localStamp(d) || raw.slice(0, 19).replace('T', ' ')
+    const utcShort = raw.slice(0, 10) === loc.slice(0, 10) ? raw.slice(11, 19) : raw
+    return `${loc} ${tzOffsetLabel} / ${utcShort} UTC`
+  }
+
   // ── Resolve types ──
-  const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server', 'transactions'] as const
+  const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server', 'transactions', 'queue'] as const
   const typesRaw = q('types') || ALL_TYPES.join(',')
   const types = new Set<string>(
     typesRaw.split(',').map((s) => s.trim()).filter((s) => (ALL_TYPES as readonly string[]).includes(s)),
   )
-  if (types.size === 0) return c.json({ success: false, error: 'types must include at least one of: errors, daily, raw, agent, server, transactions' }, 400)
+  if (types.size === 0) return c.json({ success: false, error: 'types must include at least one of: errors, daily, raw, agent, server, transactions, queue' }, 400)
 
   // ── Resolve analyze + format ──
   const analyzeRaw = q('analyze') || 'raw'
@@ -911,13 +1023,21 @@ app.get('/analysis/export', async (c) => {
     to: to || undefined,
   }
 
+  const generatedAt = new Date().toISOString()
   const bundle: Record<string, unknown> = {
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     analyze,
     filters,
     range: rangeLabel,
     types: [...types],
     summary: analysisSummary(),
+    // 0.6.93 — tell the reader how the raw UTC values map to their wall clock.
+    renderedTimezone: {
+      tz,
+      offsetLabel: tzOffsetLabel,
+      generatedAtLocal: dualTs(generatedAt),
+      note: 'All ts fields in this file remain raw UTC ISO-8601 (Z-suffixed). The markdown export renders each timestamp as "local (your timezone) / UTC raw". Machine formats (json/csv/ndjson) intentionally keep raw UTC so scripts never see a shifted value.',
+    },
   }
 
   // ── Deep scan (OLD logs) ──
@@ -1077,8 +1197,45 @@ app.get('/analysis/export', async (c) => {
     }
   }
 
+  // ── queue (0.6.94 — the unified queue-engine stream) ──
+  if (types.has('queue')) {
+    const queueRead = readQueueEntries({
+      event: q('event') || undefined,
+      agencyId: q('agencyId') || undefined,
+      branchId: q('branchId') || undefined,
+      serviceId: q('serviceId') || undefined,
+      counterId: q('counterId') || undefined,
+      ticketId: q('ticketId') || undefined,
+      ticketNumber: q('ticketNumber') || undefined,
+      source: q('source') || undefined,
+      status: q('status') || undefined,
+      origin: q('origin') || undefined,
+      platform: q('platform') || undefined,
+      sessionId: q('sessionId') || undefined,
+      level: q('level') || undefined,
+      uid: filters.uid,
+      q: filters.q,
+      from: from || undefined,
+      to: to || undefined,
+      limit,
+    })
+    if (analyze === 'summary') {
+      bundle.queue = summarizeQueueEntries(queueRead.entries)
+    } else {
+      bundle.queue = {
+        count: queueRead.entries.length,
+        truncated: queueRead.truncated,
+        scanned: queueRead.scanned,
+        summary: summarizeQueueEntries(queueRead.entries),
+        entries: queueRead.entries,
+      }
+    }
+  }
+
   // ── Render ──
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+  // 0.6.93 — the filename stamp used to be UTC, which made a freshly downloaded
+  // file look hours older than the wall clock. Now it uses the viewer timezone.
+  const stamp = (localStamp(new Date()) || new Date().toISOString().slice(0, 19)).replace(/[:T ]/g, '-')
   const base = `blasti-logs_${[...types].join('+')}_${rangeLabel}_${stamp}`
 
   if (format === 'json') {
@@ -1108,18 +1265,24 @@ app.get('/analysis/export', async (c) => {
   if (format === 'csv') {
     const type = [...types][0]
     const COLS: Record<string, readonly string[]> = {
-      errors: ['fp', 'tag', 'level', 'severity', 'severityScore', 'count', 'firstSeen', 'lastSeen', 'message', 'platforms', 'roles', 'uids', 'devices', 'triggers'],
+      // 0.6.93 — every timestamped type gains a *Local column (viewer timezone,
+      // "YYYY-MM-DD HH:mm:ss") next to the raw UTC value so spreadsheet readers
+      // never have to do UTC-offset math by hand.
+      errors: ['fp', 'tag', 'level', 'severity', 'severityScore', 'count', 'firstSeen', 'lastSeen', 'firstSeenLocal', 'lastSeenLocal', 'message', 'platforms', 'roles', 'uids', 'devices', 'triggers'],
       daily: ['platform', 'date', 'bytes', 'totals.entries', 'totals.errors', 'totals.warns', 'totals.accounts', 'updatedAt'],
-      raw: ['ts', 'level', 'tag', 'message', 'uid', 'username', 'role', 'platform', 'appVersion', 'device', 'file'],
-      agent: ['createdAt', 'action', 'status', 'summary', 'refType', 'refId', 'actor', 'provider', 'durationMs'],
-      server: ['ts', 'source', 'level', 'message'],
-      transactions: ['ts', 'stage', 'txType', 'status', 'amount', 'method', 'origin', 'ref', 'checkoutId', 'uid', 'username', 'role', 'agencyId', 'platform', 'appVersion', 'message'],
+      raw: ['ts', 'tsLocal', 'level', 'tag', 'message', 'uid', 'username', 'role', 'platform', 'appVersion', 'device', 'file'],
+      agent: ['createdAt', 'createdAtLocal', 'action', 'status', 'summary', 'refType', 'refId', 'actor', 'provider', 'durationMs'],
+      server: ['ts', 'tsLocal', 'source', 'level', 'message'],
+      transactions: ['ts', 'tsLocal', 'stage', 'txType', 'status', 'amount', 'method', 'origin', 'ref', 'checkoutId', 'uid', 'username', 'role', 'agencyId', 'platform', 'appVersion', 'message'],
+      queue: ['ts', 'tsLocal', 'event', 'message', 'ticketId', 'ticketNumber', 'source', 'status', 'counterId', 'counterName', 'serviceId', 'serviceName', 'agencyId', 'branchId', 'uid', 'username', 'role', 'platform', 'appVersion', 'origin', 'waitMs', 'serviceMs'],
     }
     const rowsOf = (b: Record<string, unknown>): Array<Record<string, unknown>> => {
       if (type === 'errors') {
         const sec = b.errors as { bugs?: Array<Record<string, unknown>> } | undefined
         return (sec?.bugs ?? []).map((bug) => ({
           ...bug,
+          firstSeenLocal: localStamp(bug.firstSeen as string | undefined),
+          lastSeenLocal: localStamp(bug.lastSeen as string | undefined),
           platforms: ((bug.affected as { platforms?: string[] })?.platforms ?? []).join('|'),
           roles: ((bug.affected as { roles?: string[] })?.roles ?? []).join('|'),
           uids: ((bug.affected as { uids?: string[] })?.uids ?? []).join('|'),
@@ -1141,12 +1304,13 @@ app.get('/analysis/export', async (c) => {
           }
         })
       }
-      if (type === 'raw') return ((b.raw as { entries?: RawExportEntry[] })?.entries ?? []) as unknown as Array<Record<string, unknown>>
-      if (type === 'agent') return (((b.agent as { rows?: unknown[] })?.rows ?? []) as Array<Record<string, unknown>>)
-      if (type === 'transactions') return ((b.transactions as { entries?: Array<Record<string, unknown>> })?.entries ?? []) as unknown as Array<Record<string, unknown>>
+      if (type === 'raw') return (((b.raw as { entries?: RawExportEntry[] })?.entries ?? []) as unknown as Array<Record<string, unknown>>).map((e) => ({ ...e, tsLocal: localStamp(e.ts as string) }))
+      if (type === 'agent') return (((b.agent as { rows?: unknown[] })?.rows ?? []) as Array<Record<string, unknown>>).map((r) => ({ ...r, createdAtLocal: localStamp(r.createdAt as string | Date) }))
+      if (type === 'transactions') return (((b.transactions as { entries?: Array<Record<string, unknown>> })?.entries ?? []) as unknown as Array<Record<string, unknown>>).map((e) => ({ ...e, tsLocal: localStamp(e.ts as string) }))
+      if (type === 'queue') return (((b.queue as { entries?: Array<Record<string, unknown>> })?.entries ?? []) as unknown as Array<Record<string, unknown>>).map((e) => ({ ...e, tsLocal: localStamp(e.ts as string) }))
       // server — flatten the per-source entries
       const snap = b.server as { sources?: Array<{ id: string; entries: Array<Record<string, unknown>> }> } | undefined
-      return (snap?.sources ?? []).flatMap((s) => (s.entries ?? []).map((e) => ({ ...e, source: e.source ?? s.id })))
+      return (snap?.sources ?? []).flatMap((s) => (s.entries ?? []).map((e) => ({ ...e, source: e.source ?? s.id, tsLocal: localStamp(e.ts as string) })))
     }
     const rows = rowsOf(bundle)
     const lines = [COLS[type].join(',')]
@@ -1167,7 +1331,8 @@ app.get('/analysis/export', async (c) => {
   const md: string[] = [
     '# BLASTI Logs Export',
     '',
-    `- Generated: ${bundle.generatedAt}`,
+    `- Generated: ${dualTs(bundle.generatedAt as string)}`,
+    `- Timezone: ${tz} (${tzOffsetLabel}) — timestamps below render as "local / UTC"; stored values are raw UTC (Z)`,
     `- Log types: ${[...types].join(', ')}`,
     `- Analyze mode: ${analyze}`,
     `- Time range: ${rangeLabel}${from ? ` (from ${from})` : ''}${to ? ` (to ${to})` : ''}`,
@@ -1191,7 +1356,7 @@ app.get('/analysis/export', async (c) => {
       md.push(
         `### [${b.severity}] ${b.tag} — ${b.count} hit(s)`,
         '',
-        `- Fingerprint: \`${b.fp}\` · Level: ${b.level} · Last seen: ${b.lastSeen}`,
+        `- Fingerprint: \`${b.fp}\` · Level: ${b.level} · Last seen: ${dualTs(b.lastSeen)}`,
         b.affected ? `- Platforms: ${(b.affected.platforms ?? []).join(', ')} · Roles: ${(b.affected.roles ?? []).join(', ')} · Triggers: ${(b.affected.triggers ?? []).join(', ') || 'n/a'}` : '',
         b.affected ? `- Devices: ${(b.affected.devices ?? []).slice(0, 5).join(' | ')}` : '',
         '',
@@ -1216,7 +1381,7 @@ app.get('/analysis/export', async (c) => {
     const entries = sec.entries ?? []
     md.push(`## Raw entries — ${entries.length} row(s)${sec.truncated ? ' (TRUNCATED — raise the row limit)' : ''}`, '')
     for (const e of entries.slice(0, 500)) {
-      md.push(`- \`${e.ts}\` **${e.level}** [${e.tag}] (${e.platform}${e.uid ? ` · ${e.uid}` : ''}${e.role ? ` · ${e.role}` : ''}) ${e.message.replace(/\n/g, ' ').slice(0, 400)}`)
+      md.push(`- \`${dualTs(e.ts)}\` **${e.level}** [${e.tag}] (${e.platform}${e.uid ? ` · ${e.uid}` : ''}${e.role ? ` · ${e.role}` : ''}) ${e.message.replace(/\n/g, ' ').slice(0, 400)}`)
     }
     md.push('')
   }
@@ -1225,7 +1390,7 @@ app.get('/analysis/export', async (c) => {
     if (sec.rows) {
       md.push(`## Translation agent trail — ${sec.count} row(s)`, '')
       for (const r of sec.rows) {
-        md.push(`- \`${typeof r.createdAt === 'string' ? r.createdAt : r.createdAt.toISOString()}\` **${r.action}** · ${r.status.toUpperCase()} — ${r.summary.slice(0, 300)}`)
+        md.push(`- \`${dualTs(r.createdAt)}\` **${r.action}** · ${r.status.toUpperCase()} — ${r.summary.slice(0, 300)}`)
       }
       md.push('')
     } else {
@@ -1239,7 +1404,7 @@ app.get('/analysis/export', async (c) => {
     for (const src of sec.sources) {
       md.push(`### ${src.id} (${src.kind}) — ${src.count} line(s)${src.truncated ? ' (truncated)' : ''}${src.available ? '' : ' · UNAVAILABLE'}`, '')
       for (const e of src.entries.slice(0, 300)) {
-        md.push(`- \`${e.ts}\` **${e.level}** ${e.message.replace(/\n/g, ' ').slice(0, 300)}`)
+        md.push(`- \`${dualTs(e.ts)}\` **${e.level}** ${e.message.replace(/\n/g, ' ').slice(0, 300)}`)
       }
       md.push('')
     }
@@ -1249,7 +1414,16 @@ app.get('/analysis/export', async (c) => {
     md.push(`## Transaction events — ${sec.count ?? 0} row(s)${sec.truncated ? ' (TRUNCATED)' : ''}`, '')
     md.push(`- By type: ${Object.entries(sec.summary?.byType ?? {}).map(([k, v]) => `${k}=${v}`).join(', ') || 'n/a'}`, '')
     for (const e of (sec.entries ?? []).slice(0, 500)) {
-      md.push(`- \`${e.ts}\` **${e.stage}** ${e.txType ?? ''}${e.amount !== undefined ? ` ${e.amount} DA` : ''}${e.origin === 'server' ? ' [server]' : ''}${e.ref ? ` ref=${e.ref}` : ''}${e.uid ? ` uid=${e.uid}` : ''} — ${e.message.replace(/\n/g, ' ').slice(0, 300)}`)
+      md.push(`- \`${dualTs(e.ts)}\` **${e.stage}** ${e.txType ?? ''}${e.amount !== undefined ? ` ${e.amount} DA` : ''}${e.origin === 'server' ? ' [server]' : ''}${e.ref ? ` ref=${e.ref}` : ''}${e.uid ? ` uid=${e.uid}` : ''} — ${e.message.replace(/\n/g, ' ').slice(0, 300)}`)
+    }
+    md.push('')
+  }
+  if (types.has('queue')) {
+    const sec = bundle.queue as { count?: number; truncated?: boolean; entries?: Array<{ ts: string; event: string; source?: string; status?: string; ticketNumber?: string; counterName?: string; origin: string; message: string }> ; summary?: { byEvent?: Record<string, number> } }
+    md.push(`## Queue events — ${sec.count ?? 0} row(s)${sec.truncated ? ' (TRUNCATED)' : ''}`, '')
+    md.push(`- By event: ${Object.entries(sec.summary?.byEvent ?? {}).map(([k, v]) => `${k}=${v}`).join(', ') || 'n/a'}`, '')
+    for (const e of (sec.entries ?? []).slice(0, 500)) {
+      md.push(`- \`${dualTs(e.ts)}\` **${e.event}**${e.ticketNumber ? ` ticket=${e.ticketNumber}` : ''}${e.counterName ? ` counter=${e.counterName}` : ''}${e.source ? ` src=${e.source}` : ''}${e.status ? ` status=${e.status}` : ''}${e.origin === 'server' ? ' [server]' : ''} — ${e.message.replace(/\n/g, ' ').slice(0, 300)}`)
     }
     md.push('')
   }
@@ -1341,6 +1515,56 @@ app.get('/devices', async (c) => {
   }
   const read = readDeviceEntries(filters)
   const summary = summarizeDeviceEntries(read.entries)
+  return c.json({
+    success: true,
+    entries: read.entries,
+    scanned: read.scanned,
+    files: read.files,
+    truncated: read.truncated,
+    summary,
+  })
+})
+
+// ─── Queue event stream (0.6.94) — the Logs Manager "Queue" tab ─────────────
+//
+// GET /api/logs/queue?event=&agencyId=&branchId=&serviceId=&counterId=
+//                   &ticketId=&ticketNumber=&source=&status=&origin=&platform=
+//                   &sessionId=&level=&uid=&q=&from=&to=&limit=
+//
+// Reads the unified cross-account stream (logs/_queue/<date>.ndjson) that
+// BOTH the client queue logger (mirrored by the ingest route) and the
+// server-side queue-engine mutations (queue-event-log.ts) write to. Returns
+// the newest entries + KPI aggregation + per-ticket / per-counter timelines.
+
+app.get('/queue', async (c) => {
+  try { await requireRole(c, 'SUPER_ADMIN') } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as any)
+  }
+  const q = (name: string) => (c.req.query(name) || '').trim()
+  const limitRaw = Number(q('limit')) || 0
+  const filters: QueueFilters = {
+    event: q('event') || undefined,
+    agencyId: q('agencyId') || undefined,
+    branchId: q('branchId') || undefined,
+    serviceId: q('serviceId') || undefined,
+    counterId: q('counterId') || undefined,
+    ticketId: q('ticketId') || undefined,
+    ticketNumber: q('ticketNumber') || undefined,
+    source: q('source') || undefined,
+    status: q('status') || undefined,
+    origin: q('origin') || undefined,
+    platform: q('platform') || undefined,
+    sessionId: q('sessionId') || undefined,
+    level: q('level') || undefined,
+    uid: q('uid') || undefined,
+    q: q('q') || undefined,
+    from: q('from') || undefined,
+    to: q('to') || undefined,
+    limit: Math.max(1, Math.min(limitRaw || 600, 5_000)),
+  }
+  const read = readQueueEntries(filters)
+  const summary = summarizeQueueEntries(read.entries)
   return c.json({
     success: true,
     entries: read.entries,

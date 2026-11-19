@@ -34,6 +34,7 @@ import {
   Download,
   FileJson,
   FileText,
+  ListOrdered,
   Loader2,
   ScrollText,
   Server,
@@ -60,7 +61,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { cn } from '@/lib/utils';
 import type { TranslationKeys } from '@/i18n';
 
-export type LogsExportScope = 'errors' | 'daily' | 'raw' | 'agent' | 'server' | 'transactions' | 'advanced';
+export type LogsExportScope = 'errors' | 'daily' | 'raw' | 'agent' | 'server' | 'transactions' | 'queue' | 'advanced';
 export type LogsExportFormat = 'json' | 'md' | 'csv' | 'ndjson';
 
 export interface LogsExportServerSource {
@@ -130,7 +131,7 @@ interface ExportState {
   deep: boolean;
 }
 
-const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server', 'transactions'] as const;
+const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server', 'transactions', 'queue'] as const;
 
 const PLATFORMS = ['web', 'mobile', 'desktop', 'kiosk', 'tv', 'legacy'] as const;
 /** STAFF + AGENCY_STAFF both listed — old logs carry the legacy label. */
@@ -162,6 +163,7 @@ const SCOPE_BASE: Record<LogsExportScope, Partial<ExportState>> = {
   agent: { types: ['agent'], analyze: 'raw', format: 'csv' },
   server: { types: ['server'], analyze: 'raw', format: 'md' },
   transactions: { types: ['transactions'], analyze: 'raw', format: 'json' },
+  queue: { types: ['queue'], analyze: 'raw', format: 'json' },
   advanced: { types: [...ALL_TYPES], analyze: 'raw', format: 'json' },
 };
 
@@ -199,6 +201,7 @@ const SCOPE_TITLE_KEY: Record<LogsExportScope, TranslationKeys> = {
   agent: 'logsExportScopeAgent',
   server: 'logsExportScopeServer',
   transactions: 'logsExportScopeTransactions',
+  queue: 'logsExportScopeQueue',
   advanced: 'logsExportAdvancedTitle',
 };
 
@@ -209,6 +212,7 @@ const TYPE_ICON: Record<string, typeof Siren> = {
   agent: Bot,
   server: Server,
   transactions: ArrowLeftRight,
+  queue: ListOrdered,
 };
 
 const TYPE_LABEL_KEY: Record<string, TranslationKeys> = {
@@ -218,6 +222,7 @@ const TYPE_LABEL_KEY: Record<string, TranslationKeys> = {
   agent: 'logsExportTypeAgent',
   server: 'logsExportTypeServer',
   transactions: 'logsExportTypeTransactions',
+  queue: 'logsExportTypeQueue',
 };
 
 export function AdminLogsExportDialog({
@@ -289,6 +294,7 @@ export function AdminLogsExportDialog({
     agent: state.types.includes('agent'),
     server: serverTypeSelected,
     transactions: state.types.includes('transactions'),
+    queue: state.types.includes('queue'),
   };
   const anyVaultType = show.errors || show.daily || show.raw;
 
@@ -308,6 +314,12 @@ export function AdminLogsExportDialog({
 
   const buildQuery = useCallback((): string => {
     const p = new URLSearchParams();
+    // 0.6.93 — the exporter renders "local / UTC" timestamps in the file body
+    // and stamps the filename with the local clock; tell it the viewer's IANA
+    // timezone so "local" means the reader's wall clock, not the server's UTC.
+    let viewerTz = 'UTC';
+    try { viewerTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { /* keep UTC */ }
+    p.set('tz', viewerTz);
     p.set('types', state.types.join(','));
     p.set('analyze', state.analyze);
     p.set('format', state.format);
@@ -345,6 +357,12 @@ export function AdminLogsExportDialog({
     if (show.transactions) {
       if (state.stage) p.set('stage', state.stage);
       if (state.txType) p.set('txType', state.txType);
+      if (state.q) p.set('q', state.q);
+      if (state.limit) p.set('limit', state.limit);
+    }
+    if (show.queue) {
+      if (state.uid) p.set('uid', state.uid);
+      if (state.level) p.set('level', state.level);
       if (state.q) p.set('q', state.q);
       if (state.limit) p.set('limit', state.limit);
     }

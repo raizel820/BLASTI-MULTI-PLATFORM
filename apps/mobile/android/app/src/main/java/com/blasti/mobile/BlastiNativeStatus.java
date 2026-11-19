@@ -11,7 +11,18 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.lang.reflect.Method;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.json.JSONObject;
 /**
  * BLASTI Native Status — exposes build/runtime status flags to the web app.
  *
@@ -1600,5 +1611,196 @@ public class BlastiNativeStatus extends Plugin {
             Log.w(TAG, "Firebase unavailable on the classpath — FCM push disabled", t);
             return false;
         }
+    }
+
+    // ═══ 0.6.92 — LAN pairing beacon (the phone ANNOUNCES itself) ══════════
+    //
+    // USER REPORT (0.6.91): the desktop Device Manager scan cannot detect the
+    // active BLASTI app on phones linked to the same network — "تحقق من أن
+    // تطبيق بلاستي في الوضع الجاهز في انتظار الاقتران يرسل إشارة لإعلان
+    // وجوده". Root cause: through 0.6.91 the phone announced NOTHING at the
+    // LAN layer. The desktop's multi-protocol scan LISTENS on UDP :3081 for
+    // BLASTI beacons (the desktop shell broadcasts {service:'blasti-local'}
+    // from apps/desktop/main.js startLanBeacon) — but the phone had no
+    // counterpart announcer, so the scan could only ever see it through the
+    // CLOUD registration, never on the wire.
+    //
+    // This beacon is the phone-side counterpart: while the app sits in the
+    // ready / waiting-for-pairing state the web layer calls
+    // startPairingBeacon({name, uid, appVersion}) and this plugin broadcasts
+    //
+    //   {"service":"blasti-phone","name":…,"uid":…,"status":"ready-for-pairing",
+    //    "appVersion":…,"platform":"android","httpPort":0,"ts":…}
+    //
+    // every BEACON_INTERVAL_MS to the subnet broadcast address of every
+    // active interface (+ the limited broadcast 255.255.255.255 fallback).
+    // The desktop scanner's beacon listener (both cloud scanner.ts and the
+    // desktop local-api discovery-scanner.js) accepts service 'blasti-phone'
+    // since 0.6.92 and surfaces the phone as a BLASTI APP card with the
+    // announcing device's IP.
+    //
+    // NATIVE ONLY (the WebView cannot send UDP), and NO SECRETS ride on the
+    // beacon: display name, a short fingerprint and the version — never the
+    // deviceToken (the kiosk pairing flow stays token-scoped over HTTP to
+    // the desktop it explicitly registered with).
+    //
+    // Sending UDP broadcast needs NO extra permission (INTERNET is enough);
+    // the multicast-lock permission only governs RECEIVING multicast, which
+    // this plugin never does.
+
+    /** UDP port the desktop scanners listen on (BEACON_UDP_PORT there). */
+    private static final int BEACON_UDP_PORT = 3081;
+    /** Broadcast cadence — ~4 packets land in the scanner's 6s listen window. */
+    private static final long BEACON_INTERVAL_MS = 1500;
+    /** The beacon payload the scanner accepts (matches UdpBeaconRecord). */
+    private static final String BEACON_SERVICE = "blasti-phone";
+
+    private volatile Thread beaconThread;
+    private final AtomicBoolean beaconRunning = new AtomicBoolean(false);
+
+    @PluginMethod
+    public void startPairingBeacon(PluginCall call) {
+        String name = call.getString("name");
+        String uid = call.getString("uid");
+        String appVersion = call.getString("appVersion");
+        String status = call.getString("status");
+        if (name == null || name.trim().isEmpty()) name = "BLASTI App";
+        if (status == null || status.trim().isEmpty()) status = "ready-for-pairing";
+
+        final String payloadName = name.trim();
+        final String payloadUid = uid == null ? "" : uid.trim();
+        final String payloadStatus = status.trim();
+        final String payloadVersion = appVersion == null ? "" : appVersion.trim();
+
+        // One beacon at a time — restart the loop when called again.
+        stopBeaconLoop();
+        beaconRunning.set(true);
+        final String json = buildBeaconPayload(payloadName, payloadUid, payloadStatus, payloadVersion);
+        Thread t = new Thread(() -> beaconLoop(json), "BLASTI-PairingBeacon");
+        t.setDaemon(true);
+        beaconThread = t;
+        t.start();
+
+        JSObject res = new JSObject();
+        res.put("ok", true);
+        res.put("intervalMs", BEACON_INTERVAL_MS);
+        res.put("port", BEACON_UDP_PORT);
+        call.resolve(res);
+    }
+
+    @PluginMethod
+    public void stopPairingBeacon(PluginCall call) {
+        boolean wasRunning = stopBeaconLoop();
+        JSObject res = new JSObject();
+        res.put("ok", true);
+        res.put("wasRunning", wasRunning);
+        call.resolve(res);
+    }
+
+    /** Build the scanner-compatible beacon JSON (never throws). */
+    private static String buildBeaconPayload(String name, String uid, String status, String appVersion) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("service", BEACON_SERVICE);
+            o.put("name", name);
+            if (!uid.isEmpty()) o.put("uid", uid);
+            o.put("status", status);
+            if (!appVersion.isEmpty()) o.put("appVersion", appVersion);
+            o.put("platform", "android");
+            o.put("httpPort", 0);
+        } catch (Throwable ignored) {
+            // JSON building cannot realistically fail with these literal keys;
+            // the loop re-checks for an empty payload anyway.
+        }
+        return o.toString();
+    }
+
+    /** True when the loop was actually running (used for the stop result). */
+    private boolean stopBeaconLoop() {
+        beaconRunning.set(false);
+        Thread t = beaconThread;
+        beaconThread = null;
+        if (t != null) {
+            t.interrupt();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Broadcast the payload to every active interface's broadcast address
+     * (+255.255.255.255) forever until stopped. Transient failures (Wi-Fi
+     * dropping, network switches, AP isolation) are swallowed per tick so the
+     * loop resumes automatically when connectivity returns.
+     */
+    private void beaconLoop(String json) {
+        byte[] data = json == null ? new byte[0] : json.getBytes();
+        while (beaconRunning.get() && !Thread.currentThread().isInterrupted()) {
+            DatagramSocket socket = null;
+            try {
+                List<InetAddress> targets = broadcastTargets();
+                if (!targets.isEmpty()) {
+                    socket = new DatagramSocket();
+                    socket.setBroadcast(true);
+                    for (InetAddress target : targets) {
+                        if (!beaconRunning.get()) break;
+                        try {
+                            socket.send(new DatagramPacket(data, data.length, target, BEACON_UDP_PORT));
+                        } catch (Throwable perTarget) {
+                            // One dead interface must not silence the others.
+                        }
+                    }
+                }
+            } catch (Throwable loopErr) {
+                // Socket creation failed (airplane mode, no networks) — retry
+                // next tick; the beacon resumes when connectivity returns.
+            } finally {
+                if (socket != null) {
+                    try { socket.close(); } catch (Throwable ignored) { }
+                }
+            }
+            try {
+                Thread.sleep(BEACON_INTERVAL_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        beaconRunning.set(false);
+    }
+
+    /**
+     * Collect the broadcast address of every up, non-loopback IPv4 interface
+     * (Wifi + Ethernet) plus the limited-broadcast fallback. Deduplicated.
+     */
+    private static List<InetAddress> broadcastTargets() {
+        Set<String> seen = new LinkedHashSet<>();
+        List<InetAddress> targets = new ArrayList<>();
+        try {
+            List<NetworkInterface> nis = java.util.Collections.list(NetworkInterface.getNetworkInterfaces());
+            for (NetworkInterface ni : nis) {
+                try {
+                    if (!ni.isUp() || ni.isLoopback() || ni.isPointToPoint()) continue;
+                    for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                        InetAddress bc = ia == null ? null : ia.getBroadcast();
+                        if (bc == null) continue;
+                        String host = bc.getHostAddress();
+                        if (host == null || seen.contains(host)) continue;
+                        seen.add(host);
+                        targets.add(bc);
+                    }
+                } catch (SocketException perIf) {
+                    // Interface gone mid-iteration — skip it.
+                }
+            }
+        } catch (Throwable ignored) { /* no interfaces — nothing to announce on */ }
+        try {
+            String limited = "255.255.255.255";
+            if (!seen.contains(limited)) {
+                seen.add(limited);
+                targets.add(InetAddress.getByName(limited));
+            }
+        } catch (Throwable ignored) { /* name lookup cannot fail for a literal */ }
+        return targets;
     }
 }

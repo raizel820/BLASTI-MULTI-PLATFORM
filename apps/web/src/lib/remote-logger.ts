@@ -49,8 +49,8 @@ export interface LogEntry {
   /** 0.6.81 — 'transactions' entries ride the SAME buffer/ingest but are
    *  MIRRORED server-side into the dedicated cross-account transaction
    *  stream (logs/_transactions/<date>.ndjson) that powers the Logs
-   *  Manager "Transactions" tab. Only this value is whitelisted. */
-  channel?: 'transactions';
+   *  Manager "Transactions" tab. Only these values are whitelisted. */
+  channel?: 'transactions' | 'device' | 'queue';
 }
 
 /**
@@ -316,6 +316,85 @@ export function logDevice(event: string, message: string, data?: Record<string, 
   // REAL-TIME: a device event never waits for the 30 s tick.
   scheduleUrgentFlush('sync');
 }
+
+/**
+ * 0.6.94 — REAL-TIME QUEUE EVENT LOGGER (queue-engine coverage).
+ *
+ * ONE entry point for every queue-engine event on any surface (web console,
+ * Capacitor mobile, Electron renderer, kiosk webviews) — the user's mandate:
+ * "all queue operations from online reservation to local and walk-in
+ * reservation on all devices and platforms including kiosk mode, all
+ * interactions between devices in the same local network, counters managing
+ * the same queue list, and all queue management":
+ *   • QUEUE ENGINE — pause/resume/settings.
+ *   • TICKET LIFECYCLE — created (online/walk-in/kiosk/import), claimed,
+ *     recalled, completed, no-show, cancelled, postponed, status, reclaimed,
+ *     rated, shared, fixed-time, batch-complete.
+ *   • COUNTER OPS — claim/release/control request-approve-reject/assign —
+ *     counters managing the SAME queue list for the SAME services.
+ *   • FULL-SCREEN MODE — enter/exit of the queue display.
+ *
+ * Entries carry tag 'queue' + channel 'queue' so the server ingest mirrors
+ * them into the unified cross-account queue stream (logs/_queue/) that the
+ * Logs Manager "Queue" tab reads. The event slug + agencyId/branchId/
+ * serviceId/serviceName/counterId/counterName/ticketId/ticketNumber/source/
+ * status/waitMs/serviceMs ride inside `data` (the mirror lifts them to
+ * top-level stream fields).
+ *
+ * Flushes via the urgent path (≈1.2 s debounce) so a failed call-next is
+ * visible in the manager while the operator is still looking at the screen.
+ * Never throws, never blocks — identical safety contract to logEvent().
+ *
+ * @param event   - one of QUEUE_EVENTS (or a new slug — kept verbatim)
+ * @param message - human-readable line (support-facing English)
+ * @param data    - { agencyId, branchId, serviceId, serviceName, counterId,
+ *                  counterName, ticketId, ticketNumber, source, status,
+ *                  waitMs, serviceMs, ...extras }
+ * @param level   - info (default) | warn | error | debug
+ */
+export function logQueue(event: string, message: string, data?: Record<string, unknown>, level: LogEntry['level'] = 'info'): void {
+  if (buffer.length >= MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER + 1);
+  buffer.push({
+    ts: new Date().toISOString(),
+    level,
+    tag: 'queue',
+    message,
+    channel: 'queue',
+    data: { event, ...(data ?? {}) },
+  });
+  if (Date.now() - lastPersistAt > 5_000) {
+    lastPersistAt = Date.now();
+    persist();
+  }
+  // REAL-TIME: a queue event never waits for the 30 s tick.
+  scheduleUrgentFlush('sync');
+}
+
+/**
+ * 0.6.94 — canonical QUEUE EVENT slugs (mirror apps/api/src/lib/
+ * queue-event-log.ts). Call sites SHOULD use one of these so the Logs
+ * Manager event filter stays meaningful; unknown slugs are kept verbatim.
+ */
+export const QUEUE_EVENT_TYPES = [
+  // queue engine state
+  'queue_paused', 'queue_resumed', 'queue_settings_updated',
+  // ticket creation sources
+  'ticket_created_online', 'ticket_created_walkin', 'ticket_created_kiosk', 'ticket_imported',
+  // ticket lifecycle
+  'ticket_claimed', 'claim_contention', 'ticket_recalled', 'ticket_completed', 'ticket_no_show',
+  'ticket_cancelled', 'ticket_postponed', 'ticket_status_changed', 'ticket_reclaimed',
+  'ticket_rated', 'ticket_shared', 'ticket_fixed_time_toggled', 'batch_completed',
+  // counter operations
+  'counter_claimed', 'counter_released', 'counter_control_requested', 'counter_control_approved',
+  'counter_control_rejected', 'counter_assigned', 'counter_created', 'counter_updated', 'counter_deleted',
+  // kiosk mode
+  'kiosk_ticket_synced',
+  // full-screen mode
+  'fullscreen_enter', 'fullscreen_exit',
+  // LAN sync propagation
+  'sync_mutation_queued', 'sync_push_replayed', 'sync_pull_applied', 'sync_conflict',
+] as const;
+export type QueueEventType = (typeof QUEUE_EVENT_TYPES)[number] | (string & {});
 
 /**
  * STRICT MODE — schedule an urgent flush after a tiny debounce (batch a

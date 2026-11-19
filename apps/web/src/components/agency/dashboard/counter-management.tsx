@@ -29,6 +29,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { unwrapListPayload } from '@/lib/list-payload';
+import { logQueue } from '@/lib/remote-logger';
 import type { TranslationKeys } from '@/i18n';
 
 interface CounterInfo {
@@ -233,11 +234,29 @@ export function CounterManagement({
         body: JSON.stringify({ agencyId: effectiveAgencyId, counterId }),
       });
       if (res.ok) {
+        // Queue event log — ticket claimed for a specific counter (success;
+        // ticket identity comes from the response's reservation mirror).
+        try {
+          const data = await res.json().catch(() => null);
+          const claimed = data?.reservation;
+          const counter = counters.find((c) => c.id === counterId);
+          logQueue('ticket_claimed', `Ticket ${claimed?.displayNumber || claimed?.queueNumber || 'next'} called`, {
+            agencyId: effectiveAgencyId,
+            counterId,
+            counterName: counter?.name || undefined,
+            ticketId: claimed?.id,
+            ticketNumber: claimed?.displayNumber || claimed?.queueNumber,
+            serviceId: claimed?.serviceId || undefined,
+            status: 'CALLED',
+          });
+        } catch { /* never block */ }
         toast.success(t('statusCalled'));
         fetchCounters();
         onCallNext();
       } else {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — call-next failed (endpoint error included).
+        try { logQueue('ticket_claimed', `Call-next failed: ${data.error || 'rejected'}`, { agencyId: effectiveAgencyId, counterId }, 'error'); } catch { /* never block */ }
         // Task 37-c contract: friendly toasts for the authority errors.
         // r21-8 — the control model's 403 gates + the legacy occupy one.
         if (data.error === 'OCCUPY_COUNTER_FIRST') {
@@ -256,6 +275,8 @@ export function CounterManagement({
         }
       }
     } catch {
+      // Queue event log — call-next network failure.
+      try { logQueue('ticket_claimed', 'Call-next failed — network error', { agencyId: effectiveAgencyId, counterId }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setCallingCounterId(null);
@@ -285,9 +306,13 @@ export function CounterManagement({
         body: JSON.stringify({ agencyId: effectiveAgencyId }),
       });
       if (res.ok) {
+        // Queue event log — counter claimed from the dashboard card.
+        try { logQueue('counter_claimed', 'Counter claimed', { agencyId: effectiveAgencyId, counterId, counterName: counters.find((c) => c.id === counterId)?.name || undefined }); } catch { /* never block */ }
         toast.success(t('counterClaimed'));
       } else {
         const data = await res.json().catch(() => ({}));
+        // Queue event log — counter claim failed (endpoint error included).
+        try { logQueue('counter_claimed', `Counter claim failed: ${data.error || 'rejected'}`, { agencyId: effectiveAgencyId, counterId }, 'error'); } catch { /* never block */ }
         if (data.error === 'COUNTER_CONTROLLED') {
           toast.error(t('counterControlTitle'));
         } else {
@@ -296,6 +321,8 @@ export function CounterManagement({
       }
       fetchCounters();
     } catch {
+      // Queue event log — counter claim network failure.
+      try { logQueue('counter_claimed', 'Counter claim failed — network error', { agencyId: effectiveAgencyId, counterId }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setClaimingCounterId(null);

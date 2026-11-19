@@ -1822,6 +1822,25 @@ async function logPendingMutation(method, path, body, responseData, opts) {
       await executor.$executeRawUnsafe(stmt, ...params)
     }
     console.log('[LocalAPI] Logged outbox mutation:', method, path, 'id:', mutationId)
+    // 0.6.89 — QUEUE event: a LAN device made a QUEUE change that is now
+    // queued for the cloud push. Only queue-related mutations are logged
+    // (queue/reservation routes, or canonical SYNC_PUSH rows for the
+    // Reservation model) — services/branding/etc. stay out of the stream.
+    if (
+      (typeof path === 'string' && (path.indexOf('/queue') !== -1 || path.indexOf('/reservations') !== -1)) ||
+      (body && typeof body === 'object' && body.model === 'Reservation')
+    ) {
+      require('./lib/queue-event').queueEvent(
+        'sync_mutation_queued',
+        'LAN queue mutation queued for the cloud: ' + method + ' ' + path,
+        {
+          path,
+          method,
+          mutationId,
+          model: body && typeof body === 'object' ? body.model || undefined : undefined,
+        },
+      )
+    }
     if (!opts.tx) {
       // Immediate replay trigger (skip when transactional — the caller emits
       // after commit).
@@ -3903,6 +3922,21 @@ function createApp() {
         })
       }
     } catch { /* the drain never breaks the forwarder */ }
+    // 0.6.89 — QUEUE EVENT STREAM drain: LAN queue mutations (local routes,
+    // kiosk board, outbox enqueues) and sync-engine replay/pull/conflict
+    // events ride the SAME cloud-forward pipeline (platform 'desktop',
+    // channel 'queue' — the cloud ingest mirrors them into the _queue stream
+    // the Logs Manager "Queue" tab reads).
+    try {
+      const queueEvents = require('./lib/queue-event').drainQueueEvents()
+      if (queueEvents.length > 0) {
+        pendingCloudLogBatches.push({
+          platform: 'desktop',
+          appVersion: global.__blastiAppVersion || undefined,
+          entries: queueEvents,
+        })
+      }
+    } catch { /* the drain never breaks the forwarder */ }
     if (pendingCloudLogBatches.length === 0) return
     // 0.6.55 — ANONYMOUS FORWARD: the old gate (`!sessionToken → return`) kept
     // update-failure trails hostage on machines where NOBODY signed in. The
@@ -5447,6 +5481,13 @@ function createApp() {
       })
 
       emitEvent('agency:queue-status', { agencyId, queueOpen: !isPaused })
+      // 0.6.89 — QUEUE event: LAN open/pause flip hit the local mirror (the
+      // outbox row replays it to the cloud, which logs its own copy there).
+      require('./lib/queue-event').queueEvent(
+        isPaused ? 'queue_paused' : 'queue_resumed',
+        'LAN queue ' + (isPaused ? 'paused' : 'opened') + ' (agency ' + agencyId + ')',
+        { agencyId, status: isPaused ? 'PAUSED' : 'OPEN' },
+      )
 
       return c.json({
         success: true,
@@ -6351,6 +6392,19 @@ function createApp() {
         occupiedAt: counterUpdated.occupiedAt || now,
         byOwner: ctx.isOwner,
       })
+      // 0.6.89 — QUEUE event: LAN desk occupied (local write + outbox row).
+      require('./lib/queue-event').queueEvent(
+        'counter_claimed',
+        'LAN counter occupied: ' + (counter.name || counterId),
+        {
+          agencyId: ctx.agencyId,
+          counterId,
+          counterName: counter.name || undefined,
+          counterNumber: counter.number,
+          branchId: counter.branchId || undefined,
+          staffId: counterUpdated.staffId || undefined,
+        },
+      )
       return c.json({ success: true, counter: counterUpdated })
     } catch (error) {
       console.error('[LocalAPI] Occupy counter error:', error)
@@ -6408,6 +6462,18 @@ function createApp() {
       })
 
       emitEvent('counter:released', { agencyId: ctx.agencyId, counterId, staffId: counterUpdated.staffId })
+      // 0.6.89 — QUEUE event: LAN desk released (local write + outbox row).
+      require('./lib/queue-event').queueEvent(
+        'counter_released',
+        'LAN counter released: ' + (counter.name || counterId),
+        {
+          agencyId: ctx.agencyId,
+          counterId,
+          counterName: counter.name || undefined,
+          counterNumber: counter.number,
+          branchId: counter.branchId || undefined,
+        },
+      )
       return c.json({ success: true, counter: counterUpdated })
     } catch (error) {
       console.error('[LocalAPI] Release counter error:', error)
@@ -6544,6 +6610,19 @@ function createApp() {
         userId: sessionUser.id,
         assigned: forced,
       })
+      // 0.6.89 — QUEUE event: LAN counter control claimed (forced = takeover).
+      require('./lib/queue-event').queueEvent(
+        'counter_claimed',
+        'LAN counter control claimed: ' + (row.name || counter.name || counter.id) + (forced ? ' (forced takeover)' : ''),
+        {
+          agencyId: ctx.agencyId,
+          counterId: counter.id,
+          counterName: row.name || counter.name || undefined,
+          counterNumber: counter.number,
+          branchId: counter.branchId || undefined,
+          userId: sessionUser.id,
+        },
+      )
       return c.json({ success: true, counter: row })
     } catch (error) {
       console.error('[LocalAPI] Claim counter error:', error)
@@ -6628,6 +6707,19 @@ function createApp() {
           forced: false,
         })
         emitEvent('counter:claimed', { agencyId: ctx.agencyId, counterId: counter.id, counterName: row.name || counter.name, counterNumber: counter.number, userId: sessionUser.id })
+        // 0.6.89 — QUEUE event: free counter claimed outright on request-control.
+        require('./lib/queue-event').queueEvent(
+          'counter_claimed',
+          'LAN counter claimed: ' + (row.name || counter.name || counter.id),
+          {
+            agencyId: ctx.agencyId,
+            counterId: counter.id,
+            counterName: row.name || counter.name || undefined,
+            counterNumber: counter.number,
+            branchId: counter.branchId || undefined,
+            userId: sessionUser.id,
+          },
+        )
         return c.json({ success: true, claimed: true, counter: row })
       }
 
@@ -6653,6 +6745,20 @@ function createApp() {
         fromUserId: sessionUser.id,
         expiresAt: expiresAt.toISOString(),
       })
+      // 0.6.89 — QUEUE event: takeover request created (held counter).
+      require('./lib/queue-event').queueEvent(
+        'counter_control_requested',
+        'LAN counter control requested: ' + (counter.name || counter.id),
+        {
+          agencyId: ctx.agencyId,
+          counterId: counter.id,
+          counterName: counter.name || undefined,
+          counterNumber: counter.number,
+          branchId: counter.branchId || undefined,
+          requestId: request.id,
+          userId: sessionUser.id,
+        },
+      )
       return c.json({ success: true, requestId: request.id, expiresAt: expiresAt.toISOString() })
     } catch (error) {
       console.error('[LocalAPI] Request-control error:', error)
@@ -6684,6 +6790,18 @@ function createApp() {
       if (!approve) {
         await db.counterControlRequest.update({ where: { id: request.id }, data: { status: 'REJECTED', resolvedByUserId: sessionUser.id, resolvedAt: new Date() } })
         emitEvent('counter:request-rejected', { agencyId: ctx.agencyId, counterId: counter.id, counterName: counter.name, counterNumber: counter.number, requestId: request.id })
+        // 0.6.89 — QUEUE event: takeover request rejected by the holder/owner.
+        require('./lib/queue-event').queueEvent(
+          'counter_control_rejected',
+          'LAN counter control request rejected: ' + (counter.name || counter.id),
+          {
+            agencyId: ctx.agencyId,
+            counterId: counter.id,
+            counterName: counter.name || undefined,
+            counterNumber: counter.number,
+            requestId: request.id,
+          },
+        )
         return c.json({ success: true })
       }
 
@@ -6695,6 +6813,19 @@ function createApp() {
       })
       await db.counterControlRequest.update({ where: { id: request.id }, data: { status: 'APPROVED', resolvedByUserId: sessionUser.id, resolvedAt: new Date() } })
       emitEvent('counter:request-approved', { agencyId: ctx.agencyId, counterId: counter.id, counterName: counter.name, counterNumber: counter.number, requestId: request.id, toUserId: request.fromUserId })
+      // 0.6.89 — QUEUE event: takeover approved — lease moved to the requester.
+      require('./lib/queue-event').queueEvent(
+        'counter_control_approved',
+        'LAN counter control approved: ' + (counter.name || counter.id),
+        {
+          agencyId: ctx.agencyId,
+          counterId: counter.id,
+          counterName: counter.name || undefined,
+          counterNumber: counter.number,
+          requestId: request.id,
+          toUserId: request.fromUserId || undefined,
+        },
+      )
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] Resolve control request error:', error)
@@ -6726,6 +6857,19 @@ function createApp() {
         forced: !!counter.controlledByUserId && counter.controlledByUserId !== targetUserId,
       })
       emitEvent('counter:claimed', { agencyId: ctx.agencyId, counterId: counter.id, counterName: counter.name, counterNumber: counter.number, userId: targetUserId, assigned: true })
+      // 0.6.89 — QUEUE event: owner force-granted the control lease.
+      require('./lib/queue-event').queueEvent(
+        'counter_assigned',
+        'LAN counter assigned: ' + (counter.name || counter.id) + ' → user ' + targetUserId,
+        {
+          agencyId: ctx.agencyId,
+          counterId: counter.id,
+          counterName: counter.name || undefined,
+          counterNumber: counter.number,
+          branchId: counter.branchId || undefined,
+          toUserId: targetUserId,
+        },
+      )
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] Assign counter error:', error)
@@ -6986,6 +7130,22 @@ function createApp() {
       })
 
       emitEvent('reservation:created', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: LAN customer join created a LOCAL ticket
+      // (canonical SYNC_PUSH outbox row → the sync engine replays it; the
+      // cloud logs its own copy only when the replay lands).
+      require('./lib/queue-event').queueEvent(
+        'ticket_created_online',
+        'LAN ticket created: ' + reservation.displayNumber + ' (queued for cloud push)',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId,
+          serviceName: service.name,
+          source: 'online',
+          status: 'WAITING',
+        },
+      )
 
       return c.json({ success: true, data: reservation }, 201)
     } catch (error) {
@@ -7276,6 +7436,20 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:called', { agencyId, reservation: updated })
+      // 0.6.89 — QUEUE event: local claim (this legacy route is always local).
+      require('./lib/queue-event').queueEvent(
+        'ticket_claimed',
+        'LAN call-next: ' + (updated.displayNumber || '?') + ' → CALLED',
+        {
+          agencyId,
+          ticketId: updated.id,
+          ticketNumber: updated.displayNumber,
+          serviceId: updated.serviceId,
+          counterId: updated.counterId || effectiveCounterId || undefined,
+          status: 'CALLED',
+          waitMs: next && next.joinedAt ? Date.now() - new Date(next.joinedAt).getTime() : undefined,
+        },
+      )
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -7333,6 +7507,20 @@ function createApp() {
       })
 
       emitEvent('queue:called', { agencyId, reservation: updated })
+      // 0.6.89 — QUEUE event: local claim of a specific ticket.
+      require('./lib/queue-event').queueEvent(
+        'ticket_claimed',
+        'LAN call: ' + (updated.displayNumber || '?') + ' → CALLED',
+        {
+          agencyId,
+          ticketId: updated.id,
+          ticketNumber: updated.displayNumber,
+          serviceId: updated.serviceId,
+          counterId: updated.counterId || effectiveCounterId || undefined,
+          status: 'CALLED',
+          waitMs: existing && existing.joinedAt ? Date.now() - new Date(existing.joinedAt).getTime() : undefined,
+        },
+      )
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -7381,6 +7569,21 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:completed', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: local completion (service time when calledAt
+      // survived on the pre-read).
+      require('./lib/queue-event').queueEvent(
+        'ticket_completed',
+        'LAN complete: ' + (reservation.displayNumber || '?') + ' → COMPLETED',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId: reservation.serviceId,
+          counterId: reservation.counterId || undefined,
+          status: 'COMPLETED',
+          serviceMs: existing && existing.calledAt ? Date.now() - new Date(existing.calledAt).getTime() : undefined,
+        },
+      )
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -7428,6 +7631,19 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:no-show', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: local no-show flip.
+      require('./lib/queue-event').queueEvent(
+        'ticket_no_show',
+        'LAN no-show: ' + (reservation.displayNumber || '?') + ' → NO_SHOW',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId: reservation.serviceId,
+          counterId: reservation.counterId || undefined,
+          status: 'NO_SHOW',
+        },
+      )
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -7498,6 +7714,26 @@ function createApp() {
       }
 
       emitEvent('queue:status', { agencyId, reservation, status })
+      // 0.6.89 — QUEUE event: unified status dispatcher (local write path —
+      // slug maps to the terminal outcome when the target status is one).
+      require('./lib/queue-event').queueEvent(
+        status === 'COMPLETED' ? 'ticket_completed'
+          : status === 'NO_SHOW' ? 'ticket_no_show'
+            : status === 'CANCELLED' ? 'ticket_cancelled'
+              : status === 'CALLED' ? 'ticket_claimed'
+                : 'ticket_status_changed',
+        'LAN status change: ' + (reservation.displayNumber || '?') + ' → ' + status,
+        {
+          agencyId,
+          ticketId: id,
+          ticketNumber: reservation.displayNumber,
+          serviceId: reservation.serviceId,
+          counterId: reservation.counterId || undefined,
+          status,
+          waitMs: status === 'CALLED' && existing.joinedAt ? Date.now() - new Date(existing.joinedAt).getTime() : undefined,
+          serviceMs: status === 'COMPLETED' && existing.calledAt ? Date.now() - new Date(existing.calledAt).getTime() : undefined,
+        },
+      )
       return c.json({ success: true, data: reservation })
     } catch (error) {
       console.error('[LocalAPI] Reservation status error:', error)
@@ -7545,6 +7781,19 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:cancelled', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: local cancel.
+      require('./lib/queue-event').queueEvent(
+        'ticket_cancelled',
+        'LAN cancel: ' + (reservation.displayNumber || '?') + ' → CANCELLED',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId: reservation.serviceId,
+          counterId: reservation.counterId || undefined,
+          status: 'CANCELLED',
+        },
+      )
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -7626,6 +7875,20 @@ function createApp() {
       // queue:postponed as an alias for any older listeners.
       emitEvent('queue:position-changed', { agencyId, reservationId: reservation.id, displayNumber: reservation.displayNumber, queueNumber: reservation.queueNumber, reservation })
       emitEvent('queue:postponed', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: local postpone (status stays WAITING, cloud
+      // semantics — position swap).
+      require('./lib/queue-event').queueEvent(
+        'ticket_postponed',
+        'LAN postpone: ' + (reservation.displayNumber || '?') + ' → position ' + reservation.queueNumber,
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId: reservation.serviceId,
+          queueNumber: reservation.queueNumber,
+          status: 'WAITING',
+        },
+      )
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -7672,6 +7935,19 @@ function createApp() {
       })
 
       emitEvent('queue:recalled', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: local recall (re-announce a CALLED ticket).
+      require('./lib/queue-event').queueEvent(
+        'ticket_recalled',
+        'LAN recall: ' + (reservation.displayNumber || '?') + ' re-announced',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId: reservation.serviceId,
+          counterId: reservation.counterId || undefined,
+          status: 'CALLED',
+        },
+      )
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -8296,6 +8572,27 @@ function createApp() {
       // routes queue:* events by data.agencyId, and without it the event was
       // silently dropped (no live update anywhere).
       emitEvent('queue:updated', { agencyId: updatedReservation.agencyId, reservationId, action, reservation: updatedReservation, ...updateData })
+      // 0.6.89 — QUEUE event: LOCAL (offline) queue action only — the central
+      // fast path above returns early, so reaching this line means the write
+      // happened on the local outbox path (no cloud-side log yet).
+      require('./lib/queue-event').queueEvent(
+        action === 'complete' ? 'ticket_completed'
+          : action === 'no_show' ? 'ticket_no_show'
+            : action === 'cancel' ? 'ticket_cancelled'
+              : action === 'recall' ? 'ticket_recalled'
+                : 'ticket_claimed',
+        'LAN queue action ' + action + ': ' + (updatedReservation.displayNumber || reservationId) + ' → ' + (updatedReservation.status || '?'),
+        {
+          agencyId: updatedReservation.agencyId,
+          ticketId: reservationId,
+          ticketNumber: updatedReservation.displayNumber,
+          serviceId: updatedReservation.serviceId,
+          counterId: updatedReservation.counterId || undefined,
+          status: updatedReservation.status,
+          waitMs: (action === 'serve' || action === 'recall') && existing.joinedAt ? Date.now() - new Date(existing.joinedAt).getTime() : undefined,
+          serviceMs: action === 'complete' && existing.calledAt ? Date.now() - new Date(existing.calledAt).getTime() : undefined,
+        },
+      )
       return c.json({ success: true, reservation: updatedReservation })
     } catch (error) {
       if (error && error.code === 'QUEUE_ACTION_CONFLICT') {
@@ -8511,6 +8808,12 @@ function createApp() {
       // Task 75: EMPTY payload meant the router dropped the event (no
       // agencyId) — dashboards never saw pause state change live.
       emitEvent('queue:paused', { agencyId, action: 'pause' })
+      // 0.6.89 — QUEUE event: LAN pause (local state + outbox).
+      require('./lib/queue-event').queueEvent(
+        'queue_paused',
+        'LAN queue paused (agency ' + agencyId + ')',
+        { agencyId, status: 'PAUSED' },
+      )
       return c.json({ success: true, isPaused: true })
     } catch (error) {
       console.error('[LocalAPI] /api/queue/pause error:', error)
@@ -8540,6 +8843,12 @@ function createApp() {
       // Task 75: EMPTY payload meant the router dropped the event (no
       // agencyId) — dashboards never saw resume state change live.
       emitEvent('queue:resumed', { agencyId, action: 'resume' })
+      // 0.6.89 — QUEUE event: LAN resume (local state + outbox).
+      require('./lib/queue-event').queueEvent(
+        'queue_resumed',
+        'LAN queue resumed (agency ' + agencyId + ')',
+        { agencyId, status: 'OPEN' },
+      )
       return c.json({ success: true, isPaused: false })
     } catch (error) {
       console.error('[LocalAPI] /api/queue/resume error:', error)
@@ -8579,6 +8888,12 @@ function createApp() {
         return row
       })
       emitEvent('queue:pause-toggled', { agencyId, isPaused: !currentPaused })
+      // 0.6.89 — QUEUE event: LAN pause toggle (local state + outbox).
+      require('./lib/queue-event').queueEvent(
+        !currentPaused ? 'queue_paused' : 'queue_resumed',
+        'LAN queue ' + (!currentPaused ? 'paused' : 'resumed') + ' via toggle (agency ' + agencyId + ')',
+        { agencyId, status: !currentPaused ? 'PAUSED' : 'OPEN' },
+      )
       return c.json({ success: true, isPaused: !currentPaused })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/toggle-pause error:', error)
@@ -8689,6 +9004,21 @@ function createApp() {
       // by data.agencyId and silently dropped this event before, so a staff
       // walk-in never appeared live on other views.
       emitEvent('queue:walk-in', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: LAN walk-in on the LOCAL outbox path (the
+      // central fast path above returns early — the cloud logs that one).
+      require('./lib/queue-event').queueEvent(
+        'ticket_created_walkin',
+        'Offline walk-in created: ' + (reservation.displayNumber || '?') + ' (queued for cloud push)',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId,
+          serviceName: service.name,
+          source: 'walkin',
+          status: 'WAITING',
+        },
+      )
       return c.json({ success: true, reservation })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/walk-in error:', error)
@@ -11998,6 +12328,23 @@ function createApp() {
       }
 
       emitEvent('queue:called', { agencyId, reservation: updated })
+      // 0.6.89 — QUEUE event: the unified call-next LOCAL fallback (offline)
+      // — when the central claim succeeded the route returned early and the
+      // cloud side already logged it, so only the outbox path lands here.
+      require('./lib/queue-event').queueEvent(
+        'ticket_claimed',
+        'LAN call-next (offline fallback): ' + (updated.displayNumber || '?') + ' → CALLED',
+        {
+          agencyId,
+          ticketId: updated.id,
+          ticketNumber: updated.displayNumber,
+          serviceId: updated.serviceId,
+          counterId: updated.counterId || effectiveCounterId || undefined,
+          status: 'CALLED',
+          waitMs: updated.joinedAt ? Date.now() - new Date(updated.joinedAt).getTime() : undefined,
+          lanFallback: true,
+        },
+      )
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -12051,6 +12398,20 @@ function createApp() {
         }
       } catch { /* cursor is best-effort for the token flow */ }
       emitEvent('reservation:created', { agencyId, reservation })
+      // 0.6.89 — QUEUE event: LAN QR-token walk-in (local create).
+      require('./lib/queue-event').queueEvent(
+        'ticket_created_walkin',
+        'LAN token walk-in created: ' + (reservation.displayNumber || '?') + ' (queued for cloud push)',
+        {
+          agencyId,
+          ticketId: reservation.id,
+          ticketNumber: reservation.displayNumber,
+          serviceId,
+          serviceName: service.name,
+          source: 'walkin',
+          status: 'WAITING',
+        },
+      )
       return c.json({ success: true, data: { ...reservation, tokenCode } }, 201)
     } catch (error) {
       console.error('[LocalAPI] walk-in-token error:', error)
@@ -12457,6 +12818,20 @@ function createApp() {
       })
       const updated = await db.reservation.findUnique({ where: { id } })
       emitEvent('queue:called', { agencyId, reservation: updated })
+      // 0.6.89 — QUEUE event: legacy alias route (plain local update).
+      require('./lib/queue-event').queueEvent(
+        'ticket_claimed',
+        'LAN call (legacy alias): ' + (updated.displayNumber || '?') + ' → CALLED',
+        {
+          agencyId,
+          ticketId: id,
+          ticketNumber: updated.displayNumber,
+          serviceId: updated.serviceId,
+          counterId: updated.counterId || effectiveCounterId || undefined,
+          status: 'CALLED',
+          waitMs: existing && existing.joinedAt ? Date.now() - new Date(existing.joinedAt).getTime() : undefined,
+        },
+      )
       return c.json({ success: true, data: updated })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/call/:id error:', error)

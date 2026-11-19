@@ -17,8 +17,12 @@ import {
 } from '@/lib/kiosk-lan-base';
 import { apiFetch } from '@/lib/api-fetch';
 import { APP_VERSION } from '@/lib/version';
+// 0.6.92 — the phone ANNOUNCES itself over the LAN while in the pairing-ready
+// state (user request: the desktop Device Manager scan must see the active
+// BLASTI app on phones linked to the same network). Native UDP beacon.
+import { startPairingBeacon, stopPairingBeacon } from '@/lib/pairing-beacon';
 import { getLocalIp } from '@/lib/get-local-ip';
-import { flushLogsNow, logDevice } from '@/lib/remote-logger';
+import { flushLogsNow, logDevice, logQueue } from '@/lib/remote-logger';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -497,6 +501,30 @@ export function DeviceKiosk() {
     };
   }, []);
 
+  // ─── 0.6.92 — LAN pairing beacon while the kiosk waits for pairing ──────
+  // USER REQUEST: "تطبيق بلاستي في الوضع الجاهز في انتظار الاقتران يرسل
+  // إشارة لإعلان وجوده" — the BLASTI app in ready mode MUST announce itself.
+  // While this phone sits on the pairing screen (method chooser or the
+  // discovery login, not yet paired) the native UDP beacon broadcasts
+  // {service:'blasti-phone', …} on port 3081 so the desktop Device Manager's
+  // scan surfaces it as a BLASTI APP card. The beacon stops the moment the
+  // phone is discovered/paired, moves to another step, or unmounts. Native
+  // only — no-op in plain browsers and on desktop.
+  useEffect(() => {
+    const announcing =
+      (step === 'method-select' || step === 'discovery') &&
+      discoveryStatus !== 'discovered' &&
+      discoveryStatus !== 'connecting';
+    if (!announcing) return;
+    void startPairingBeacon({
+      name: 'BLASTI App',
+      uid: generateFingerprint(),
+      status: 'ready-for-pairing',
+    });
+    return () => { void stopPairingBeacon(); };
+  }, [step, discoveryStatus]);
+
+
   // Auto-fetch agency on mount if code was saved
   useEffect(() => { if (agencyCode.trim()) fetchAgency(agencyCode.trim()); }, []);
 
@@ -618,6 +646,14 @@ export function DeviceKiosk() {
       saveOfflineTickets(remaining);
       setOfflineTickets(remaining);
       if (synced > 0) {
+        // Queue event log — ONE event per sync run (never per ticket).
+        try {
+          logQueue('kiosk_ticket_synced', `${synced} offline ticket(s) synced to the server`, {
+            agencyId: unsynced[0]?.agencyId || undefined,
+            count: synced,
+            remaining: remaining.length,
+          });
+        } catch { /* never block */ }
         setSyncCount(synced);
         setSyncStatus('success');
         toast.success(`${synced} ${t('kioskTicketsSynced')}`);
@@ -650,7 +686,24 @@ export function DeviceKiosk() {
         body: JSON.stringify({ agencyId: agency.id, serviceId: selectedService, customerName: customerName.trim() || undefined }),
       });
       const data = await res.json();
-      if (!data.success) { setError(data.error || 'Failed to join queue'); return; }
+      if (!data.success) {
+        // Queue event log — kiosk join failed (endpoint error included).
+        try { logQueue('ticket_created_kiosk', `Kiosk join failed: ${data.error || 'rejected'}`, { agencyId: agency.id, serviceId: selectedService, deviceId: data.deviceId || deviceId || undefined, source: 'kiosk' }, 'error'); } catch { /* never block */ }
+        setError(data.error || 'Failed to join queue');
+        return;
+      }
+      // Queue event log — kiosk ticket created (success; ticket identity from
+      // the response's reservation mirror).
+      try {
+        logQueue('ticket_created_kiosk', `Kiosk ticket ${data.reservation?.ticketNumber || ''} issued`.trim(), {
+          agencyId: agency.id,
+          serviceId: selectedService,
+          deviceId: data.deviceId || deviceId || undefined,
+          ticketId: data.reservation?.id,
+          ticketNumber: data.reservation?.ticketNumber,
+          source: 'kiosk',
+        });
+      } catch { /* never block */ }
       setTicket(data.reservation);
       setStep('ticket');
       setInactivitySeconds(0);
@@ -663,7 +716,11 @@ export function DeviceKiosk() {
       } else { setTicketQrUrl(null); }
       setShowConfetti(true);
       setTimeout(() => setShowConfetti(false), 3500);
-    } catch { setError('Network error'); }
+    } catch {
+      // Queue event log — kiosk join network failure.
+      try { logQueue('ticket_created_kiosk', 'Kiosk join failed — network error', { agencyId: agency?.id, serviceId: selectedService || undefined, source: 'kiosk' }, 'error'); } catch { /* never block */ }
+      setError('Network error');
+    }
     finally { setLoading(false); joiningRef.current = false; }
   };
 

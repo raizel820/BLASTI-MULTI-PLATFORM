@@ -650,6 +650,35 @@ function _generateConflictId() {
 }
 
 /**
+ * 0.6.89 — QUEUE EVENT producer bridge (cloned design from device-event.js).
+ * sync-service emits ONE queue event per pull/replay cycle when QUEUE rows
+ * were involved; local-api/index.js drains the SAME in-memory queue on every
+ * forward tick (same Node module instance) and POSTs the batch to the cloud
+ * /api/logs ingest tagged channel:'queue' + platform 'desktop' — the cloud
+ * mirrors it into the _queue stream the Logs Manager "Queue" tab reads.
+ * Best-effort: never throws, never breaks the sync engine.
+ */
+function _queueEvent(event, message, data, level) {
+  try {
+    require('./lib/queue-event').queueEvent(event, message, data, level);
+  } catch { /* queue-event is best-effort — never breaks the sync engine */ }
+}
+
+/**
+ * 0.6.89 — QUEUE-only filter for outbox rows: is this pending mutation a
+ * QUEUE mutation? Canonical SYNC_PUSH rows carry body.model ('Reservation');
+ * legacy HTTP rows replay the original business path (/api/queue/*,
+ * /api/reservations*). Everything else (services, branding, settings…)
+ * stays OUT of the queue stream.
+ */
+function _mutationIsQueueRelated(mutation) {
+  if (!mutation) return false;
+  if (mutation.body && typeof mutation.body === 'object' && mutation.body.model === 'Reservation') return true;
+  if (typeof mutation.path === 'string' && (mutation.path.indexOf('/queue') !== -1 || mutation.path.indexOf('/reservations') !== -1)) return true;
+  return false;
+}
+
+/**
  * Coerce a loosely-typed version marker (millis number, Date, ISO string, or
  * integer) into a value safe to bind into a BIGINT column. Unparseable → null.
  */
@@ -683,6 +712,18 @@ async function _logConflict(db, tableName, recordId, localVersion, cloudVersion,
     );
   } catch (e) {
     console.error('[SyncService] Failed to log conflict:', e.message);
+  }
+  // 0.6.89 — QUEUE event: conflicts on QUEUE models are support-visible in
+  // the cloud Logs Manager "Queue" tab (level warn). Every OTHER model is
+  // filtered out — services/branding/settings conflicts must NOT reach the
+  // queue stream (queue-only filter).
+  if (tableName === 'Reservation' || tableName === 'Counter') {
+    _queueEvent(
+      'sync_conflict',
+      'Sync conflict on ' + tableName + ' ' + String(recordId || '').substring(0, 40) + ' — local kept, cloud version parked',
+      { model: tableName, recordId: recordId },
+      'warn'
+    );
   }
   return id;
 }
@@ -1462,6 +1503,17 @@ async function _pullFromCloud(options) {
 
   var deferredTotal = await _countDeferredChanges(db, agencyId);
   console.log('[SyncService] Pull applied: ' + applied + ', conflicts: ' + conflictCount + ', deleted: ' + deletedCount + ', pages: ' + pages + ', deferredPending: ' + deferredTotal);
+  // 0.6.89 — QUEUE event: ONE line per pull cycle, ONLY when the pulled
+  // changes actually landed Reservation rows locally (dataAppliedModels is
+  // the union of applied models across all pages — see _applyPullChanges).
+  // Non-queue pulls (services, branding, settings…) emit NOTHING.
+  if (applied > 0 && dataAppliedModels.Reservation === true) {
+    _queueEvent(
+      'sync_pull_applied',
+      'Pulled ' + applied + ' cloud change(s) into the local mirror (queue rows included)',
+      { applied: applied, conflicts: conflictCount, queueRelated: true }
+    );
+  }
   // Task 75: tell the UI which NON-Reservation data just landed locally
   // (services, branches, counters, settings…). Reservation rows already
   // carry their own business events (_broadcastPullBusinessEvents); this
@@ -2035,6 +2087,10 @@ async function _replayPendingMutations() {
   let succeeded = 0;
   let failed = 0;
   let paused = false;
+  // 0.6.89 — QUEUE-only counter: how many of this cycle's outbox rows were
+  // QUEUE-related (canonical Reservation rows / legacy queue paths). Drives
+  // the single 'sync_push_replayed' queue event below.
+  let queueRelated = 0;
 
   try {
     const mutations = await _getPendingMutations();
@@ -2051,6 +2107,11 @@ async function _replayPendingMutations() {
         await _markMutationCompleted(mutation.id);
         continue;
       }
+
+      // 0.6.89 — QUEUE-only filter: count queue-related rows attempted this
+      // cycle (Reservation canonical rows, legacy /queue + /reservations
+      // paths). Services/branding/etc. never reach the queue stream.
+      if (_mutationIsQueueRelated(mutation)) queueRelated++;
 
       // Crash-safe in-flight marker (boot sweep resets stale rows).
       if (_markMutationSending) await _markMutationSending(mutation.id);
@@ -2203,6 +2264,16 @@ async function _replayPendingMutations() {
     if (succeeded > 0 || failed > 0) {
       console.log('[SyncService] Mutation replay: ' + succeeded + ' succeeded, ' + failed + ' failed' + (paused ? ' (paused)' : ''));
       emit({ type: 'mutations-replayed', succeeded: succeeded, failed: failed, paused: paused });
+    }
+    // 0.6.89 — QUEUE event: ONE line per replay cycle, ONLY when at least one
+    // QUEUE-related outbox row went out (the offline LAN mutation reached the
+    // cloud). data carries the cycle counts support needs at a glance.
+    if (queueRelated > 0) {
+      _queueEvent(
+        'sync_push_replayed',
+        'Outbox replay pushed ' + queueRelated + ' queue mutation(s) to the cloud (' + succeeded + ' ok, ' + failed + ' failed' + (paused ? ', paused' : '') + ')',
+        { replayed: succeeded, failed: failed, queueRelated: queueRelated }
+      );
     }
     if (succeeded > 0 && !paused) {
       _resetBackoff();

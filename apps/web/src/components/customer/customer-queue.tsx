@@ -24,6 +24,7 @@ import { apiFetch } from '@/lib/api-fetch';
 // manual refresh; see lib/resume-refresh.ts).
 import { useResumeRefresh } from '@/lib/resume-refresh';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+import { logQueue } from '@/lib/remote-logger';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
@@ -632,6 +633,9 @@ export function CustomerQueue() {
   };
 
   const handleCancel = async (id: string) => {
+    // Queue event data — the reservation row (agencyId etc.) comes from the
+    // already-loaded list; omitted when not found (ids are never fabricated).
+    const target = reservations.find((r) => r.id === id);
     setCancelling(id);
     try {
       const res = await apiFetch(`/api/reservations/${id}/status`, {
@@ -640,13 +644,19 @@ export function CustomerQueue() {
         body: JSON.stringify({ status: 'CANCELLED' }),
       });
       if (res.ok) {
+        // Queue event log — customer self-cancelled the ticket.
+        try { logQueue('ticket_cancelled', 'Customer cancelled the ticket', { agencyId: target?.agencyId || undefined, ticketId: id, ticketNumber: target?.queueNumber || undefined, status: 'CANCELLED', source: 'online' }); } catch { /* never block */ }
         toast.success(t('cancelSuccess'));
         fetchReservations();
       } else {
         const data = await res.json();
+        // Queue event log — self-cancel failed (endpoint error included).
+        try { logQueue('ticket_cancelled', `Self-cancel failed: ${data?.error || 'rejected'}`, { agencyId: target?.agencyId || undefined, ticketId: id }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — self-cancel network failure.
+      try { logQueue('ticket_cancelled', 'Self-cancel failed — network error', { agencyId: target?.agencyId || undefined, ticketId: id }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setCancelling(null);
@@ -663,6 +673,16 @@ export function CustomerQueue() {
         body: JSON.stringify({ userId: user?.id, positions: postponePositions }),
       });
       if (res.ok) {
+        // Queue event log — ticket postponed by the customer.
+        try {
+          const target = reservations.find((r) => r.id === postponeResId);
+          logQueue('ticket_postponed', `Ticket postponed by ${postponePositions} position(s)`, {
+            agencyId: target?.agencyId || undefined,
+            ticketId: postponeResId,
+            ticketNumber: target?.queueNumber || undefined,
+            positions: postponePositions,
+          });
+        } catch { /* never block */ }
         toast.success(t('postponeSuccess'));
         setPostponeDialogOpen(false);
         setPostponeResId(null);
@@ -670,9 +690,13 @@ export function CustomerQueue() {
         fetchReservations();
       } else {
         const data = await res.json();
+        // Queue event log — postpone failed (endpoint error included).
+        try { logQueue('ticket_postponed', `Postpone failed: ${data?.error || 'rejected'}`, { ticketId: postponeResId, positions: postponePositions }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — postpone network failure.
+      try { logQueue('ticket_postponed', 'Postpone failed — network error', { ticketId: postponeResId, positions: postponePositions }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setPostponeLoading(false);
@@ -688,13 +712,27 @@ export function CustomerQueue() {
         body: JSON.stringify({ userId: user?.id, fixedTimeEnabled: !currentEnabled }),
       });
       if (res.ok) {
+        // Queue event log — fixed-time preference toggled.
+        try {
+          const target = reservations.find((r) => r.id === resId);
+          logQueue('ticket_fixed_time_toggled', `Fixed time ${!currentEnabled ? 'enabled' : 'disabled'}`, {
+            agencyId: target?.agencyId || undefined,
+            ticketId: resId,
+            ticketNumber: target?.queueNumber || undefined,
+            enabled: !currentEnabled,
+          });
+        } catch { /* never block */ }
         toast.success(!currentEnabled ? t('fixedTimeOn') : t('fixedTimeOff'));
         fetchReservations();
       } else {
         const data = await res.json();
+        // Queue event log — fixed-time toggle failed (endpoint error included).
+        try { logQueue('ticket_fixed_time_toggled', `Fixed-time toggle failed: ${data?.error || 'rejected'}`, { ticketId: resId, enabled: !currentEnabled }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — fixed-time toggle network failure.
+      try { logQueue('ticket_fixed_time_toggled', 'Fixed-time toggle failed — network error', { ticketId: resId, enabled: !currentEnabled }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setCancelling(null);
@@ -709,6 +747,9 @@ export function CustomerQueue() {
         method: 'DELETE',
       });
       if (res.ok) {
+        // Queue event log — customer left the queue (cancel-active clears
+        // every active ticket; no single ticket id applies here).
+        try { logQueue('ticket_cancelled', 'Customer left the queue', { ...(user?.id ? { userId: user.id } : {}) }); } catch { /* never block */ }
         toast.success(t('queueLeft'));
         setLeaveDialogOpen(false);
         stopNotificationSound();
@@ -716,9 +757,13 @@ export function CustomerQueue() {
         setView('customer-home');
       } else {
         const data = await res.json();
+        // Queue event log — leave-queue failed (endpoint error included).
+        try { logQueue('ticket_cancelled', `Leave queue failed: ${data?.error || 'rejected'}`, { ...(user?.id ? { userId: user.id } : {}) }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — leave-queue network failure.
+      try { logQueue('ticket_cancelled', 'Leave queue failed — network error', { ...(user?.id ? { userId: user.id } : {}) }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setCancelling(null);
@@ -734,13 +779,26 @@ export function CustomerQueue() {
         body: JSON.stringify({ reservationId: id }),
       });
       if (res.ok) {
+        // Queue event log — customer reclaimed a ticket from history.
+        try {
+          const target = reservations.find((r) => r.id === id);
+          logQueue('ticket_reclaimed', 'Customer reclaimed the ticket', {
+            agencyId: target?.agencyId || undefined,
+            ticketId: id,
+            ticketNumber: target?.queueNumber || undefined,
+          });
+        } catch { /* never block */ }
         toast.success(t('reclaimSuccess'));
         fetchReservations();
       } else {
         const data = await res.json();
+        // Queue event log — reclaim failed (endpoint error included).
+        try { logQueue('ticket_reclaimed', `Reclaim failed: ${data?.error || 'rejected'}`, { ticketId: id }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — reclaim network failure.
+      try { logQueue('ticket_reclaimed', 'Reclaim failed — network error', { ticketId: id }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setCancelling(null);
@@ -763,6 +821,16 @@ export function CustomerQueue() {
         body: JSON.stringify({ rating, comment, userId: user?.id }),
       });
       if (res.ok) {
+        // Queue event log — customer rated the ticket.
+        try {
+          const target = reservations.find((r) => r.id === resId);
+          logQueue('ticket_rated', `Ticket rated ${rating}/5`, {
+            agencyId: target?.agencyId || undefined,
+            ticketId: resId,
+            ticketNumber: target?.queueNumber || undefined,
+            rating,
+          });
+        } catch { /* never block */ }
         setUserRating((prev) => ({ ...prev, [resId]: rating }));
         setFeedbackSubmittedIds((prev) => {
           const next = new Set(prev);
@@ -775,9 +843,13 @@ export function CustomerQueue() {
         toast.success(t('ratingSubmitted'));
       } else {
         const data = await res.json();
+        // Queue event log — rating failed (endpoint error included).
+        try { logQueue('ticket_rated', `Rating failed: ${data?.error || 'rejected'}`, { ticketId: resId, rating }, 'error'); } catch { /* never block */ }
         toast.error(data.error || t('error'));
       }
     } catch {
+      // Queue event log — rating network failure.
+      try { logQueue('ticket_rated', 'Rating failed — network error', { ticketId: resId, rating }, 'error'); } catch { /* never block */ }
       toast.error(t('error'));
     } finally {
       setSubmittingRating(null);

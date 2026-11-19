@@ -20,6 +20,9 @@ import { recordSyncChange } from '../lib/sync-helpers'
 // (DB-level mutual exclusion + staff/counter assignment in a single tx +
 // automatic concurrent-operation retry). The legacy route delegates to it.
 import { claimNextTicket } from '../lib/queue-claim'
+// Task 4-a — server-authoritative queue mutations land in the unified queue
+// event stream (appendQueueEvent never throws; additive logging only).
+import { appendQueueEvent } from '../lib/queue-event-log'
 
 const app = new Hono()
 
@@ -32,6 +35,9 @@ const app = new Hono()
 // POST /queue/call-next — Call the next customer
 // Phase 3: Uses queueNumber-based sorting + optimistic concurrency + preferred time logic
 app.post('/call-next', async (c) => {
+  // Task 4-a — captured early so the catch-block failure event can carry the
+  // agency scope even when the error fires after validation.
+  let callNextAgencyId: string | null = null
   try {
     const body = await c.req.json()
     const callNextSchema = z.object({
@@ -45,6 +51,7 @@ app.post('/call-next', async (c) => {
     }
 
     const { agencyId, serviceId, counterId } = validation.data
+    callNextAgencyId = agencyId
     const user = await requireAgencyAccess(c, agencyId)
 
     const agencyCheck = await db.agency.findUnique({ where: { id: agencyId } })
@@ -78,7 +85,15 @@ app.post('/call-next', async (c) => {
       return c.json({ success: false, error: 'Queue is paused' }, 400)
     }
 
-    const claim = await claimNextTicket({ agencyId, serviceId, counterId: effectiveCounterId, actorUserId: user.id })
+    const claim = await claimNextTicket({
+      agencyId,
+      serviceId,
+      counterId: effectiveCounterId,
+      actorUserId: user.id,
+      // Task 4-a — identity rides into the shared claim lib so the ONE
+      // ticket_claimed event (emitted there) carries the acting staff.
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+    })
 
     if (!claim.ok) {
       if (claim.kind === 'CONFLICT') {
@@ -170,12 +185,26 @@ app.post('/call-next', async (c) => {
     return c.json({ success: true, reservation: updatedReservation })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    // Task 4-a — unexpected failures (DB errors, 5xx) land in the queue event
+    // stream; auth/validation rejections are not logged (no spam).
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'claim_failed',
+        message: `Legacy call-next failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        agencyId: callNextAgencyId,
+        data: { route: 'POST /queue/call-next' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 
 // PUT /queue/pause — Pause the queue
 app.put('/pause', async (c) => {
+  let pauseAgencyId: string | null = null
   try {
     const body = await c.req.json()
     const agencyIdSchema = z.object({ agencyId: z.string().min(1, 'Agency ID is required') })
@@ -185,6 +214,7 @@ app.put('/pause', async (c) => {
     }
 
     const { agencyId } = validation.data
+    pauseAgencyId = agencyId
     const user = await requireAgencyAccess(c, agencyId)
 
     // r23 — pause IS queue management: same counter-CONTROL gate as call-next
@@ -210,15 +240,38 @@ app.put('/pause', async (c) => {
     emitQueueEvent('queue:paused', agencyId, { action: 'pause' })
     emitKioskEvent(agencyId, { action: 'queue-paused' })
 
+    // Task 4-a — queue-engine state change → queue event stream.
+    appendQueueEvent({
+      event: 'queue_paused',
+      message: `Queue paused by ${user.username}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+    })
+
     return c.json({ success: true, queueSettings: updatedSettings })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'queue_paused',
+        message: `Queue pause failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        agencyId: pauseAgencyId,
+        data: { route: 'PUT /queue/pause' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 
 // PUT /queue/resume — Resume the queue
 app.put('/resume', async (c) => {
+  let resumeAgencyId: string | null = null
   try {
     const body = await c.req.json()
     const agencyIdSchema = z.object({ agencyId: z.string().min(1, 'Agency ID is required') })
@@ -228,6 +281,7 @@ app.put('/resume', async (c) => {
     }
 
     const { agencyId } = validation.data
+    resumeAgencyId = agencyId
     const user = await requireAgencyAccess(c, agencyId)
 
     // r23 — resume IS queue management: same counter-CONTROL gate as pause.
@@ -251,15 +305,38 @@ app.put('/resume', async (c) => {
     emitQueueEvent('queue:resumed', agencyId, { action: 'resume' })
     emitKioskEvent(agencyId, { action: 'queue-resumed' })
 
+    // Task 4-a — queue-engine state change → queue event stream.
+    appendQueueEvent({
+      event: 'queue_resumed',
+      message: `Queue resumed by ${user.username}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+    })
+
     return c.json({ success: true, queueSettings: updatedSettings })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'queue_resumed',
+        message: `Queue resume failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        agencyId: resumeAgencyId,
+        data: { route: 'PUT /queue/resume' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 
 // PUT /queue/settings — Update queue settings
 app.put('/settings', async (c) => {
+  let settingsAgencyId: string | null = null
   try {
     const body = await c.req.json()
     const queueSettingsBodySchema = z.object({
@@ -274,6 +351,7 @@ app.put('/settings', async (c) => {
     }
 
     const { agencyId, averageServiceTime, maxActiveReservations, isQueueOpen } = validation.data
+    settingsAgencyId = agencyId
     const user = await requireAgencyAccess(c, agencyId)
 
     const agency = await db.agency.findUnique({ where: { id: agencyId } })
@@ -292,9 +370,37 @@ app.put('/settings', async (c) => {
 
     emitQueueEvent('queue:settings-updated', agencyId, { action: 'settings-updated', averageServiceTime, maxActiveReservations, isQueueOpen })
 
+    // Task 4-a — queue-engine settings change → queue event stream (the
+    // changed fields ride in data; this route has no service/counter scope).
+    appendQueueEvent({
+      event: 'queue_settings_updated',
+      message: `Queue settings updated by ${user.username}`,
+      level: 'info',
+      identity: { uid: user.id, userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId },
+      origin: 'server',
+      platform: 'server',
+      agencyId,
+      data: {
+        ...(averageServiceTime !== undefined ? { averageServiceTime } : {}),
+        ...(maxActiveReservations !== undefined ? { maxActiveReservations } : {}),
+        ...(isQueueOpen !== undefined ? { isQueueOpen } : {}),
+      },
+    })
+
     return c.json({ success: true, agency: updatedAgency })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
+    if (err.status >= 500) {
+      appendQueueEvent({
+        event: 'queue_settings_updated',
+        message: `Queue settings update failed: ${error instanceof Error ? error.message : 'unexpected error'}`,
+        level: 'error',
+        origin: 'server',
+        platform: 'server',
+        agencyId: settingsAgencyId,
+        data: { route: 'PUT /queue/settings' },
+      })
+    }
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
