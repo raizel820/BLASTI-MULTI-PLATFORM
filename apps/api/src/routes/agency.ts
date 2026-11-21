@@ -44,6 +44,7 @@ import {
   canBypassCounterApproval,
 } from '../lib/counter-control'
 import { normalizeRecordFileUrls } from '../lib/file-url'
+import { enqueueUserNameTranslation } from '../lib/translation-agent'
 // 0.6.54 — phone-uniqueness rules (user↔agency) + the phone-options picker.
 import { assertAgencyPhoneUsable, assertUserPhoneNotAgencyConflicting, getAgencyPhoneOptions } from '../lib/phone-contacts'
 // UID-0.6.14 — immutable per-user identifier ({TYPE}-{WILAYA}-{SEQ}).
@@ -5436,7 +5437,8 @@ app.get('/staff', async (c) => {
       include: {
         user: {
           // UID-0.6.14 — the immutable account identifier rides along.
-          select: { id: true, username: true, fullName: true, role: true, isActive: true, uid: true },
+          // 0.6.98 — fullNameAr/Fr ride along so the UI localizes names.
+          select: { id: true, username: true, fullName: true, fullNameAr: true, fullNameFr: true, role: true, isActive: true, uid: true },
         },
       },
       orderBy: { joinedAt: 'desc' },
@@ -5515,6 +5517,12 @@ app.post('/staff', async (c) => {
         },
       },
     })
+
+    // 0.6.98 — translation agent: cover the linked user's display name too.
+    void enqueueUserNameTranslation(
+      { id: user.id, fullName: user.fullName, fullNameAr: user.fullNameAr, fullNameFr: user.fullNameFr },
+      `owner:${caller.id}`,
+    )
 
     // Task 44: explicit SyncChange capture — see POST /branches note.
     try {
@@ -5728,6 +5736,14 @@ app.post('/staff/create', async (c) => {
       },
     })
 
+    // 0.6.98 — translation agent: transliterate the staff member's display
+    // name into the other app languages (customer-visible in queue views).
+    // Fire-and-forget — must never block or fail the creation.
+    void enqueueUserNameTranslation(
+      { id: newUser.id, fullName: newUser.fullName },
+      `owner:${user.id}`,
+    )
+
     // UID-0.6.14 — immutable UID assigned ONCE at creation; staff accounts
     // inherit the agency's wilaya as the fallback segment when the staff
     // member has no personal wilaya on file.
@@ -5763,7 +5779,8 @@ app.post('/staff/create', async (c) => {
       },
       include: {
         user: {
-          select: { id: true, username: true, fullName: true, role: true, isActive: true, uid: true },
+          // 0.6.98 — localized display names ride along.
+          select: { id: true, username: true, fullName: true, fullNameAr: true, fullNameFr: true, role: true, isActive: true, uid: true },
         },
       },
     })

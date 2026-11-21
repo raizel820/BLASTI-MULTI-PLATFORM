@@ -87,6 +87,48 @@ let beaconTimer = null
 let probeBusy = false
 let electionBusy = false
 
+// ─── Live BLASTI beacon registry (0.6.96) ───────────────────────────────────
+// The listener below hears EVERY beacon on UDP :3081 — desktop/kiosk shells
+// ('blasti-local') AND phones in pairing standby ('blasti-phone'). Instead of
+// discarding the phone beacons (the historic behavior kept only election
+// peers) they are tracked here so the Device Manager can list ACTIVE BLASTI
+// apps INSTANTLY — between scans, before any subnet sweep — and so the
+// agency-devices module can auto-connect a PAIRED device the moment it
+// re-appears on the LAN ("after pairing the device becomes eligible for auto
+// connection when detected").
+const BLASTI_BEACON_TTL_MS = 15_000
+const MAX_LIVE_BEACONS = 64
+const liveBlastiBeacons = new Map() // ip → { service, name, mode, deviceType, platform, appVersion, uid, instanceId, status, httpPort, lastSeenAt, firstSeenAt }
+const blastiBeaconListeners = new Set()
+
+/** Register a callback fired on every live BLASTI beacon (local or phone). */
+function onBlastiBeacon(cb) {
+  if (typeof cb === 'function') blastiBeaconListeners.add(cb)
+  return () => blastiBeaconListeners.delete(cb)
+}
+
+function emitBlastiBeacon(record) {
+  for (const cb of blastiBeaconListeners) {
+    try { cb(record) } catch { /* a broken consumer must not kill the listener */ }
+  }
+}
+
+/** All currently-alive BLASTI app beacons (TTL-pruned, newest first). */
+function getLiveBlastiBeacons() {
+  const cutoff = Date.now() - BLASTI_BEACON_TTL_MS
+  for (const [ip, rec] of liveBlastiBeacons) {
+    if (rec.lastSeenAt < cutoff) liveBlastiBeacons.delete(ip)
+  }
+  return [...liveBlastiBeacons.values()].sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+}
+
+function pruneLiveBlastiBeacons() {
+  const cutoff = Date.now() - BLASTI_BEACON_TTL_MS
+  for (const [ip, rec] of liveBlastiBeacons) {
+    if (rec.lastSeenAt < cutoff) liveBlastiBeacons.delete(ip)
+  }
+}
+
 // ─── Small helpers ───────────────────────────────────────────────────────────
 
 function log(msg) {
@@ -468,6 +510,44 @@ function startListener() {
     listenSocket.on('message', (buf, rinfo) => {
       try {
         const msg = JSON.parse(buf.toString('utf-8'))
+        if (!msg || !rinfo || !rinfo.address) return
+        // 0.6.96 — the SAME socket hears the phone pairing beacons
+        // ('blasti-phone', mobile BlastiNativeStatus.startPairingBeacon).
+        // Track them in the live-BLASTI registry + notify subscribers, then
+        // keep the election path strictly for desktop shells.
+        const svc = typeof msg.service === 'string' ? msg.service : ''
+        if (svc === 'blasti-local' || svc === 'blasti-phone') {
+          if (!(state.instanceId && msg.instanceId && msg.instanceId === state.instanceId)) {
+            const prev = liveBlastiBeacons.get(rinfo.address)
+            liveBlastiBeacons.set(rinfo.address, {
+              service: svc,
+              name: typeof msg.name === 'string' ? msg.name.slice(0, 100) : (prev && prev.name) || '',
+              hostname: typeof msg.hostname === 'string' ? msg.hostname.slice(0, 100) : (prev && prev.hostname) || undefined,
+              mode: typeof msg.mode === 'string' ? msg.mode : (prev && prev.mode) || undefined,
+              // Shared device info (user requirement 0.6.96): the BLASTI app
+              // itself announces its type/name/platform/ip — the receiver
+              // TRUSTS these fields instead of guessing.
+              deviceType: typeof msg.deviceType === 'string' ? msg.deviceType.slice(0, 40)
+                : (svc === 'blasti-phone' ? 'phone' : (prev && prev.deviceType) || 'desktop'),
+              platform: typeof msg.platform === 'string' ? msg.platform.slice(0, 20) : (svc === 'blasti-phone' ? 'android' : (prev && prev.platform) || undefined),
+              appVersion: typeof msg.appVersion === 'string' ? msg.appVersion.slice(0, 32) : (prev && prev.appVersion) || undefined,
+              uid: typeof msg.uid === 'string' ? msg.uid.slice(0, 64) : (prev && prev.uid) || undefined,
+              instanceId: typeof msg.instanceId === 'string' ? msg.instanceId.slice(0, 64) : (prev && prev.instanceId) || undefined,
+              status: typeof msg.status === 'string' ? msg.status.slice(0, 40) : (prev && prev.status) || undefined,
+              httpPort: Number(msg.httpPort || msg.port) || (prev && prev.httpPort) || 0,
+              lanIp: typeof msg.lanIp === 'string' ? msg.lanIp : (prev && prev.lanIp) || undefined,
+              ip: rinfo.address,
+              lastSeenAt: Date.now(),
+              firstSeenAt: (prev && prev.firstSeenAt) || Date.now(),
+            })
+            if (liveBlastiBeacons.size > MAX_LIVE_BEACONS) {
+              let oldestKey = null; let oldest = Infinity
+              for (const [k, v] of liveBlastiBeacons) if (v.lastSeenAt < oldest) { oldest = v.lastSeenAt; oldestKey = k }
+              if (oldestKey) liveBlastiBeacons.delete(oldestKey)
+            }
+            emitBlastiBeacon(liveBlastiBeacons.get(rinfo.address))
+          }
+        }
         if (!msg || msg.service !== 'blasti-local') return
         const id = msg.instanceId || (rinfo.address + ':' + (msg.httpPort || 3080))
         if (state.instanceId && id === state.instanceId) return // self-echo
@@ -865,6 +945,7 @@ function shutdownAuthority() {
   beaconTimer = null
   listenSocket = null
   state.peers.clear()
+  liveBlastiBeacons.clear()
   state.role = 'CANDIDATE'
   state.master = null
   state.inited = false
@@ -884,4 +965,8 @@ module.exports = {
   setPreferredMaster,
   getPreferredMasterInstanceId,
   isPreferredMaster,
+  // 0.6.96 — live BLASTI beacon registry (phones + desktop shells)
+  onBlastiBeacon,
+  getLiveBlastiBeacons,
+  pruneLiveBlastiBeacons,
 }

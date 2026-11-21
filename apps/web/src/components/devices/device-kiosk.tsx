@@ -87,6 +87,28 @@ import {
 } from './kiosk/kiosk-types';
 import { useCategoryTermScope } from '@/hooks/use-category-terms';
 
+/**
+ * 0.6.96 — STABLE kiosk/phone fingerprint, persisted in localStorage.
+ * The OLD code generated a fresh fingerprint on every beacon effect run and
+ * every register call, so the desktop Device Manager could never correlate a
+ * beacon card with a registered device (dedupe flapped, pairing-by-identity
+ * had nothing to match). Persisted once, reused for: the UDP beacon `uid`,
+ * every discover-register/kiosk-auth `deviceFingerprint`, and the manager's
+ * pairing-by-identity lookup — one stable identity end-to-end.
+ */
+function getStableKioskFingerprint(): string {
+  try {
+    let fp = localStorage.getItem('blasti_kiosk_beacon_uid');
+    if (!fp) {
+      fp = generateFingerprint();
+      localStorage.setItem('blasti_kiosk_beacon_uid', fp);
+    }
+    return fp;
+  } catch {
+    return generateFingerprint();
+  }
+}
+
 export function DeviceKiosk() {
   const { t, lang, setLang } = useLanguage();
   const rtl = isRTL(lang);
@@ -472,7 +494,7 @@ export function DeviceKiosk() {
           const regRes = await apiFetch('/api/agency-devices/public/register', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ agencyCode: code.trim(), deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: generateFingerprint() }),
+            body: JSON.stringify({ agencyCode: code.trim(), deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
           });
           const regData = await regRes.json();
           if (regData.success && regData.deviceToken) {
@@ -519,24 +541,25 @@ export function DeviceKiosk() {
     };
   }, []);
 
-  // ─── 0.6.92 — LAN pairing beacon while the kiosk waits for pairing ──────
-  // USER REQUEST: "تطبيق بلاستي في الوضع الجاهز في انتظار الاقتران يرسل
-  // إشارة لإعلان وجوده" — the BLASTI app in ready mode MUST announce itself.
-  // While this phone sits on the pairing screen (method chooser or the
-  // discovery login, not yet paired) the native UDP beacon broadcasts
-  // {service:'blasti-phone', …} on port 3081 so the desktop Device Manager's
-  // scan surfaces it as a BLASTI APP card. The beacon stops the moment the
-  // phone is discovered/paired, moves to another step, or unmounts. Native
-  // only — no-op in plain browsers and on desktop.
+  // ─── 0.6.96 — LAN pairing beacon while the kiosk waits for pairing ──────
+  // USER REQUEST (0.6.96): "update kiosk mode waiting-for-discovery mode to
+  // send signals to expose itself, waiting for pairing requests from the
+  // BLASTI app". The beacon now announces on EVERY pre-pairing screen —
+  // method chooser, branch code, credentials, QR, discovery — not just two of
+  // them. The device exposes itself, the manager's scan (or the live beacon
+  // feed) shows it, and the operator sends a pairing request. The beacon uses
+  // the STABLE fingerprint so pairing-by-identity matches across restarts.
   useEffect(() => {
     const announcing =
-      (step === 'method-select' || step === 'discovery') &&
+      step !== 'services' &&
+      step !== 'name' &&
+      step !== 'ticket' &&
       discoveryStatus !== 'discovered' &&
       discoveryStatus !== 'connecting';
     if (!announcing) return;
     void startPairingBeacon({
       name: 'BLASTI App',
-      uid: generateFingerprint(),
+      uid: getStableKioskFingerprint(),
       status: 'ready-for-pairing',
     });
     return () => { void stopPairingBeacon(); };
@@ -713,7 +736,7 @@ export function DeviceKiosk() {
           deviceName: 'BLASTI Kiosk',
           deviceType: 'KIOSK',
           connectionType: lanServer ? 'LAN' : 'WIFI',
-          deviceFingerprint: generateFingerprint(),
+          deviceFingerprint: getStableKioskFingerprint(),
         }),
       });
       const regData = await regRes.json();
@@ -983,7 +1006,7 @@ export function DeviceKiosk() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({ deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: generateFingerprint() }),
+        body: JSON.stringify({ deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
       });
       clearTimeout(timeoutId);
 

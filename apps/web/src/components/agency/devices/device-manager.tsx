@@ -254,10 +254,15 @@ export function DeviceManager() {
   const onlineCount = devices.filter((d) => d.status === 'ONLINE').length;
   const needsAttention = devices.filter((d) => d.status === 'OFFLINE' || d.status === 'DISABLED').length;
   const visibleDiscovered = useMemo(
-    // 0.6.92 — ROUTER results are dropped here too (defense in depth: the
-    // scan shapers already filter them). The router/gateway is infrastructure
-    // the agency can never pair, print to or cast to — it must not render.
-    () => discoveredDevices.filter((d) => !dismissedIds.has(d.id) && d.ip !== '127.0.0.1' && d.type !== 'ROUTER'),
+    // 0.6.92 — ROUTER results dropped (defense in depth over the API shaper).
+    // 0.6.96 — SCAN RESULT WHITELIST: the manager only shows devices it can
+    // act on — BLASTI apps (desktop/kiosk/phone), TVs and printers. Generic
+    // PCs/IoT/unknown noise never renders (parity with the server shaper).
+    () => discoveredDevices.filter(
+      (d) => !dismissedIds.has(d.id)
+        && d.ip !== '127.0.0.1'
+        && ['APP', 'KIOSK', 'PHONE', 'TV', 'PRINTER', 'DISPLAY'].includes(d.type),
+    ),
     [discoveredDevices, dismissedIds],
   );
   const hasDiscoveryContent = scanState.scanning || visibleDiscovered.length > 0 || unpairedDevices.length > 0;
@@ -561,27 +566,80 @@ export function DeviceManager() {
           ip: device.ip, port: device.port,
           manufacturer: device.manufacturer || device.macVendor,
           name: device.name, ssdpLocation: device.ssdpLocation,
-          mediaUrl: genericTvUrl,
+          mdnsService: device.mdnsService,
         }),
       });
       const data = await res.json();
       if (data.success) {
-        if (data.castKind === 'url') {
-          if (data.tvBoardUrl) window.open(data.tvBoardUrl, '_blank');
-          toast.info(getLocalizedString(
-            'تعذر البث المباشر — افتح الرابط في متصفح التلفاز',
-            'Diffusion directe impossible — ouvrez le lien sur la TV',
-            'Direct cast unavailable — open the link on the TV browser',
-            lang,
-          ));
-        } else {
-          toast.success(getLocalizedString('تم البث بنجاح', 'Diffusion réussie', 'Cast successful', lang));
-        }
+        toast.success(data.message || getLocalizedString(
+          data.protocol === 'blasti-tv'
+            ? 'تم البث المباشر إلى تطبيق بلاستي على الشاشة'
+            : 'تم البث بنجاح عبر ' + String(data.protocol || ''),
+          data.protocol === 'blasti-tv'
+            ? "Diffusion directe vers l'app BLASTI sur la TV"
+            : 'Diffusion réussie via ' + String(data.protocol || ''),
+          data.protocol === 'blasti-tv'
+            ? 'Cast sent directly to the BLASTI app on the TV'
+            : 'Cast successful via ' + String(data.protocol || ''),
+          lang,
+        ));
       } else {
-        toast.error(data.error || getLocalizedString('فشل البث', 'Échec de la diffusion', 'Cast failed', lang));
+        toast.error(data.message || data.error || getLocalizedString(
+          'فشل البث — لا توجد بروتوكولات متاحة على هذا التلفاز',
+          'Échec de la diffusion — aucun protocole disponible sur cette TV',
+          'Cast failed — no protocol reachable on this TV',
+          lang,
+        ));
       }
     } catch {
       toast.error(getLocalizedString('حدث خطأ أثناء البث', 'Erreur de diffusion', 'Error casting', lang));
+    } finally { setBusyDeviceId(null); }
+  };
+
+  // 0.6.96 — "Request pairing" straight from a scan-result card: a discovered
+  // BLASTI card carries its self-announced fingerprint; the desktop matches
+  // (or creates) the device record and sends the pairing request. The waiting
+  // kiosk/phone auto-accepts (3s grace) or shows Accept/Reject.
+  const [pairRequestedIds, setPairRequestedIds] = useState<Set<string>>(new Set());
+  const handlePairByIdentity = async (device: RealDiscoveredDevice) => {
+    setBusyDeviceId(device.id);
+    try {
+      const fingerprint = device.fingerprint || device.blastiInfo?.fingerprint || device.blastiInfo?.instanceId || '';
+      const res = await apiFetch(deviceApi('/discovery/pairing-request-by-identity'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fingerprint: fingerprint || undefined,
+          name: device.name,
+          ip: device.ip || undefined,
+          port: device.port || undefined,
+          deviceType: device.type,
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setPairRequestedIds((prev) => new Set(prev).add(device.id));
+        if (data.autoConnected) {
+          toast.success(getLocalizedString(
+            `تم الاتصال التلقائي بـ ${device.name}`,
+            `Connexion automatique à ${device.name}`,
+            `Auto-connected to ${device.name}`,
+            lang,
+          ));
+        } else {
+          toast.success(getLocalizedString(
+            'تم إرسال طلب الربط — انتظر موافقة الجهاز',
+            "Demande de jumelage envoyée — en attente de l'appareil",
+            'Pairing request sent — waiting for the device to accept',
+            lang,
+          ));
+        }
+        fetchDevices(true);
+        fetchUnpaired();
+      } else {
+        toast.error(data.error || getLocalizedString('فشل إرسال طلب الربط', "Échec de l'envoi", 'Pairing request failed', lang));
+      }
+    } catch {
+      toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));
     } finally { setBusyDeviceId(null); }
   };
 
@@ -720,25 +778,54 @@ export function DeviceManager() {
   };
 
   // ─── Handlers: cast menu ─────────────────────────────────────────────────
-  const handleChromecast = useCallback(async () => {
-    const nav = navigator as unknown as { presentation?: { request: (url: string, opts?: unknown) => { start: () => Promise<void>; onend?: () => void } } };
-    if (!nav.presentation?.request) {
-      toast.error(getLocalizedString(
-        'المتصفح لا يدعم البث — استخدم Chrome أو Edge',
-        'Navigateur incompatible — utilisez Chrome ou Edge',
-        'Browser does not support casting — use Chrome/Edge',
-        lang,
-      ));
-      return;
+  // 0.6.96 — CASTING REWORK (user requirement): real, DIRECT protocols only.
+  // The Presentation-API "Google Cast" button (Chrome/Edge only) and the
+  // "Open in TV browser" entry are GONE. Every cast goes through the device
+  // API: registered TVs receive a direct CAST_URL command (BLASTI board app),
+  // other TVs get Samsung Tizen / LG webOS / DLNA / CASTv2 / Roku pushes with
+  // LAN-reachable URLs built by the server (bestLanIp).
+
+  // LAN-reachable TV URL (QR / copy) — window.location.origin is loopback
+  // inside Electron; the bridge exposes the host's real LAN IP.
+  const [lanTvOrigin, setLanTvOrigin] = useState<string | null>(null);
+  useEffect(() => {
+    const electronApi = (window as unknown as { electronAPI?: { getLanServerInfo?: () => Promise<{ ip?: string; port?: number } | null> } }).electronAPI;
+    if (electronApi?.getLanServerInfo) {
+      electronApi.getLanServerInfo()
+        .then((info) => {
+          if (info && info.ip) setLanTvOrigin(`http://${info.ip}:${info.port || 3080}`);
+        })
+        .catch(() => { /* browser/mobile contexts keep window.origin */ });
     }
+  }, []);
+  const lanTvUrl = useMemo(
+    () => (lanTvOrigin ? `${lanTvOrigin}/?mode=device&type=TV${agencyId ? `&agencyId=${agencyId}` : ''}` : genericTvUrl),
+    [lanTvOrigin, genericTvUrl, agencyId],
+  );
+
+  // Cast the board to a REGISTERED TV — one direct CAST_URL command.
+  const handleCastRegistered = async (device: AgencyDevice) => {
+    setBusyDeviceId(device.id);
     try {
-      const request = nav.presentation.request(genericTvUrl, { id: 'blasti-tv-board' });
-      await request.start();
-      toast.success(getLocalizedString('تم بدء البث', 'Diffusion démarrée', 'Casting started', lang));
+      const res = await apiFetch(`${API_BASE}/${device.id}/cast`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(getLocalizedString(
+          `تم إرسال البث إلى ${device.name} — ستعرض الشاشة اللوحة مباشرة`,
+          `Diffusion envoyée à ${device.name} — l'écran affichera le tableau`,
+          `Cast sent to ${device.name} — the screen will show the board`,
+          lang,
+        ));
+      } else {
+        toast.error(data.error || getLocalizedString('فشل البث', 'Échec de la diffusion', 'Cast failed', lang));
+      }
     } catch {
-      toast.info(getLocalizedString('تم إلغاء البث', 'Diffusion annulée', 'Cast cancelled', lang));
-    }
-  }, [genericTvUrl, lang]);
+      toast.error(getLocalizedString('حدث خطأ أثناء البث', 'Erreur de diffusion', 'Error casting', lang));
+    } finally { setBusyDeviceId(null); }
+  };
 
   const handleHdmi = useCallback(() => {
     const electronApi = (window as unknown as { electronAPI?: { openTvScreen?: (o: { url: string }) => void } }).electronAPI;
@@ -746,11 +833,11 @@ export function DeviceManager() {
       electronApi.openTvScreen({ url: genericTvUrl });
       toast.success(getLocalizedString('تم فتح الشاشة على HDMI', 'Écran ouvert sur HDMI', 'Screen opened on HDMI', lang));
     } else {
-      navigator.clipboard.writeText(genericTvUrl).then(() => {
+      navigator.clipboard.writeText(lanTvUrl).then(() => {
         toast.info(getLocalizedString('تم نسخ الرابط — افتحه في تطبيق سطح المكتب', 'Lien copié — ouvrez-le dans l\'app desktop', 'URL copied — open in the desktop app', lang));
       });
     }
-  }, [genericTvUrl, lang]);
+  }, [genericTvUrl, lanTvUrl, lang]);
 
   const copyText = useCallback((text: string, message?: string) => {
     navigator.clipboard.writeText(text).then(() => {
@@ -800,7 +887,7 @@ export function DeviceManager() {
             </div>
 
             <div className="flex items-center gap-2 flex-wrap">
-              {/* Cast menu */}
+              {/* Cast menu — 0.6.96: DIRECT protocols only, no browser entries */}
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button size="sm" className="gap-1.5 bg-gradient-to-r from-cyan-500 to-teal-500 hover:from-cyan-600 hover:to-teal-600 text-white shadow-md">
@@ -809,22 +896,8 @@ export function DeviceManager() {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-64">
-                  <DropdownMenuLabel>{getLocalizedString('خيارات البث', 'Options de diffusion', 'Cast options', lang)}</DropdownMenuLabel>
+                  <DropdownMenuLabel>{getLocalizedString('بث مباشر — بلا متصفح', 'Diffusion directe — sans navigateur', 'Direct cast — no browser', lang)}</DropdownMenuLabel>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => window.open(genericTvUrl, '_blank')}>
-                    <ExternalLink className="h-4 w-4 me-2" />
-                    <div>
-                      <div>{getLocalizedString('فتح في متصفح التلفاز', 'Ouvrir dans le navigateur TV', 'Open in TV browser', lang)}</div>
-                      <div className="text-xs text-muted-foreground">{getLocalizedString('للشاشات الذكية', 'Pour Smart TV', 'For smart TVs', lang)}</div>
-                    </div>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={handleChromecast}>
-                    <Cast className="h-4 w-4 me-2" />
-                    <div>
-                      <div>{getLocalizedString('بث Google Cast', 'Diffuser via Google Cast', 'Google Cast', lang)}</div>
-                      <div className="text-xs text-muted-foreground">Chromecast / Android TV</div>
-                    </div>
-                  </DropdownMenuItem>
                   <DropdownMenuItem onClick={handleHdmi}>
                     <Cable className="h-4 w-4 me-2" />
                     <div>
@@ -832,15 +905,23 @@ export function DeviceManager() {
                       <div className="text-xs text-muted-foreground">{getLocalizedString('أي شاشة عبر سطح المكتب', 'Tout écran via le desktop', 'Any screen via desktop app', lang)}</div>
                     </div>
                   </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onClick={() => copyText(genericTvUrl)}>
+                  <DropdownMenuItem onClick={() => copyText(lanTvUrl)}>
                     <Copy className="h-4 w-4 me-2" />
-                    {getLocalizedString('نسخ رابط الشاشة', 'Copier le lien', 'Copy screen URL', lang)}
+                    {getLocalizedString('نسخ رابط الشاشة (LAN)', 'Copier le lien (LAN)', 'Copy screen URL (LAN)', lang)}
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setTvQrOpen(true)}>
                     <QrCode className="h-4 w-4 me-2" />
                     {getLocalizedString('عرض رمز QR', 'Afficher le QR', 'Show QR code', lang)}
                   </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <p className="px-2 py-1.5 text-[11px] leading-snug text-muted-foreground">
+                    {getLocalizedString(
+                      'اضغط "بث" على بطاقة أي تلفاز مكتشف أو مسجل — يتم الإرسال مباشرة عبر بروتوكولات التلفاز (Samsung / LG / DLNA / Google Cast / Roku) أو بأمر مباشر لتطبيق بلاستي على الشاشة.',
+                      'Appuyez « Diffuser » sur une TV découverte ou enregistrée — envoi direct via les protocoles TV (Samsung / LG / DLNA / Google Cast / Roku) ou commande directe à l\'app BLASTI.',
+                      'Press "Cast" on any discovered or registered TV — sent directly via the TV\'s protocols (Samsung / LG / DLNA / Google Cast / Roku) or a direct command to the BLASTI app on the screen.',
+                      lang,
+                    )}
+                  </p>
                 </DropdownMenuContent>
               </DropdownMenu>
 
@@ -993,6 +1074,8 @@ export function DeviceManager() {
                         printingTest={printingTestId === d.id}
                         onSaveTv={() => handleSaveTv(d)}
                         onCast={() => handleCastTv(d)}
+                        onPair={() => handlePairByIdentity(d)}
+                        pairRequested={pairRequestedIds.has(d.id)}
                         onSavePrinter={() => handleSavePrinter(d)}
                         onTestPrinter={() => handleTestPrinter(d)}
                         onPrintTest={() => handlePrintTestPage(d)}
@@ -1074,6 +1157,7 @@ export function DeviceManager() {
                 busy={busyDeviceId === device.id}
                 onQuickRefresh={() => sendCommand(device, 'REFRESH')}
                 onPreview={() => setTvPreviewDevice(device)}
+                onCast={() => handleCastRegistered(device)}
                 onCredentials={() => openKioskCredentials(device)}
                 onEdit={() => openEdit(device)}
                 onPair={() => handlePair(device)}
@@ -1163,9 +1247,9 @@ export function DeviceManager() {
         />
 
         <TvQrDialog
-          open={tvQrOpen} lang={lang} rtl={rtl} url={genericTvUrl}
+          open={tvQrOpen} lang={lang} rtl={rtl} url={lanTvUrl}
           onOpenChange={setTvQrOpen}
-          onCopyUrl={() => copyText(genericTvUrl)}
+          onCopyUrl={() => copyText(lanTvUrl)}
         />
       </div>
     </TooltipProvider>
@@ -1176,7 +1260,7 @@ export function DeviceManager() {
 
 function ManagerDeviceCard({
   device, lang, busy,
-  onQuickRefresh, onPreview, onCredentials, onEdit, onPair, onUnpair, onCommand,
+  onQuickRefresh, onPreview, onCast, onCredentials, onEdit, onPair, onUnpair, onCommand,
   onToggleEnable, onDelete,
 }: {
   device: AgencyDevice;
@@ -1184,6 +1268,8 @@ function ManagerDeviceCard({
   busy: boolean;
   onQuickRefresh: () => void;
   onPreview: () => void;
+  /** 0.6.96 — direct board cast to a registered TV (CAST_URL command). */
+  onCast?: () => void;
   onCredentials: () => void;
   onEdit: () => void;
   onPair: () => void;
@@ -1303,10 +1389,26 @@ function ManagerDeviceCard({
               {getLocalizedString('تحديث', 'Rafraîchir', 'Refresh', lang)}
             </Button>
             {isTvLike && (
-              <Button variant="outline" size="sm" className="h-7 flex-1 gap-1 text-xs" onClick={onPreview}>
-                <ExternalLink className="h-3 w-3" />
-                {getLocalizedString('معاينة', 'Aperçu', 'Preview', lang)}
-              </Button>
+              <>
+                <Button variant="outline" size="sm" className="h-7 flex-1 gap-1 text-xs" onClick={onPreview}>
+                  <ExternalLink className="h-3 w-3" />
+                  {getLocalizedString('معاينة', 'Aperçu', 'Preview', lang)}
+                </Button>
+                {/* 0.6.96 — direct cast: the TV's BLASTI board app navigates to
+                    the board (CAST_URL command) — no browser, no Chromecast tab. */}
+                {onCast && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 flex-1 gap-1 text-xs border-cyan-300/60 text-cyan-700 hover:bg-cyan-50 dark:border-cyan-900/50 dark:text-cyan-400 dark:hover:bg-cyan-950/30"
+                    disabled={busy}
+                    onClick={onCast}
+                  >
+                    {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Cast className="h-3 w-3" />}
+                    {getLocalizedString('بث', 'Diffuser', 'Cast', lang)}
+                  </Button>
+                )}
+              </>
             )}
             {isKiosk && (
               <Button variant="outline" size="sm" className="h-7 flex-1 gap-1 text-xs" onClick={onCredentials}>
@@ -1342,8 +1444,8 @@ function DiscoveredTypeIcon({ device }: { device: RealDiscoveredDevice }) {
 
 function DiscoveredCard({
   device, lang, busy, tvSaved, isDefaultPrinter,
-  connecting, connectVerified, printingTest,
-  onSaveTv, onCast, onSavePrinter, onTestPrinter, onPrintTest, onConnect, onDismiss,
+  connecting, connectVerified, printingTest, pairRequested,
+  onSaveTv, onCast, onPair, onSavePrinter, onTestPrinter, onPrintTest, onConnect, onDismiss,
 }: {
   device: RealDiscoveredDevice;
   lang: string;
@@ -1353,8 +1455,12 @@ function DiscoveredCard({
   connecting: boolean;
   connectVerified: 'verified' | 'failed' | undefined;
   printingTest: boolean;
+  /** 0.6.96 — pairing request already sent from this card. */
+  pairRequested?: boolean;
   onSaveTv: () => void;
   onCast: () => void;
+  /** 0.6.96 — request pairing from a discovered BLASTI card. */
+  onPair: () => void;
   onSavePrinter: () => void;
   onTestPrinter: () => void;
   onPrintTest: () => void;
@@ -1417,6 +1523,12 @@ function DiscoveredCard({
               {getLocalizedString('حاسوب', 'Bureau', 'Desktop', lang)}
             </span>
           )}
+          {/* 0.6.96 — self-announced platform chip (the app SHARED this info) */}
+          {device.platform && (
+            <span className="rounded-full bg-muted px-1.5 py-px text-[9px] uppercase" dir="ltr">
+              {device.platform}
+            </span>
+          )}
           {typeof confidence === 'number' && (
             <span className={`rounded-full px-1.5 py-px text-[9px] ${
               confidence >= 85
@@ -1435,6 +1547,23 @@ function DiscoveredCard({
       </div>
       <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
         {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+        {/* 0.6.96 — PAIRING REQUEST BUTTON on discovery results: every active
+            BLASTI app card (desktop / kiosk / phone beacon) gets a one-click
+            pairing request — no more "visible but unpairable" beacon cards. */}
+        {isBlasti && device.type !== 'TV' && (
+          <Button
+            variant="outline"
+            size="sm"
+            className={`h-7 gap-1 text-xs ${pairRequested ? 'border-emerald-300 text-emerald-700 dark:text-emerald-400' : 'border-emerald-300/60 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-900/50 dark:text-emerald-400 dark:hover:bg-emerald-950/30'}`}
+            disabled={busy || pairRequested}
+            onClick={onPair}
+          >
+            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
+            {pairRequested
+              ? getLocalizedString('أُرسل الطلب', 'Envoyé', 'Sent', lang)
+              : getLocalizedString('طلب ربط', 'Associer', 'Pair', lang)}
+          </Button>
+        )}
         {isTv && (
           <>
             {!tvSaved && (

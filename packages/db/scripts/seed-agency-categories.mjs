@@ -161,10 +161,12 @@ const SPECIALTY_CATALOG = {
 
 // ─── Default terminology overrides (key = i18n dictionary key) ──────────────
 // Doctor/Clinic callers are PATIENTS; law-office callers are CLIENTS
-// (موكل); barber callers are CUSTOMERS (زبناء). 0.6.76 — nine audited keys:
-// the six stat labels PLUS the three queue-sentence keys (noQueue,
-// noCustomersWaiting, customerJoinedQueue). Admins can add more keys
-// from the "Agency Categories Language" page.
+// (موكل); barber callers are CUSTOMERS (زبناء). 0.6.76 — nine audited keys.
+// 0.6.98 — FULL terminology audit (29 keys per category): the SERVICE
+// wording (Consultation / Legal Service / Hair Service), the ticket/counter/
+// queue labels and the customer-flavored sentences (walk-in flow, call/
+// complete events, satisfaction/growth stats). Kept in lockstep with
+// apps/api/src/lib/ensure-category-dictionary.ts.
 
 const TERMS = {
   DOCTOR: [
@@ -177,6 +179,27 @@ const TERMS = {
     ['noQueue', 'لا يوجد مرضى في الانتظار', 'No patients in queue', 'Aucun patient en attente'],
     ['noCustomersWaiting', 'لا يوجد مرضى منتظرون', 'No patients waiting', 'Aucun patient en attente'],
     ['customerJoinedQueue', '{name} انضم إلى قائمة الانتظار', '{name} joined the queue', "{name} a rejoint la file d'attente"],
+    // ── 0.6.98 audit — a medical "service" is a consultation ──
+    ['service', 'استشارة', 'Consultation', 'Consultation'],
+    ['services', 'الاستشارات', 'Consultations', 'Consultations'],
+    ['addService', 'إضافة استشارة', 'Add Consultation', 'Ajouter une consultation'],
+    ['serviceName', 'اسم الاستشارة', 'Consultation Name', 'Nom de la consultation'],
+    ['ticket', 'تذكرة', 'Ticket', 'Ticket'],
+    ['currentTicket', 'التذكرة الحالية', 'Current Ticket', 'Ticket actuel'],
+    ['counter', 'الشباك', 'Desk', 'Guichet'],
+    ['counterLabel', 'الشباك', 'Desk', 'Guichet'],
+    ['queueNumber', 'رقم الانتظار', 'Queue Number', 'Numéro de file'],
+    ['queueManagement', 'إدارة قائمة الانتظار', 'Queue Management', 'Gestion de la file'],
+    ['joinQueue', 'انضم إلى قائمة الانتظار', 'Join Queue', 'Rejoindre la file'],
+    ['noQueueHint', 'تمت خدمة جميع المرضى. عمل رائع!', 'All patients have been served. Great job!', 'Tous les patients ont été servis. Bon travail !'],
+    ['customerWasCalled', 'تم استدعاء {name}', '{name} was called', '{name} a été appelé'],
+    ['customerCompletedService', '{name} أنهى الاستشارة', '{name} completed the consultation', '{name} a terminé la consultation'],
+    ['customerSatisfaction', 'رضا المرضى', 'Patient Satisfaction', 'Satisfaction des patients'],
+    ['customerGrowth', 'نمو المرضى', 'Patient Growth', 'Croissance des patients'],
+    ['customerInfo', 'معلومات المريض', 'Patient Info', 'Infos patient'],
+    ['walkInCustomerName', 'اسم المريض', 'Patient Name', 'Nom du patient'],
+    ['addWalkInCustomer', 'إضافة مريض حاضر', 'Add Walk-in Patient', 'Ajouter un patient présent'],
+    ['walkInCustomerAdded', 'تمت إضافة المريض الحاضر إلى قائمة الانتظار', 'Walk-in patient added to the queue', 'Patient présent ajouté à la file'],
   ],
   CLINIC: [
     ['customer', 'مريض', 'Patient', 'Patient'],
@@ -188,6 +211,27 @@ const TERMS = {
     ['noQueue', 'لا يوجد مرضى في الانتظار', 'No patients in queue', 'Aucun patient en attente'],
     ['noCustomersWaiting', 'لا يوجد مرضى منتظرون', 'No patients waiting', 'Aucun patient en attente'],
     ['customerJoinedQueue', '{name} انضم إلى قائمة الانتظار', '{name} joined the queue', "{name} a rejoint la file d'attente"],
+    // ── 0.6.98 audit — a medical "service" is a consultation ──
+    ['service', 'استشارة', 'Consultation', 'Consultation'],
+    ['services', 'الاستشارات', 'Consultations', 'Consultations'],
+    ['addService', 'إضافة استشارة', 'Add Consultation', 'Ajouter une consultation'],
+    ['serviceName', 'اسم الاستشارة', 'Consultation Name', 'Nom de la consultation'],
+    ['ticket', 'تذكرة', 'Ticket', 'Ticket'],
+    ['currentTicket', 'التذكرة الحالية', 'Current Ticket', 'Ticket actuel'],
+    ['counter', 'الشباك', 'Desk', 'Guichet'],
+    ['counterLabel', 'الشباك', 'Desk', 'Guichet'],
+    ['queueNumber', 'رقم الانتظار', 'Queue Number', 'Numéro de file'],
+    ['queueManagement', 'إدارة قائمة الانتظار', 'Queue Management', 'Gestion de la file'],
+    ['joinQueue', 'انضم إلى قائمة الانتظار', 'Join Queue', 'Rejoindre la file'],
+    ['noQueueHint', 'تمت خدمة جميع المرضى. عمل رائع!', 'All patients have been served. Great job!', 'Tous les patients ont été servis. Bon travail !'],
+    ['customerWasCalled', 'تم استدعاء {name}', '{name} was called', '{name} a été appelé'],
+    ['customerCompletedService', '{name} أنهى الاستشارة', '{name} completed the consultation', '{name} a terminé la consultation'],
+    ['customerSatisfaction', 'رضا المرضى', 'Patient Satisfaction', 'Satisfaction des patients'],
+    ['customerGrowth', 'نمو المرضى', 'Patient Growth', 'Croissance des patients'],
+    ['customerInfo', 'معلومات المريض', 'Patient Info', 'Infos patient'],
+    ['walkInCustomerName', 'اسم المريض', 'Patient Name', 'Nom du patient'],
+    ['addWalkInCustomer', 'إضافة مريض حاضر', 'Add Walk-in Patient', 'Ajouter un patient présent'],
+    ['walkInCustomerAdded', 'تمت إضافة المريض الحاضر إلى قائمة الانتظار', 'Walk-in patient added to the queue', 'Patient présent ajouté à la file'],
   ],
   LAW_FIRM: [
     ['customer', 'موكّل', 'Client', 'Client'],
@@ -199,6 +243,27 @@ const TERMS = {
     ['noQueue', 'لا يوجد موكلين في الانتظار', 'No clients in queue', 'Aucun client en attente'],
     ['noCustomersWaiting', 'لا يوجد موكلين منتظرون', 'No clients waiting', 'Aucun client en attente'],
     ['customerJoinedQueue', '{name} انضم إلى قائمة الانتظار', '{name} joined the queue', "{name} a rejoint la file d'attente"],
+    // ── 0.6.98 audit — a law office's "service" is a legal service ──
+    ['service', 'خدمة قانونية', 'Legal Service', 'Service juridique'],
+    ['services', 'الخدمات القانونية', 'Legal Services', 'Services juridiques'],
+    ['addService', 'إضافة خدمة قانونية', 'Add Legal Service', 'Ajouter un service juridique'],
+    ['serviceName', 'اسم الخدمة', 'Service Name', 'Nom du service'],
+    ['ticket', 'تذكرة', 'Ticket', 'Ticket'],
+    ['currentTicket', 'التذكرة الحالية', 'Current Ticket', 'Ticket actuel'],
+    ['counter', 'المكتب', 'Desk', 'Bureau'],
+    ['counterLabel', 'المكتب', 'Desk', 'Bureau'],
+    ['queueNumber', 'رقم الانتظار', 'Queue Number', 'Numéro de file'],
+    ['queueManagement', 'إدارة قائمة الانتظار', 'Queue Management', 'Gestion de la file'],
+    ['joinQueue', 'انضم إلى قائمة الانتظار', 'Join Queue', 'Rejoindre la file'],
+    ['noQueueHint', 'تمت خدمة جميع الموكلين. عمل رائع!', 'All clients have been served. Great job!', 'Tous les clients ont été servis. Bon travail !'],
+    ['customerWasCalled', 'تم استدعاء {name}', '{name} was called', '{name} a été appelé'],
+    ['customerCompletedService', '{name} أنهى الخدمة', '{name} completed the service', '{name} a terminé le service'],
+    ['customerSatisfaction', 'رضا الموكلين', 'Client Satisfaction', 'Satisfaction des clients'],
+    ['customerGrowth', 'نمو الموكلين', 'Client Growth', 'Croissance des clients'],
+    ['customerInfo', 'معلومات الموكل', 'Client Info', 'Infos client'],
+    ['walkInCustomerName', 'اسم الموكل', 'Client Name', 'Nom du client'],
+    ['addWalkInCustomer', 'إضافة موكّل حاضر', 'Add Walk-in Client', 'Ajouter un client présent'],
+    ['walkInCustomerAdded', 'تمت إضافة الموكل الحاضر إلى قائمة الانتظار', 'Walk-in client added to the queue', 'Client présent ajouté à la file'],
   ],
   BARBER: [
     ['customer', 'زبون', 'Customer', 'Client'],
@@ -210,6 +275,27 @@ const TERMS = {
     ['noQueue', 'لا يوجد زبناء في الانتظار', 'No customers in queue', 'Aucun client en attente'],
     ['noCustomersWaiting', 'لا يوجد زبناء منتظرون', 'No customers waiting', 'Aucun client en attente'],
     ['customerJoinedQueue', '{name} انضم للطابور', '{name} joined the queue', "{name} a rejoint la file d'attente"],
+    // ── 0.6.98 audit — a barber's "service" is a hair service ──
+    ['service', 'خدمة شعر', 'Hair Service', 'Service coiffure'],
+    ['services', 'خدمات الشعر', 'Hair Services', 'Services coiffure'],
+    ['addService', 'إضافة خدمة', 'Add Service', 'Ajouter un service'],
+    ['serviceName', 'اسم الخدمة', 'Service Name', 'Nom du service'],
+    ['ticket', 'تذكرة', 'Ticket', 'Ticket'],
+    ['currentTicket', 'التذكرة الحالية', 'Current Ticket', 'Ticket actuel'],
+    ['counter', 'الكرسي', 'Chair', 'Fauteuil'],
+    ['counterLabel', 'الكرسي', 'Chair', 'Fauteuil'],
+    ['queueNumber', 'رقم الطابور', 'Queue Number', 'Numéro de file'],
+    ['queueManagement', 'إدارة الطابور', 'Queue Management', 'Gestion de la file'],
+    ['joinQueue', 'انضم للطابور', 'Join Queue', 'Rejoindre la file'],
+    ['noQueueHint', 'تمت خدمة جميع الزبناء. عمل رائع!', 'All customers have been served. Great job!', 'Tous les clients ont été servis. Bon travail !'],
+    ['customerWasCalled', 'تم استدعاء {name}', '{name} was called', '{name} a été appelé'],
+    ['customerCompletedService', '{name} أنهى الخدمة', '{name} completed the service', '{name} a terminé le service'],
+    ['customerSatisfaction', 'رضا الزبناء', 'Customer Satisfaction', 'Satisfaction des clients'],
+    ['customerGrowth', 'نمو الزبناء', 'Customer Growth', 'Croissance des clients'],
+    ['customerInfo', 'معلومات الزبون', 'Customer Info', 'Infos client'],
+    ['walkInCustomerName', 'اسم الزبون', 'Customer Name', 'Nom du client'],
+    ['addWalkInCustomer', 'إضافة زبون حاضر', 'Add Walk-in Customer', 'Ajouter un client présent'],
+    ['walkInCustomerAdded', 'تمت إضافة الزبون الحاضر إلى الطابور', 'Walk-in customer added to the queue', 'Client présent ajouté à la file'],
   ],
 }
 

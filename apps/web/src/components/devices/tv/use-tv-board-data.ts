@@ -448,7 +448,7 @@ export function useTvBoardData({ agencyId: agencyIdProp, discoverLan = true, reg
         }
         if (res.ok) {
           const body = await res.json().catch(() => null);
-          const commands: Array<{ id: string; type: string }> = body?.pendingCommands ?? [];
+          const commands: Array<{ id: string; type: string; payload?: string }> = body?.pendingCommands ?? [];
           for (const cmd of commands) {
             if (cmd.type === 'FORCE_DISCONNECT') {
               await ackCommand(cmd.id);
@@ -465,6 +465,22 @@ export function useTvBoardData({ agencyId: agencyIdProp, discoverLan = true, reg
             if (cmd.type === 'CONFIG_UPDATE') {
               await ackCommand(cmd.id);
               fetchDeviceConfigRef.current();
+              continue;
+            }
+            // 0.6.96 — DIRECT CAST receiver: the manager's "Cast" action on a
+            // registered TV sends one CAST_URL command; the board navigates to
+            // the target board URL (same host, different agency/layout).
+            // Real device-to-device casting — no browser, no Chromecast tab.
+            if (cmd.type === 'CAST_URL') {
+              await ackCommand(cmd.id);
+              try {
+                const payload = typeof cmd.payload === 'string' ? JSON.parse(cmd.payload) : (cmd as { payload?: unknown }).payload;
+                const url = payload && typeof payload === 'object' ? String((payload as { url?: string }).url || '') : String(payload || '');
+                if (/^https?:\/\//.test(url)) {
+                  if (window.location.href !== url) window.location.href = url;
+                  return;
+                }
+              } catch { /* malformed payload — keep showing the current board */ }
               continue;
             }
             await ackCommand(cmd.id);

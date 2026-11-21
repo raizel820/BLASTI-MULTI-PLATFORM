@@ -211,6 +211,7 @@ const en: Record<TranslationKeys, string> = {
   catClinic: "Clinic",
   catLawFirm: "Law Office",
   catBarber: "Barber",
+  catCustomBadge: "Custom",
   catFilter: "Category",
 
   // ─── Queue Statuses ──────────────────────
@@ -1615,6 +1616,12 @@ const en: Record<TranslationKeys, string> = {
   trAgentStatusProcessing: "Processing",
   trAgentStatusDone: "Done",
   trAgentStatusFailed: "Failed",
+  trAgentRetryAllFailed: "Retry failed",
+  trAgentRetryOne: "Retry this translation",
+  trAgentJobRetried: "Translation re-queued",
+  trAgentAllRetried: "{count} failed translation(s) re-queued",
+  trAgentRetryIn: "retry in {min} min",
+  trAgentRetryHint: "Failed translations retry automatically after 3 minutes, up to 5 tries, then wait here until you press retry — and every old failed translation on the server was re-queued by this update.",
   trAgentDictHint: "The local dictionary answers translation lookups FIRST — the agent is only called for strings it has never seen. It stores words and full sentences, keyed by a normalized hash of the source text.",
   trAgentDictSearch: "Search source or translation…",
   trAgentDictEmpty: "The dictionary is empty — it grows as content is translated",

@@ -40,6 +40,55 @@
  *    byte-for-byte.
  */
 
+// ─── 0. Board snapshot provider (0.6.96) ───────────────────────────────────
+// DLNA / Chromecast / Roku can only render MEDIA (an image or a video), not a
+// live web page. The desktop main process registers a provider here that
+// renders the agency's TV board in a hidden Electron window and captures it
+// as a JPEG; the cast routes then push `…/cast/snapshot.jpg` to the TV so the
+// board actually APPEARS on the screen (not a dead URL).
+
+let snapshotProvider = null; // async (url) => Buffer | null
+let snapshotProviderName = null;
+let lastSnapshot = null;        // { buf, ts } — served by GET /cast/snapshot.jpg
+const SNAPSHOT_MAX_AGE_MS = 90_000; // renderers may re-fetch; keep it brief
+
+function setSnapshotProvider(fn, name) {
+  snapshotProvider = typeof fn === 'function' ? fn : null;
+  snapshotProviderName = typeof name === 'string' ? name : null;
+}
+
+function hasSnapshotProvider() {
+  return !!snapshotProvider;
+}
+
+async function captureSnapshot(url) {
+  if (!snapshotProvider) return null;
+  // Fresh cache → reuse (a renderer may fetch the URL seconds after the cast).
+  if (lastSnapshot && Date.now() - lastSnapshot.ts < SNAPSHOT_MAX_AGE_MS) {
+    return lastSnapshot.buf;
+  }
+  try {
+    const buf = await snapshotProvider(url);
+    if (buf && buf.length > 0) {
+      lastSnapshot = { buf, ts: Date.now() };
+      return buf;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** The most recent snapshot buffer (even if older than the cache window). */
+async function getLastSnapshot() {
+  if (lastSnapshot) return lastSnapshot.buf;
+  return null;
+}
+
+function getLastSnapshotTs() {
+  return lastSnapshot ? lastSnapshot.ts : null;
+}
+
 // ─── Protocol detection ─────────────────────────────────────────────────────
 
 /**
@@ -99,11 +148,14 @@ function detectCastProtocols(target) {
     description: 'Roku External Control Protocol — launches the Roku web browser with the URL.',
   });
 
+  // 0.6.96 — Google Cast is now a REAL, direct sender: the local API speaks
+  // the CASTv2 protocol itself (TLS :8009 + protobuf) and launches the Default
+  // Media Receiver with the board snapshot. No Chrome/Edge involved.
   list.push({
     protocol: 'google-cast',
     label: 'Google Cast',
     available: hasGoogleCast,
-    description: 'Chromecast / Android TV detected — cast from Chrome (Presentation API) or the cast menu.',
+    description: 'Chromecast / Android TV detected — direct CASTv2 cast (Default Media Receiver), no browser.',
   });
 
   list.push({
@@ -114,10 +166,10 @@ function detectCastProtocols(target) {
   });
 
   list.push({
-    protocol: 'url',
-    label: 'Open URL',
+    protocol: 'blasti-tv',
+    label: 'BLASTI TV (direct)',
     available: true,
-    description: 'Fallback: open the TV board URL on the TV\'s browser manually.',
+    description: 'TV running the BLASTI board app — direct LAN command, live board, no browser.',
   });
 
   return list;
@@ -520,27 +572,231 @@ async function stopDlnaCast(target) {
   }
 }
 
+// ─── 5. Google Cast / Chromecast — REAL CASTv2 sender (0.6.96) ─────────────
+// Speaks the actual Google Cast V2 protocol directly: a TLS connection to the
+// dongle/TV on port 8009, protobuf-framed CastMessage envelopes (hand-rolled
+// encoder — cast_channel.proto is a flat message of 6 fields), the standard
+// virtual-connection handshake, a LAUNCH of the Default Media Receiver
+// (appId CC1AD845) and a LOAD of the board snapshot JPEG. NO browser, NO
+// Chrome/Edge, NO external dependency.
+
+const tls = require('tls');
+
+const CASTV2_NS_CONNECTION = 'urn:x-cast:com.google.cast.tp.connection';
+const CASTV2_NS_RECEIVER = 'urn:x-cast:com.google.cast.receiver';
+const CASTV2_NS_MEDIA = 'urn:x-cast:com.google.cast.media';
+const CASTV2_DEFAULT_MEDIA_RECEIVER = 'CC1AD845';
+
+/** protobuf wire helpers for cast_channel.proto CastMessage. */
+function pbVarint(field, value) {
+  const tag = field << 3 | 0; // wiretype 0 (varint)
+  const tagBytes = encodeVarint(tag);
+  return Buffer.concat([tagBytes, encodeVarint(value >>> 0)]);
+}
+function encodeVarint(value) {
+  const out = [];
+  let v = value >>> 0;
+  while (v > 0x7f) { out.push((v & 0x7f) | 0x80); v >>>= 7; }
+  out.push(v & 0x7f);
+  return Buffer.from(out);
+}
+function pbString(field, str) {
+  const tag = Buffer.from([(field << 3) | 2]); // wiretype 2 (length-delimited)
+  const payload = Buffer.from(String(str), 'utf8');
+  return Buffer.concat([tag, encodeVarint(payload.length), payload]);
+}
+/** CastMessage { protocol_version:1(CASTV2_1_0=0), source_id, receiver_id, namespace, payload_type:0(STRING), payload_utf8 } */
+function encodeCastMessage({ sourceId, receiverId, namespace, payloadUtf8 }) {
+  return Buffer.concat([
+    pbVarint(1, 0),              // protocol_version = CASTV2_1_0
+    pbString(2, sourceId),       // source_id
+    pbString(3, receiverId),     // receiver_id
+    pbString(4, namespace),      // namespace
+    pbVarint(5, 0),              // payload_type = STRING
+    pbString(6, payloadUtf8),    // payload_utf8
+  ]);
+}
+function frameMessage(msgBuffer) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(msgBuffer.length, 0);
+  return Buffer.concat([len, msgBuffer]);
+}
+
+/**
+ * One full CASTv2 session: connect → virtual connect → launch Default Media
+ * Receiver → LOAD the media URL (the board snapshot JPEG). Resolves
+ * { success, protocol:'google-cast', message, acknowledged }.
+ */
+function castViaGoogleCast(target, mediaUrl, { title } = {}) {
+  const host = target.ip;
+  const port = target.port === 8009 ? 8009 : 8009;
+  return new Promise((resolve) => {
+    let settled = false;
+    let sock = null;
+    let buffer = Buffer.alloc(0);
+    let requestId = 1;
+    let transportId = null;
+    let launched = false;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      try { if (sock) sock.destroy(); } catch { /* ignore */ }
+      resolve(r);
+    };
+    const overallTimer = setTimeout(() => {
+      done({ success: false, protocol: 'google-cast', message: 'Google Cast timed out (device unreachable or cast rejected).' });
+    }, 9000);
+
+    const send = (namespace, receiverId, obj) => {
+      if (!sock) return;
+      try {
+        sock.write(frameMessage(encodeCastMessage({
+          sourceId: 'sender-0',
+          receiverId,
+          namespace,
+          payloadUtf8: JSON.stringify(obj),
+        })));
+      } catch { /* socket gone — the timeout/error paths settle it */ }
+    };
+
+    const handleText = (namespace, obj) => {
+      if (!obj || typeof obj !== 'object') return;
+      if (namespace === CASTV2_NS_RECEIVER) {
+        const apps = (obj.status && Array.isArray(obj.status.applications)) ? obj.status.applications : [];
+        const app = apps.find((a) => a.appId === CASTV2_DEFAULT_MEDIA_RECEIVER);
+        if (app && app.transportId && !launched) {
+          launched = true;
+          transportId = app.transportId;
+          // Virtual connection to the app, then LOAD the media.
+          send(CASTV2_NS_CONNECTION, transportId, { type: 'CONNECT' });
+          send(CASTV2_NS_MEDIA, transportId, {
+            type: 'LOAD',
+            requestId: ++requestId,
+            autoplay: true,
+            currentTime: 0,
+            media: {
+              contentId: mediaUrl,
+              streamType: 'BUFFERED',
+              contentType: 'image/jpeg',
+              metadata: { type: 0, metadataType: 0, title: title || 'BLASTI Queue Board' },
+            },
+          });
+        }
+      }
+      if (namespace === CASTV2_NS_MEDIA) {
+        // A MEDIA_STATUS with a loaded media session (or a LOAD_FAILED) settles it.
+        if (obj.type === 'LOAD_FAILED') {
+          clearTimeout(overallTimer);
+          done({ success: false, protocol: 'google-cast', message: 'Chromecast refused the media (LOAD_FAILED).' });
+          return;
+        }
+        if (obj.type === 'MEDIA_STATUS' && Array.isArray(obj.status)) {
+          clearTimeout(overallTimer);
+          done({
+            success: true,
+            protocol: 'google-cast',
+            message: `Google Cast: board snapshot loaded on ${host}.`,
+            mediaUrl,
+            acknowledged: true,
+          });
+        }
+      }
+    };
+
+    try {
+      sock = tls.connect({ host, port, rejectUnauthorized: false }, () => {
+        // Step 1 — virtual connection to the receiver, then LAUNCH the app.
+        send(CASTV2_NS_CONNECTION, 'receiver-0', { type: 'CONNECT' });
+        send(CASTV2_NS_RECEIVER, 'receiver-0', { type: 'LAUNCH', appId: CASTV2_DEFAULT_MEDIA_RECEIVER, requestId });
+      });
+      sock.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        // Parse as many length-prefixed frames as arrived.
+        while (buffer.length >= 4) {
+          const frameLen = buffer.readUInt32BE(0);
+          if (frameLen <= 0 || frameLen > 256 * 1024) { buffer = Buffer.alloc(0); break; }
+          if (buffer.length < 4 + frameLen) break;
+          const frame = buffer.slice(4, 4 + frameLen);
+          buffer = buffer.slice(4 + frameLen);
+          try {
+            const parsed = decodeCastMessage(frame);
+            if (parsed && parsed.payloadUtf8) {
+              let obj = null;
+              try { obj = JSON.parse(parsed.payloadUtf8); } catch { obj = null; }
+              handleText(parsed.namespace, obj);
+            }
+          } catch { /* malformed frame — skip */ }
+        }
+      });
+      sock.on('error', () => {
+        clearTimeout(overallTimer);
+        done({ success: false, protocol: 'google-cast', message: 'Google Cast connection failed (device may be offline or port 8009 closed).' });
+      });
+    } catch (err) {
+      clearTimeout(overallTimer);
+      done({ success: false, protocol: 'google-cast', message: 'Google Cast init error: ' + (err && err.message ? err.message : 'unknown') });
+    }
+  });
+}
+
+/** Minimal CastMessage DECODER — only the 6 fields we encoded (varint + strings). */
+function decodeCastMessage(buf) {
+  let i = 0;
+  const readVarint = () => {
+    let value = 0; let shift = 0;
+    while (i < buf.length) {
+      const b = buf[i++];
+      value += (b & 0x7f) * Math.pow(2, shift);
+      if ((b & 0x80) === 0) break;
+      shift += 7;
+    }
+    return value;
+  };
+  const readString = () => {
+    const len = readVarint();
+    if (len < 0 || i + len > buf.length) return '';
+    const s = buf.slice(i, i + len).toString('utf8');
+    i += len;
+    return s;
+  };
+  const out = {};
+  while (i < buf.length) {
+    const tag = buf[i++];
+    const field = tag >> 3;
+    const wire = tag & 0x7;
+    if (wire === 0) { readVarint(); }
+    else if (wire === 2) {
+      const len = readVarint();
+      if (len < 0 || i + len > buf.length) break;
+      if (field === 4) out.namespace = buf.slice(i, i + len).toString('utf8');
+      else if (field === 6) out.payloadUtf8 = buf.slice(i, i + len).toString('utf8');
+      i += len;
+    } else break;
+  }
+  return out;
+}
+
 // ─── High-level cast orchestrator ──────────────────────────────────────────────
 
 /**
  * Try the best-matching real cast protocol for the TV, falling back through
- * the list until one succeeds. Returns the first successful result.
+ * the list until one succeeds. 0.6.96: every protocol is DIRECT — vendor
+ * websockets, DLNA SOAP, CASTv2. There is NO "open in a browser" fallback
+ * any more: when everything fails we say so instead of pretending.
  */
 async function castToTv(target, mediaUrl, preferred) {
   const protocols = detectCastProtocols(target);
-  // Order: preferred → brand-native → DLNA → URL fallback.
-  // 'google-cast' and 'airplay' are informational — never executable here.
-  const executable = ['dlna', 'samsung-tizen', 'lg-webos', 'roku-ecp'];
+  const executable = ['dlna', 'samsung-tizen', 'lg-webos', 'roku-ecp', 'google-cast'];
   const order = [];
-  if (preferred) order.push(preferred);
+  if (preferred && executable.includes(preferred)) order.push(preferred);
   for (const p of protocols) {
     if (p.available && !order.includes(p.protocol) && executable.includes(p.protocol)) {
       order.push(p.protocol);
     }
   }
   if (!order.includes('dlna')) order.push('dlna');
-  order.push('url');
 
+  const failures = [];
   for (const proto of order) {
     let result;
     switch (proto) {
@@ -548,15 +804,19 @@ async function castToTv(target, mediaUrl, preferred) {
       case 'samsung-tizen': result = await castViaSamsungTizen(target, mediaUrl); break;
       case 'lg-webos': result = await castViaLgWebOS(target, mediaUrl); break;
       case 'roku-ecp': result = await castViaRokuEcp(target, mediaUrl); break;
-      case 'url':
-      default:
-        result = { success: true, protocol: 'url', message: 'Open the URL on the TV browser.', mediaUrl, acknowledged: false };
-        break;
+      case 'google-cast': result = await castViaGoogleCast(target, mediaUrl); break;
+      default: result = { success: false, message: 'Unknown protocol ' + proto }; break;
     }
     if (result.success) return result;
+    failures.push(`${proto}: ${result.message || 'failed'}`);
   }
 
-  return { success: false, protocol: 'url', message: 'All cast protocols failed.' };
+  return {
+    success: false,
+    protocol: order[0] || 'dlna',
+    message: `All cast protocols failed — ${failures.join(' | ')}`,
+    mediaUrl,
+  };
 }
 
 module.exports = {
@@ -566,5 +826,11 @@ module.exports = {
   castViaSamsungTizen,
   castViaLgWebOS,
   castViaRokuEcp,
+  castViaGoogleCast,
   stopDlnaCast,
+  setSnapshotProvider,
+  hasSnapshotProvider,
+  captureSnapshot,
+  getLastSnapshot,
+  getLastSnapshotTs,
 };

@@ -320,6 +320,9 @@ app.get('/code/:code', async (c) => {
         customCode: agency.customCode,
         category: agency.category,
         address: agency.address,
+        // 0.6.98 — localized address columns (agent-filled; UI falls back).
+        addressAr: agency.addressAr,
+        addressFr: agency.addressFr,
         city: agency.city,
         phone: agency.phone,
         email: agency.email,
@@ -704,6 +707,9 @@ app.get('/:id', async (c) => {
           select: {
             id: true,
             fullName: true,
+            // 0.6.98 — localized display name for the UI.
+            fullNameAr: true,
+            fullNameFr: true,
             username: true,
           },
         },
@@ -1045,14 +1051,21 @@ app.post('/', async (c) => {
     // the owner typed in ONE language (agency name/description, service
     // names). Dictionary hits apply instantly; misses wait for the next
     // 5-minute agent window. NEVER blocks or fails the create.
+    // 0.6.98 — coverage extended to the ADDRESS and the OWNER's display name.
     let translationQueued = 0
     try {
+      const ownerUser = await db.user.findUnique({
+        where: { id: resolvedOwnerId },
+        select: { id: true, fullName: true, fullNameAr: true, fullNameFr: true },
+      })
       const summary = await enqueueAgencyContentTranslations({
         agencyId: agency.id,
         name,
         nameAr: (agency as { nameAr?: string | null }).nameAr,
         nameFr: (agency as { nameFr?: string | null }).nameFr,
         description: (agency as { description?: string | null }).description,
+        address: (agency as { address?: string | null }).address,
+        owner: ownerUser,
         contentLanguage: (validation.data as { contentLanguage?: string }).contentLanguage,
         services: ((agency as { services?: Array<{ id: string; name: string; nameAr?: string | null; nameFr?: string | null }> }).services || [])
           .map((s) => ({ id: s.id, name: s.name, nameAr: s.nameAr, nameFr: s.nameFr })),
@@ -1128,6 +1141,36 @@ app.put('/:id', async (c) => {
     // Performance Round — profile/queue/location edits reflect on the public
     // directory immediately instead of after the 30s TTL.
     invalidateResponseCacheTag('agencies')
+
+    // 0.6.98 — translation coverage on UPDATE: whenever the owner edits the
+    // name/description/address, re-enqueue so any language column still
+    // EMPTY gets filled by the agent ("agency name if some language field
+    // left empty"). The apply step only writes EMPTY columns — manual
+    // translations are never overrun. Fire-and-forget, never fails the PUT.
+    try {
+      const ownerUser = await db.user.findUnique({
+        where: { id: agency.ownerId },
+        select: { id: true, fullName: true, fullNameAr: true, fullNameFr: true },
+      })
+      const summary = await enqueueAgencyContentTranslations({
+        agencyId: agency.id,
+        name: agency.name,
+        nameAr: agency.nameAr,
+        nameFr: agency.nameFr,
+        description: agency.description,
+        descriptionAr: agency.descriptionAr,
+        descriptionFr: agency.descriptionFr,
+        address: agency.address,
+        owner: ownerUser,
+        contentLanguage: null, // unknown on update → name language detected
+        services: [],
+      })
+      if (summary.queued || summary.applied) {
+        console.log(`[agencies] translation agent (update): ${summary.queued} queued, ${summary.applied} applied (agency ${agency.id})`)
+      }
+    } catch (trErr) {
+      console.warn('[agencies] translation re-enqueue failed (non-fatal):', (trErr as Error)?.message || trErr)
+    }
 
     return c.json({ success: true, agency })
   } catch (error: unknown) {

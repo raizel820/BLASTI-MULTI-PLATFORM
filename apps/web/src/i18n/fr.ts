@@ -211,6 +211,7 @@ const fr: Record<TranslationKeys, string> = {
   catClinic: "Clinique",
   catLawFirm: "Cabinet d'avocat",
   catBarber: "Barbier",
+  catCustomBadge: "Personnalisée",
   catFilter: "Catégorie",
 
   // ─── Queue Statuses ──────────────────────
@@ -1605,6 +1606,12 @@ const fr: Record<TranslationKeys, string> = {
   trAgentStatusProcessing: "En cours",
   trAgentStatusDone: "Terminée",
   trAgentStatusFailed: "Échouée",
+  trAgentRetryAllFailed: "Réessayer les échecs",
+  trAgentRetryOne: "Réessayer cette traduction",
+  trAgentJobRetried: "Traduction remise en file",
+  trAgentAllRetried: "{count} traduction(s) échouée(s) remise(s) en file",
+  trAgentRetryIn: "réessai dans {min} min",
+  trAgentRetryHint: "Les traductions échouées sont réessayées automatiquement après 3 minutes, jusqu'à 5 essais, puis attendent ici un clic sur réessayer — et toutes les anciennes traductions échouées du serveur ont été remises en file par cette mise à jour.",
   trAgentDictHint: "Le dictionnaire local répond D'ABORD à chaque recherche — l'agent n'est appelé que pour les mots et phrases jamais vus. Il stocke mots et phrases entières, indexés par un hash normalisé du texte source.",
   trAgentDictSearch: "Rechercher source ou traduction…",
   trAgentDictEmpty: "Le dictionnaire est vide — il grandit à chaque traduction",

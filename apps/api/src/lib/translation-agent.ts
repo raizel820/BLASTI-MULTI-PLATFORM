@@ -27,7 +27,8 @@
 
 import { createHash } from 'node:crypto'
 import { db } from '@blasti/db'
-import { CATEGORY_TERM_KEYS } from './ensure-category-dictionary'
+import { CATEGORY_TERM_KEYS, createMissingBuiltInTermRows } from './ensure-category-dictionary'
+import { invalidateResponseCacheTag } from './response-cache'
 
 // ─── Action trail (0.6.62 — Logs Manager + Category Language page) ──────────
 
@@ -36,6 +37,7 @@ export type AgentLogAction =
   | 'BATCH_RUN' | 'BATCH_FAIL' | 'KEY_TEST' | 'PROCESS_NOW'
   | 'SETTINGS_UPDATE' | 'KEY_CREATE' | 'KEY_UPDATE' | 'KEY_DELETE'
   | 'DICTIONARY_EDIT' | 'DICTIONARY_DELETE'
+  | 'RETRY_JOB' | 'RETRY_ALL_FAILED' | 'RETRY_QUEUE_HEAL' | 'TERMS_AUDIT_TOPUP'
   | 'LOGS_EXPORT'
 
 export interface AgentLogInput {
@@ -87,10 +89,24 @@ export type AgentLang = (typeof AGENT_LANGS)[number]
 
 /** Maximum source text accepted (agency descriptions stay well under this). */
 const MAX_SOURCE_CHARS = 2000
-/** A failed job is retried on the next windows, then parked as 'failed'. */
-const MAX_JOB_ATTEMPTS = 3
+/**
+ * 0.6.98 — RETRY QUEUE: a failed job goes back to 'pending' with
+ * nextRetryAt = now + RETRY_DELAY_MS (the WAITING QUEUE) and is retried
+ * automatically up to FIVE attempts, then parked as 'failed'. Parked jobs
+ * never retry on their own — the admin's "Retry" button (single + retry-all)
+ * re-queues them with a fresh attempt budget any time.
+ */
+const MAX_JOB_ATTEMPTS = 5
+/** Delay before the automatic retry of a failed job (3 minutes). */
+const RETRY_DELAY_MS = 3 * 60_000
 /** create-category jobs processed per window (each also asks for an icon). */
 const MAX_CATEGORY_JOBS_PER_RUN = 5
+/**
+ * 0.6.98 — specialty catalog size the agent is asked to derive for a category
+ * without one (the "specialties words" list of the category-language
+ * directive). Enough to be useful, small enough for one flash window.
+ */
+const CATEGORY_SPECIALTIES_COUNT = 12
 /** Hard LLM call timeout — a stuck provider must never wedge the window. */
 const LLM_TIMEOUT_MS = 120_000
 
@@ -132,15 +148,18 @@ function supportsThinkingDisable(base: string): boolean {
   return /z\.ai|bigmodel\.cn/i.test(base)
 }
 
-const REF_TYPES = ['agency', 'service', 'agency-category', 'category-term'] as const
+const REF_TYPES = ['agency', 'service', 'agency-category', 'category-term', 'user'] as const
 type RefType = (typeof REF_TYPES)[number]
 
 /** Fields the agent may ever write, per ref type (strict whitelist). */
 const APPLYABLE_FIELDS: Record<RefType, ReadonlySet<string>> = {
-  agency: new Set(['nameAr', 'nameFr', 'descriptionAr', 'descriptionFr']),
+  // 0.6.98 — agency gains the address columns; 'user' covers staff/owner
+  // display names (transliteration into the other app languages).
+  agency: new Set(['nameAr', 'nameFr', 'descriptionAr', 'descriptionFr', 'addressAr', 'addressFr']),
   service: new Set(['nameAr', 'nameFr']),
   'agency-category': new Set(['nameAr', 'nameFr']),
   'category-term': new Set(['valueAr', 'valueEn', 'valueFr']),
+  user: new Set(['fullNameAr', 'fullNameFr']),
 }
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
@@ -233,6 +252,13 @@ async function applyTranslation(
       const row = await db.agencyCategory.findUnique({ where: { id: refId }, select: { [field]: true } })
       if (!row || !empty((row as Record<string, unknown>)[field])) return false
       await db.agencyCategory.update({ where: { id: refId }, data: { [field]: text } })
+      return true
+    }
+    // 0.6.98 — staff/owner display names (transliteration).
+    if (refType === 'user') {
+      const row = await db.user.findUnique({ where: { id: refId }, select: { [field]: true } })
+      if (!row || !empty((row as Record<string, unknown>)[field])) return false
+      await db.user.update({ where: { id: refId }, data: { [field]: text } })
       return true
     }
     // category-term
@@ -405,10 +431,12 @@ function nameFieldFor(lang: AgentLang): 'nameAr' | 'nameFr' | null {
 }
 
 /**
- * One-call enqueue for the agency-creation flow: agency name, description
- * and every service name the owner typed in ONE language. The base column
- * keeps exactly what was typed; the agent fills only the EMPTY explicit
- * language columns.
+ * One-call enqueue for the agency-creation flow: agency name, description,
+ * ADDRESS, owner display name and every service name the owner typed in ONE
+ * language. The base column keeps exactly what was typed; the agent fills
+ * only the EMPTY explicit language columns. 0.6.98 — coverage extended with
+ * the address (addressAr/addressFr) and person names (User.fullNameAr/Fr,
+ * transliteration) per the agencies-language directive. Never throws.
  */
 export async function enqueueAgencyContentTranslations(input: {
   agencyId: string
@@ -418,13 +446,23 @@ export async function enqueueAgencyContentTranslations(input: {
   description?: string | null
   descriptionAr?: string | null
   descriptionFr?: string | null
+  /** Street address as typed — language detected heuristically. */
+  address?: string | null
+  /** The agency OWNER's display name (User.fullName). */
+  owner?: { id: string; fullName: string; fullNameAr?: string | null; fullNameFr?: string | null } | null
+  /** Staff members to cover (User rows linked to the agency). */
+  staff?: Array<{ id: string; fullName: string; fullNameAr?: string | null; fullNameFr?: string | null }>
   services?: Array<{ id: string; name: string; nameAr?: string | null; nameFr?: string | null }>
   contentLanguage?: string | null
   /** Trail actor (who triggered the enqueue) — defaults to 'system'. */
   actor?: string
 }): Promise<EnqueueSummary> {
   const total: EnqueueSummary = { queued: 0, applied: 0, skipped: 0 }
-  const sourceLang = sanitizeLang(input.contentLanguage)
+  // 0.6.98 — on UPDATE the content language is unknown → detect it from the
+  // name itself (Arabic script / French markers), instead of defaulting to
+  // 'en' which would mistranslate an Arabic-typed name.
+  const nameProbe = normalizeForDictionary(input.name || input.description || '')
+  const sourceLang = input.contentLanguage ? sanitizeLang(input.contentLanguage) : detectLang(nameProbe)
 
   // ── Agency name ──
   const name = normalizeForDictionary(input.name)
@@ -459,6 +497,41 @@ export async function enqueueAgencyContentTranslations(input: {
       if (!empty(targetLang === 'ar' ? input.descriptionAr : input.descriptionFr)) continue
       mergeSummaries(total, await enqueueTextTranslation({
         text: description, sourceLang, domain: 'agency', refType: 'agency', refId: input.agencyId, field,
+      }))
+    }
+  }
+
+  // ── Agency address (0.6.98) — the address language is NOT authoritative
+  // (owners type it in any script), so it is detected heuristically. Only
+  // the ar/fr columns are agent-filled; the base column stays the EN display.
+  const address = normalizeForDictionary(input.address || '')
+  if (address && address.length <= MAX_SOURCE_CHARS) {
+    const addressSourceLang = detectLang(address)
+    for (const targetLang of AGENT_LANGS) {
+      if (targetLang === addressSourceLang || targetLang === 'en') continue
+      const field = targetLang === 'ar' ? 'addressAr' : 'addressFr'
+      mergeSummaries(total, await enqueueTextTranslation({
+        text: address, sourceLang: addressSourceLang, domain: 'agency',
+        refType: 'agency', refId: input.agencyId, field,
+      }))
+    }
+  }
+
+  // ── Person names (0.6.98) — owner + staff: transliteration into the two
+  // other languages (e.g. "أحمد بن عمر" → "Ahmed Ben Omar"). Only EMPTY
+  // explicit columns are filled; the base fullName is never touched.
+  for (const person of [input.owner, ...(input.staff || [])]) {
+    if (!person?.id) continue
+    const personName = normalizeForDictionary(person.fullName)
+    if (!personName || personName.length > 120) continue
+    const personSourceLang = detectLang(personName)
+    for (const targetLang of AGENT_LANGS) {
+      if (targetLang === personSourceLang || targetLang === 'en') continue
+      const field = targetLang === 'ar' ? 'fullNameAr' : 'fullNameFr'
+      if (!empty(targetLang === 'ar' ? person.fullNameAr : person.fullNameFr)) continue
+      mergeSummaries(total, await enqueueTextTranslation({
+        text: personName, sourceLang: personSourceLang, domain: 'staff',
+        refType: 'user', refId: person.id, field,
       }))
     }
   }
@@ -500,6 +573,48 @@ export async function enqueueAgencyContentTranslations(input: {
     })
   }
 
+  return total
+}
+
+/**
+ * 0.6.98 — queue the transliteration of ONE person's display name (a newly
+ * created/linked staff member or an owner whose name changed). Fire-and-forget
+ * safe: never throws, one trail row when something was queued/applied.
+ */
+export async function enqueueUserNameTranslation(person: {
+  id: string
+  fullName: string
+  fullNameAr?: string | null
+  fullNameFr?: string | null
+}, actor?: string): Promise<EnqueueSummary> {
+  const total: EnqueueSummary = { queued: 0, applied: 0, skipped: 0 }
+  try {
+    const personName = normalizeForDictionary(person.fullName)
+    if (!personName || personName.length > 120) return total
+    const personSourceLang = detectLang(personName)
+    for (const targetLang of AGENT_LANGS) {
+      if (targetLang === personSourceLang || targetLang === 'en') continue
+      const field = targetLang === 'ar' ? 'fullNameAr' : 'fullNameFr'
+      if (!empty(targetLang === 'ar' ? person.fullNameAr : person.fullNameFr)) continue
+      mergeSummaries(total, await enqueueTextTranslation({
+        text: personName, sourceLang: personSourceLang, domain: 'staff',
+        refType: 'user', refId: person.id, field,
+      }))
+    }
+    if (total.queued > 0 || total.applied > 0) {
+      await logAgentAction({
+        action: 'ENQUEUE_AGENCY',
+        status: 'success',
+        summary: `person name → ${total.queued} queued, ${total.applied} applied from the dictionary ("${personName.slice(0, 60)}")`,
+        details: { ...total, userId: person.id, name: personName.slice(0, 80) },
+        refType: 'user',
+        refId: person.id,
+        actor: actor || 'system',
+      })
+    }
+  } catch (error) {
+    console.warn('[translation-agent] user-name enqueue failed:', (error as Error)?.message || error)
+  }
   return total
 }
 
@@ -626,6 +741,9 @@ export async function createPendingCategory(
           payload: JSON.stringify({
             categoryRowId: existing.id, slug: existing.slug, name, sourceLang,
             generateTerms: true, termKeys: [...CATEGORY_TERM_KEYS],
+            // 0.6.98 — the agent also builds the domain's SPECIALTY catalog
+            // (only applied when the category has zero specialties).
+            generateSpecialties: true, specialtiesCount: CATEGORY_SPECIALTIES_COUNT,
           }),
         },
       })
@@ -663,9 +781,13 @@ export async function createPendingCategory(
       // 0.6.76 — generateTerms: the agent also derives the category's
       // SPECIALIZED terminology (Patient/Client/Customer...) for every
       // audited key — new categories no longer stay on generic words.
+      // 0.6.98 — generateSpecialties: it ALSO builds the domain's specialty
+      // catalog (trilingual), so a brand-new category arrives with real,
+      // translatable specialties instead of an empty picker.
       payload: JSON.stringify({
         categoryRowId: row.id, slug: row.slug, name, sourceLang,
         generateTerms: true, termKeys: [...CATEGORY_TERM_KEYS],
+        generateSpecialties: true, specialtiesCount: CATEGORY_SPECIALTIES_COUNT,
       }),
     },
   })
@@ -696,7 +818,7 @@ export async function createPendingCategory(
 export async function enqueueCategoryTermGeneration(categoryId: string, actor?: string): Promise<boolean> {
   const category = await db.agencyCategory.findUnique({
     where: { id: categoryId },
-    select: { id: true, slug: true, name: true },
+    select: { id: true, slug: true, name: true, _count: { select: { specialties: true } } },
   })
   if (!category) return false
   // Dedup: only skip when a TERMS-generation job for THIS category is already
@@ -716,6 +838,10 @@ export async function enqueueCategoryTermGeneration(categoryId: string, actor?: 
       payload: JSON.stringify({
         categoryRowId: category.id, slug: category.slug, name: category.name,
         sourceLang: 'en', generateTerms: true, termKeys: [...CATEGORY_TERM_KEYS],
+        // 0.6.98 — the same window also fills an EMPTY specialty catalog.
+        ...(category._count.specialties === 0
+          ? { generateSpecialties: true, specialtiesCount: CATEGORY_SPECIALTIES_COUNT }
+          : {}),
       }),
     },
   })
@@ -733,17 +859,19 @@ export async function enqueueCategoryTermGeneration(categoryId: string, actor?: 
 
 // ─── LLM call (strict contract) ─────────────────────────────────────────────
 
-const AGENT_SYSTEM_PROMPT = `You are the BLASTI translation agent. You do EXACTLY ONE job: translate the given strings between Arabic (ar), English (en) and French (fr), and — only when an item is marked as a category — pick ONE emoji icon for it and, when the category carries "termKeys", derive that business domain's SPECIALIZED UI terminology.
+const AGENT_SYSTEM_PROMPT = `You are the BLASTI translation agent. You do EXACTLY ONE job: translate the given strings between Arabic (ar), English (en) and French (fr), and — only when an item is marked as a category — pick ONE emoji icon for it and, when the category carries "termKeys" or "specialties", derive that business domain's SPECIALIZED UI terminology and service catalog.
 ABSOLUTE RULES:
 1. Output ONLY one minified JSON object. No markdown fences, no commentary, no extra keys, no trailing text.
 2. Exact shape: {"items":[{"id":"<as given>","t":{"<lang>":"<translation>"}}],"categories":[{"id":"<as given>","name":"<english name>","nameAr":"<arabic name>","nameFr":"<french name>","icon":"<one emoji>"}]}
    When a category item carries "termKeys", ALSO add to it "terms":[{"key":"<as given>","ar":"...","en":"...","fr":"..."}] with EXACTLY one entry per requested key, same order.
+   When a category item carries "specialties", ALSO add to it "specialties":[{"en":"...","ar":"...","fr":"..."}] — EXACTLY that many distinct entries (same order as requested), the concrete specialties/sub-services a typical business of this category offers, in professional English + Arabic + French (see rule 9).
 3. Omit "items" when there are none; omit "categories" when there are none.
 4. Translate faithfully, concisely and professionally. Keep numbers, codes and brand names as-is. Do not add quotes, notes or explanations around translations.
 5. "icon" MUST be exactly ONE emoji character suitable for the business category. Never a word, never more than one emoji.
 6. If a string is already written in a target language, return it unchanged for that language.
-7. Never invent content beyond the provided strings. Never answer anything that is not this JSON.
-8. SPECIALIZED TERMINOLOGY (only for categories carrying "termKeys"): the terms name the PERSON the business serves and its queue wording — they MUST use the vocabulary of THAT exact business domain (the category name is the domain), never the generic platform word. Medical (doctor, clinic, dentist, laboratory...) → "Patient" / "مريض"; legal (law firm, attorney) → "Client" / "موكّل"; beauty (barber, salon, spa) → "Customer" / "زبون"; food (restaurant, café) → "Guest" / "ضيف"; anything else → the most natural professional word a business of that kind uses for the person it serves. Key meanings, so every language reads naturally: customer = the served person (singular noun); totalCustomers = "Total <term>s"; customersServed = "<term>s served"; waitingCustomers = "Waiting <term>s"; customerReviews = "<term> reviews"; customersPerHour = short throughput label ("patients/hr" / "مرضى/ساعة"); noQueue = "No <term>s in queue"; noCustomersWaiting = "No <term>s waiting"; customerJoinedQueue = "<name> joined the queue" — the {name} placeholder MUST be kept verbatim in every language.`
+7. Never invent content beyond the provided strings — except the category terminology and specialty catalog the category item explicitly asks you to derive (rules 8-9). Never answer anything that is not this JSON.
+8. SPECIALIZED TERMINOLOGY (only for categories carrying "termKeys"): the terms name the PERSON the business serves, its queue wording and its service wording — they MUST use the vocabulary of THAT exact business domain (the category name is the domain), never the generic platform word. Medical (doctor, clinic, dentist, laboratory...) → "Patient" / "مريض"; legal (law firm, attorney) → "Client" / "موكّل"; beauty (barber, salon, spa) → "Customer" / "زبون"; food (restaurant, café) → "Guest" / "ضيف"; anything else → the most natural professional word a business of that kind uses for the person it serves. Key meanings, so every language reads naturally: customer = the served person (singular noun); totalCustomers = "Total <term>s"; customersServed = "<term>s served"; waitingCustomers = "Waiting <term>s"; customerReviews = "<term> reviews"; customersPerHour = short throughput label ("patients/hr" / "مرضى/ساعة"); noQueue = "No <term>s in queue"; noCustomersWaiting = "No <term>s waiting"; customerJoinedQueue = "<name> joined the queue"; noQueueHint = "All <term>s have been served. Great job!"; customerWasCalled = "<term> was called"; customerCompletedService = "<name> completed the <service>" — phrased so the rendered sentence works with ONLY the {name} placeholder (never write a literal {service} placeholder); customerSatisfaction = "<term> satisfaction"; customerGrowth = "<term> growth"; customerInfo = "<term> info"; walkInCustomerName = "<term> name" (a form label); addWalkInCustomer = "Add walk-in <term>"; walkInCustomerAdded = "Walk-in <term> added to the queue"; service = the word ONE bookable/queueable offering of that business is called (medical → "Consultation" / "استشارة"; legal → "Legal service" / "خدمة قانونية"; barber → "Hair service" / "خدمة شعر"); services = the plural label of that same word; addService = "Add <service>"; serviceName = "<service> name"; ticket = the issued queue slip ("Ticket" / "تذكرة" — or the domain word); counter = the serving desk ("Desk"/"Box"/"Office" per domain); counterLabel = the same word standalone; queueNumber = "Queue number" with the domain flavor; joinQueue = the call-to-action to join; queueManagement = "Queue management"; currentTicket = "Current ticket". The {name} placeholder MUST be kept verbatim in every language wherever it appears.
+9. SPECIALTY CATALOG (only for categories carrying "specialties"): list the concrete specialties/sub-services a typical business of that category offers (for a dental clinic: "Dental Implants", "Orthodontics"...; for a law office: "Family Law", "Criminal Law"...). Each entry: professional name in English ("en"), Arabic ("ar") and French ("fr"), 2-60 characters, title-case, NO numbering, NO duplicates, ONE row per requested count.`
 
 interface LLMCallResult {
   ok: boolean
@@ -1034,17 +1162,71 @@ function failJobs(ids: string[], error: string): Promise<void> {
       const job = await db.translationJob.findUnique({ where: { id }, select: { attempts: true } })
       if (!job) continue
       const attempts = job.attempts + 1
+      const exhausted = attempts >= MAX_JOB_ATTEMPTS
       await db.translationJob.update({
         where: { id },
         data: {
           attempts,
-          status: attempts >= MAX_JOB_ATTEMPTS ? 'failed' : 'pending',
+          // 0.6.98 — WAITING QUEUE: still alive → back to 'pending' with a
+          // 3-minute cooldown (the batch claim only picks due jobs);
+          // exhausted → parked as 'failed' (nextRetryAt cleared, the row
+          // waits for the admin's manual Retry button).
+          status: exhausted ? 'failed' : 'pending',
           error: error.slice(0, 500),
-          processedAt: attempts >= MAX_JOB_ATTEMPTS ? new Date() : null,
+          processedAt: exhausted ? new Date() : null,
+          nextRetryAt: exhausted ? null : new Date(Date.now() + RETRY_DELAY_MS),
         },
       })
     }
   })()
+}
+
+/**
+ * 0.6.98 — manually re-queue ONE job (the admin Retry button): attempts are
+ * reset to a fresh budget so it gets the full 5 automatic tries again, and
+ * nextRetryAt is cleared so the very next window picks it up. Works on
+ * 'failed' jobs AND on stuck 'processing' rows (a wedged claim from a dead
+ * process would otherwise never be reclaimed).
+ */
+export async function retryTranslationJob(jobId: string, actor?: string): Promise<boolean> {
+  const job = await db.translationJob.findUnique({ where: { id: jobId } })
+  if (!job) return false
+  await db.translationJob.update({
+    where: { id: jobId },
+    data: { status: 'pending', attempts: 0, nextRetryAt: null, error: null, processedAt: null },
+  })
+  await logAgentAction({
+    action: 'RETRY_JOB',
+    status: 'success',
+    summary: `job re-queued manually — "${String(job.sourceText || job.type).slice(0, 60)}" (was ${job.status}, ${job.attempts} attempts)`,
+    details: { jobId, previousStatus: job.status, previousAttempts: job.attempts },
+    refType: 'translation-job',
+    refId: jobId,
+    actor: actor || 'system',
+  })
+  return true
+}
+
+/**
+ * 0.6.98 — re-queue EVERY parked 'failed' job (the "Retry all failed"
+ * button). Each job gets a fresh attempt budget + cleared nextRetryAt so the
+ * next window processes them all. @returns how many jobs were re-queued.
+ */
+export async function retryAllFailedJobs(actor?: string): Promise<number> {
+  const result = await db.translationJob.updateMany({
+    where: { status: 'failed' },
+    data: { status: 'pending', attempts: 0, nextRetryAt: null, error: null, processedAt: null },
+  })
+  if (result.count > 0) {
+    await logAgentAction({
+      action: 'RETRY_ALL_FAILED',
+      status: 'success',
+      summary: `all failed jobs re-queued manually — ${result.count} job(s) back in the waiting queue`,
+      details: { requeued: result.count },
+      actor: actor || 'system',
+    })
+  }
+  return result.count
 }
 
 export interface BatchRunStats {
@@ -1071,14 +1253,21 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
     return stats
   }
 
+  // 0.6.98 — the claim only picks jobs whose retry cooldown has elapsed
+  // (nextRetryAt null = never failed; due = the 3-minute waiting queue
+  // elapsed). Jobs in cooldown stay 'pending' but invisible to this window.
+  const retryDueFilter = {
+    OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: new Date() } }],
+  }
+
   const [textJobs, categoryJobs] = await Promise.all([
     db.translationJob.findMany({
-      where: { type: 'translate-text', status: 'pending' },
+      where: { type: 'translate-text', status: 'pending', ...retryDueFilter },
       orderBy: { createdAt: 'asc' },
       take: Math.max(1, Math.min(100, config.batchSize || 40)),
     }),
     db.translationJob.findMany({
-      where: { type: 'create-category', status: 'pending' },
+      where: { type: 'create-category', status: 'pending', ...retryDueFilter },
       orderBy: { createdAt: 'asc' },
       take: MAX_CATEGORY_JOBS_PER_RUN,
     }),
@@ -1131,24 +1320,30 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
       text: g.item.sourceText,
     })),
     categories: categoryJobs.map((job, index) => {
-      let payload: { categoryRowId?: string; name?: string; termKeys?: unknown } = {}
+      let payload: { categoryRowId?: string; name?: string; termKeys?: unknown; specialtiesCount?: unknown } = {}
       try { payload = JSON.parse(String(job.payload || '{}')) } catch { /* malformed → empty */ }
       // 0.6.76 — categories with generateTerms also request their SPECIALIZED
       // terminology (the agent derives "Patient"-style terms per domain).
       const requestedTermKeys = Array.isArray(payload.termKeys)
         ? (payload.termKeys as unknown[]).filter((k): k is string => typeof k === 'string' && /^[A-Za-z][A-Za-z0-9_.]{1,59}$/.test(k))
         : []
+      // 0.6.98 — categories with generateSpecialties also request the domain's
+      // specialty catalog (trilingual rows created only when none exist).
+      const specialtiesCount = Number(payload.specialtiesCount)
       return {
         id: `c${index}`,
         name: String(payload.name || ''),
         sourceLang: 'auto',
         ...(requestedTermKeys.length > 0 ? { termKeys: requestedTermKeys } : {}),
+        ...(Number.isFinite(specialtiesCount) && specialtiesCount > 0
+          ? { specialties: Math.min(20, Math.max(3, Math.round(specialtiesCount))) }
+          : {}),
       }
     }),
   }
 
   const llm = await callTranslationLLM(
-    `Translate for a queue-management platform. For any category carrying "termKeys", also produce its specialized domain terminology (system rule 8). Return ONLY the JSON object.\n${JSON.stringify(promptPayload)}`,
+    `Translate for a queue-management platform. For any category carrying "termKeys", also produce its specialized domain terminology (system rule 8); for any category carrying "specialties", also produce its trilingual specialty catalog (system rule 9). Return ONLY the JSON object.\n${JSON.stringify(promptPayload)}`,
   )
 
   if (!llm.ok) {
@@ -1179,8 +1374,11 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
   const parsed = extractJsonBlock(llm.content || '')
   const itemResults = new Map<string, Record<string, string>>()
   interface GeneratedTerm { key: string; ar?: string; en?: string; fr?: string }
+  /** 0.6.98 — one trilingual specialty row the agent derived for a category. */
+  interface GeneratedSpecialty { en: string; ar: string; fr: string }
   const categoryResults = new Map<string, {
-    name?: string; nameAr?: string; nameFr?: string; icon?: string; terms?: GeneratedTerm[]
+    name?: string; nameAr?: string; nameFr?: string; icon?: string
+    terms?: GeneratedTerm[]; specialties?: GeneratedSpecialty[]
   }>()
   if (parsed) {
     for (const raw of Array.isArray(parsed.items) ? parsed.items : []) {
@@ -1194,22 +1392,43 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
       itemResults.set(String(it.id), t)
     }
     for (const raw of Array.isArray(parsed.categories) ? parsed.categories : []) {
-      const ct = raw as { id?: string; name?: unknown; nameAr?: unknown; nameFr?: unknown; icon?: unknown; terms?: unknown }
+      const ct = raw as { id?: string; name?: unknown; nameAr?: unknown; nameFr?: unknown; icon?: unknown; terms?: unknown; specialties?: unknown }
       if (!ct?.id) continue
       // 0.6.76 — parse the generated terminology entries (validated again at
       // apply time against the REQUESTED keys — hallucinated keys are dropped).
+      // 0.6.98 — {name} is the ONLY placeholder a term may carry; the agent
+      // occasionally invents {service}/{count}-style placeholders that no
+      // renderer substitutes, so they are stripped defensively here.
+      const stripUnexpectedPlaceholders = (v: string): string =>
+        v.replace(/\{(?!name\})[A-Za-z_]+\}/g, '').replace(/\s{2,}/g, ' ').trim()
       const terms: GeneratedTerm[] = Array.isArray(ct.terms)
         ? (ct.terms as Array<Record<string, unknown>>)
           .map((term): GeneratedTerm | null => {
             if (!term || typeof term.key !== 'string' || !term.key.trim()) return null
             return {
               key: term.key.trim(),
-              ar: typeof term.ar === 'string' ? term.ar.trim().slice(0, 120) : undefined,
-              en: typeof term.en === 'string' ? term.en.trim().slice(0, 120) : undefined,
-              fr: typeof term.fr === 'string' ? term.fr.trim().slice(0, 120) : undefined,
+              ar: typeof term.ar === 'string' ? stripUnexpectedPlaceholders(term.ar).slice(0, 120) : undefined,
+              en: typeof term.en === 'string' ? stripUnexpectedPlaceholders(term.en).slice(0, 120) : undefined,
+              fr: typeof term.fr === 'string' ? stripUnexpectedPlaceholders(term.fr).slice(0, 120) : undefined,
             }
           })
           .filter((t): t is GeneratedTerm => t !== null)
+        : []
+      // 0.6.98 — parse the generated specialty catalog (validated again at
+      // apply time: every entry needs ALL three languages 2-60 chars).
+      const specialties: GeneratedSpecialty[] = Array.isArray(ct.specialties)
+        ? (ct.specialties as Array<Record<string, unknown>>)
+          .map((s): GeneratedSpecialty | null => {
+            if (!s) return null
+            const en = typeof s.en === 'string' ? s.en.trim() : ''
+            const ar = typeof s.ar === 'string' ? s.ar.trim() : ''
+            const fr = typeof s.fr === 'string' ? s.fr.trim() : ''
+            if (en.length < 2 || en.length > 60 || ar.length < 2 || ar.length > 60 || fr.length < 2 || fr.length > 60) return null
+            return { en, ar, fr }
+          })
+          .filter((s): s is GeneratedSpecialty => s !== null)
+          // De-dup by English name (the catalog identity).
+          .filter((s, i, all) => all.findIndex((o) => o.en.toLowerCase() === s.en.toLowerCase()) === i)
         : []
       categoryResults.set(String(ct.id), {
         name: typeof ct.name === 'string' ? ct.name.trim().slice(0, 60) : undefined,
@@ -1217,6 +1436,7 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
         nameFr: typeof ct.nameFr === 'string' ? ct.nameFr.trim().slice(0, 60) : undefined,
         icon: isValidEmojiIcon(ct.icon) ? ct.icon : undefined,
         ...(terms.length > 0 ? { terms } : {}),
+        ...(specialties.length > 0 ? { specialties } : {}),
       })
     }
   }
@@ -1269,7 +1489,7 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
   for (let index = 0; index < categoryJobs.length; index++) {
     const job = categoryJobs[index]
     const result = categoryResults.get(`c${index}`)
-    let payload: { categoryRowId?: string; name?: string; sourceLang?: string; termKeys?: unknown } = {}
+    let payload: { categoryRowId?: string; name?: string; sourceLang?: string; termKeys?: unknown; generateSpecialties?: unknown; specialtiesCount?: unknown } = {}
     try { payload = JSON.parse(String(job.payload || '{}')) } catch { /* malformed */ }
     if (!result || (!result.name && !result.nameAr && !result.nameFr)) {
       failedCategoryIds.push(job.id)
@@ -1385,6 +1605,39 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
       }
     }
 
+    // ── 0.6.98 — apply the generated SPECIALTY catalog ──
+    // Created ONLY when the category has zero specialties (fresh category or
+    // an existing one that never got a catalog) — admin-curated specialty
+    // lists are never overrun. Each entry lands as a real Specialty row
+    // (trilingual), so the new category is immediately selectable in the
+    // agencies/services flows like the four built-ins.
+    const wantsSpecialties = payload.generateSpecialties === true || Number(payload.specialtiesCount) > 0
+    const generatedSpecialties = Array.isArray(result.specialties) ? result.specialties : []
+    if (wantsSpecialties && generatedSpecialties.length > 0) {
+      try {
+        const specCount = await db.specialty.count({ where: { categoryId: row.id } })
+        if (specCount === 0) {
+          await db.specialty.createMany({
+            data: generatedSpecialties.slice(0, 20).map((s, i) => ({
+              categoryId: row.id, nameEn: s.en, nameAr: s.ar, nameFr: s.fr,
+              sortOrder: i + 1, isActive: true,
+            })),
+            skipDuplicates: true,
+          })
+          stats.applied++
+          appliedRefs.push({
+            refType: 'specialty',
+            refId: row.id,
+            specialtiesCreated: generatedSpecialties.length,
+            names: generatedSpecialties.map((s) => s.en).slice(0, 20),
+          })
+          invalidateResponseCacheTag('categories')
+        }
+      } catch (specErr) {
+        console.warn('[translation-agent] specialty creation failed:', (specErr as Error)?.message || specErr)
+      }
+    }
+
     stats.applied++
     appliedRefs.push({
       refType: 'agency-category',
@@ -1438,12 +1691,104 @@ let schedulerStarted = false
 let runInFlight = false
 
 /**
+ * 0.6.98 — ONE-TIME boot heal for OLD failed translations: every 'failed'
+ * job parked by the pre-0.6.98 engine (which gave up after 3 attempts and
+ * never retried) goes back into the waiting queue with a FRESH attempt
+ * budget, so it is retried automatically like any new job (5 tries, 3-minute
+ * cooldown). Guarded by a RETRY_QUEUE_HEAL trail row — the heal runs exactly
+ * once per deployment, never ping-pongs across restarts.
+ */
+async function healLegacyFailedJobs(): Promise<void> {
+  try {
+    const healed = await db.translationAgentLog.count({ where: { action: 'RETRY_QUEUE_HEAL' } })
+    if (healed > 0) return
+    const result = await db.translationJob.updateMany({
+      where: { status: 'failed' },
+      data: { status: 'pending', attempts: 0, nextRetryAt: null, error: null, processedAt: null },
+    })
+    await logAgentAction({
+      action: 'RETRY_QUEUE_HEAL',
+      status: 'success',
+      summary: `legacy failed translations healed — ${result.count} job(s) re-queued with a fresh 5-try budget`,
+      details: { requeued: result.count },
+      actor: 'system',
+    })
+    if (result.count > 0) {
+      console.log(`[translation-agent] retry-queue heal: ${result.count} old failed job(s) re-queued`)
+    }
+  } catch (error) {
+    console.warn('[translation-agent] retry-queue heal failed:', (error as Error)?.message || error)
+  }
+}
+
+/** Guard key for the terminology-audit top-up (runs once per version). */
+const TERMS_AUDIT_SETTING_KEY = 'translation-agent.terms-audit-version'
+const TERMS_AUDIT_VERSION = '0.6.98'
+
+/**
+ * 0.6.98 — ONE-TIME terminology-audit top-up: the audited key set grew from
+ * 9 to 29 per-category terms. Existing deployments get the new vocabulary:
+ *   - built-in categories: the MISSING audited keys are created from the
+ *     curated trilingual defaults (createMissingBuiltInTermRows — create-only,
+ *     existing values never touched);
+ *   - custom categories: a specialized terminology generation job is queued
+ *     so the agent derives domain values for the new keys (and the specialty
+ *     catalog when the category has none).
+ * Guarded by a PlatformSetting version marker — admin deletions after the
+ * top-up survive every restart.
+ */
+async function ensureTermsAuditTopUp(): Promise<void> {
+  try {
+    const marker = await db.platformSetting.findUnique({ where: { key: TERMS_AUDIT_SETTING_KEY } })
+    if (marker?.value === TERMS_AUDIT_VERSION) return
+    const builtInCreated = await createMissingBuiltInTermRows()
+    let customsQueued = 0
+    const customs = await db.agencyCategory.findMany({
+      where: { slug: { notIn: ['DOCTOR', 'CLINIC', 'LAW_FIRM', 'BARBER'] }, isActive: true },
+      select: { id: true, name: true },
+    })
+    for (const cat of customs) {
+      try {
+        if (await enqueueCategoryTermGeneration(cat.id, 'system:terms-audit')) customsQueued++
+      } catch (e) {
+        console.warn(`[translation-agent] terms top-up queue failed for "${cat.name}":`, (e as Error)?.message || e)
+      }
+    }
+    await db.platformSetting.upsert({
+      where: { key: TERMS_AUDIT_SETTING_KEY },
+      create: { key: TERMS_AUDIT_SETTING_KEY, value: TERMS_AUDIT_VERSION },
+      update: { value: TERMS_AUDIT_VERSION },
+    })
+    await logAgentAction({
+      action: 'TERMS_AUDIT_TOPUP',
+      status: 'success',
+      summary: `terminology audit v${TERMS_AUDIT_VERSION} — ${builtInCreated} built-in term row(s) created, ${customsQueued} custom categorie(s) queued for generation`,
+      details: { version: TERMS_AUDIT_VERSION, builtInCreated, customsQueued, auditedKeys: CATEGORY_TERM_KEYS.length },
+      actor: 'system',
+    })
+    if (builtInCreated || customsQueued) {
+      console.log(`[translation-agent] terms audit v${TERMS_AUDIT_VERSION}: +${builtInCreated} built-in rows, ${customsQueued} custom categories queued`)
+    }
+  } catch (error) {
+    console.warn('[translation-agent] terms audit top-up failed:', (error as Error)?.message || error)
+  }
+}
+
+/**
  * Starts the 60s due-check loop: when `intervalMinutes` elapsed since the
  * last run (default 5), ONE batch window executes. Overlap-proof.
  */
 export function startTranslationAgentScheduler(): void {
   if (schedulerStarted) return
   schedulerStarted = true
+
+  // 0.6.98 — boot heal + terminology-audit top-up (both one-time, both
+  // best-effort). Delayed a few seconds so the boot DB connection is warm.
+  void (async () => {
+    await new Promise((r) => setTimeout(r, 5_000))
+    await healLegacyFailedJobs()
+    await ensureTermsAuditTopUp()
+  })()
 
   // 0.6.65 — one-time boot heal: re-stamp EVERY stored model id (keys with a
   // hand-typed/wrong/empty id and the config row) with the pinned flash id so

@@ -35,6 +35,9 @@ const crypto = require('crypto')
 const net = require('net')
 const scanner = require('./lib/discovery-scanner')
 const castService = require('./lib/cast-service')
+// 0.6.96 — live BLASTI beacon registry (lan-authority listener): ACTIVE apps
+// between scans + the auto-connect-on-detection hook.
+const lanAuthority = require('./lib/lan-authority')
 // 0.6.88 — DEVICE EVENT STREAM producer (module-level: runEmbeddedScan and
 // stopEmbeddedScan live outside the route-registration closure).
 const deviceEvents = require('./lib/device-event')
@@ -435,18 +438,69 @@ function healthResponse() {
     message: 'Embedded multi-protocol discovery active (ARP + Ping + TCP + mDNS + SSDP + WS-Discovery + HTTP)',
     fallback: 'embedded',
     uptime: process.uptime(),
-    version: '2.1.0-embedded',
+    version: '2.2.0-embedded',
   }
 }
 
-function devicesResponse(category, status) {
+// 0.6.96 — SCAN RESULT WHITELIST (user requirement: "device manager scans can
+// only discover active BLASTI apps on other devices and TVs and printers").
+// The scanner still fingerprints every host (evidence feeds TVs/printers),
+// but the manager listing keeps ONLY the device classes the agency can act
+// on: BLASTI apps (desktop/kiosk/phone), TVs (cast targets) and printers.
+// PCs/IoT/routers/unknown noise never render. `?include=all` bypasses the
+// whitelist for the diagnostics surface.
+const DISCOVERY_LIST_TYPES = new Set(['APP', 'KIOSK', 'PHONE', 'TV', 'PRINTER', 'DISPLAY'])
+
+/** Live BLASTI beacons → manager cards (source 'live-beacon', status ONLINE). */
+function liveBeaconDeviceCards() {
+  let beacons = []
+  try { beacons = lanAuthority.getLiveBlastiBeacons() || [] } catch { beacons = [] }
+  return beacons.map((b) => ({
+    id: 'beacon:' + b.ip,
+    source: 'live-beacon',
+    category: 'BLASTI',
+    type: b.service === 'blasti-phone'
+      ? 'PHONE'
+      : String(b.mode || '').toUpperCase() === 'KIOSK' ? 'KIOSK' : 'APP',
+    name: b.name || `BLASTI @ ${b.ip}`,
+    ip: b.ip,
+    port: b.httpPort || 0,
+    status: 'ONLINE',
+    lastSeen: b.lastSeenAt,
+    firstSeen: b.firstSeenAt,
+    connectionType: 'LAN',
+    capabilities: ['UDP_BEACON', 'BLASTI_APP', 'LIVE'],
+    appVersion: b.appVersion,
+    platform: b.platform,
+    deviceTypeShared: b.deviceType,
+    fingerprint: b.uid || b.instanceId || undefined,
+    blastiMode: b.mode || (b.service === 'blasti-phone' ? 'phone' : 'desktop'),
+    blastiInfo: { instanceId: b.instanceId || undefined, fingerprint: b.uid || undefined, pairingStatus: b.status || undefined },
+    confidence: 97,
+    identitySource: 'self-announced',
+    identitySourcePriority: 97,
+    pairable: true,
+  }))
+}
+
+function devicesResponse(category, status, includeAll) {
   let devices = [...scanDevices]
   if (category) devices = devices.filter((d) => String(d.category).toUpperCase() === String(category).toUpperCase())
   if (status) devices = devices.filter((d) => String(d.status).toUpperCase() === String(status).toUpperCase())
-  // 0.6.92 — routers/gateways NEVER appear in the manager's scan results
-  // (user report: the router shows in the results although there is no need
-  // for it). The scanner still classifies them, but the listing is filtered.
-  devices = devices.filter((d) => String(d.type).toUpperCase() !== 'ROUTER')
+  // 0.6.96 — whitelist (routers AND generic PC/IoT/unknown noise filtered).
+  // 0.6.92 filtered ROUTER only; 0.6.96 narrows to actionable device classes.
+  if (!includeAll) {
+    devices = devices.filter((d) => DISCOVERY_LIST_TYPES.has(String(d.type).toUpperCase()))
+  }
+  // 0.6.96 — merge LIVE beacon cards so ACTIVE BLASTI apps appear INSTANTLY
+  // (before/without a scan). Scan cards at the same IP win (they are richer).
+  const seenIps = new Set(devices.map((d) => d.ip).filter(Boolean))
+  for (const card of liveBeaconDeviceCards()) {
+    if (card.ip && !seenIps.has(card.ip)) {
+      devices.push(card)
+      seenIps.add(card.ip)
+    }
+  }
   return {
     devices,
     total: devices.length,
@@ -741,7 +795,8 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   app.get('/api/agency-devices/discovery/devices', authMiddleware, (c) => {
     const category = c.req.query('category')
     const status = c.req.query('status')
-    return c.json(devicesResponse(category, status))
+    const includeAll = c.req.query('include') === 'all'
+    return c.json(devicesResponse(category, status, includeAll))
   })
 
   app.post('/api/agency-devices/discovery/scan/start', authMiddleware, (c) => {
@@ -762,6 +817,159 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
 
   app.get('/api/agency-devices/discovery/diagnostics', authMiddleware, (c) => {
     return c.json(diagnosticsResponse())
+  })
+
+  // ═══ 0.6.96 — pair-by-identity + probe + cast snapshot ═══════════════════
+
+  // POST /discovery/probe — TCP reachability probe (CLOUD PARITY: this route
+  // existed only on the cloud API, so the manager's printer "Test" button 404'd
+  // inside Electron forever). Body { ip, port?, timeoutMs? }.
+  app.post('/api/agency-devices/discovery/probe', authMiddleware, async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const ip = str(body.ip, 50)
+    if (!ip) return c.json({ success: false, error: 'ip: required string' }, 400)
+    const port = optInt(body.port, 1, 65535) || 9100
+    const timeoutMs = Math.min(Math.max(Number(body.timeoutMs || body.timeout || 3000), 300), 8000)
+    const startedAt = Date.now()
+    const reachable = await scanner.tcpProbePort(ip, port, timeoutMs)
+    return c.json({ success: true, reachable, latencyMs: reachable ? Date.now() - startedAt : null, ip, port })
+  })
+
+  // GET /discovery/cast/snapshot.jpg — the TV-board snapshot pushed to DLNA /
+  // Chromecast / Roku renderers. PUBLIC on purpose: the TV cannot authenticate,
+  // and the payload is just the last captured board image (LAN-only surface,
+  // no tokens, no secrets). main.js registers the real capture provider.
+  app.get('/api/agency-devices/discovery/cast/snapshot.jpg', async (c) => {
+    const buf = await castService.getLastSnapshot()
+    if (!buf) return c.json({ success: false, error: 'No board snapshot captured yet' }, 404)
+    return c.body(new Uint8Array(buf), 200, {
+      'Content-Type': 'image/jpeg',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*',
+    })
+  })
+
+  // POST /discovery/pairing-request-by-identity — "Request pairing" button on
+  // the SCAN RESULTS (user requirement 0.6.96): a discovered BLASTI card
+  // (phone in pairing standby, kiosk shell, desktop app) carries its
+  // self-announced fingerprint; the manager pairs it directly WITHOUT waiting
+  // for the /unpaired strip (which only lists devices that already managed a
+  // discover-register round-trip).
+  //   fingerprint found + already ours  → auto-connect (mark ONLINE)
+  //   fingerprint found + orphan        → PAIRING_REQUEST command
+  //   fingerprint unknown               → create the orphan, then request
+  app.post('/api/agency-devices/discovery/pairing-request-by-identity', authMiddleware, async (c) => {
+    const db = c.get('db')
+    const user = c.get('user')
+    const agencyId = requireAgencyId(c)
+    if (!agencyId) return
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const fingerprint = typeof body.fingerprint === 'string' ? body.fingerprint.slice(0, 200) : ''
+      const ip = optStr(body.ip, 50) || null
+      const port = optInt(body.port, 1, 65535) || null
+      const rawName = typeof body.name === 'string' ? body.name.slice(0, 100) : ''
+      const rawType = String(body.deviceType || body.blastiMode || '').toUpperCase()
+      const deviceType = rawType === 'TV' ? 'TV'
+        : rawType === 'KIOSK' ? 'KIOSK'
+          : rawType === 'PRINTER' ? 'PRINTER'
+            : 'APP'
+      if (!fingerprint && !ip) {
+        return c.json({ success: false, error: 'fingerprint or ip required' }, 400)
+      }
+
+      let device = fingerprint
+        ? await db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } })
+        : null
+      if (!device && ip && fingerprint) {
+        device = await db.agencyDevice.findFirst({ where: { ipAddress: ip, status: 'PAIRING' } })
+      }
+
+      if (device && device.agencyId && device.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Device is already paired with another agency' }, 409)
+      }
+
+      let created = false
+      if (!device) {
+        device = await db.agencyDevice.create({
+          data: {
+            agencyId: null,
+            name: rawName || 'BLASTI Device',
+            type: deviceType,
+            status: 'PAIRING',
+            connectionType: 'LAN',
+            ipAddress: ip,
+            port,
+            deviceFingerprint: fingerprint || null,
+            lastHeartbeatAt: new Date(),
+            statusChangedAt: new Date(),
+          },
+        })
+        created = true
+      }
+
+      if (device.agencyId === agencyId) {
+        // Already ours → auto-connect (it was detected on the LAN again).
+        const now = new Date()
+        const wasOffline = device.status !== 'ONLINE'
+        const updated = await db.agencyDevice.update({
+          where: { id: device.id },
+          data: {
+            status: 'ONLINE',
+            statusChangedAt: now,
+            connectedAt: device.connectedAt || now,
+            lastHeartbeatAt: now,
+            ...(ip && device.ipAddress !== ip ? { ipAddress: ip } : {}),
+            ...(port && device.port !== port ? { port } : {}),
+          },
+          select: DEVICE_SELECT_FIELDS,
+        })
+        broadcastSafe('agency-device:connected', { agencyId, deviceId: device.id, deviceName: device.name })
+        broadcastSafe('device:online', { agencyId, deviceId: device.id })
+        deviceEvents.deviceEvent('connect_success', `Auto-connected detected device: ${device.name || device.id}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId, status: 'ONLINE' })
+        return c.json({ success: true, autoConnected: true, wasOffline, device: updated })
+      }
+
+      // Orphan (existing or just created) → refresh presence + pairing request.
+      const now = new Date()
+      await db.agencyDevice.update({
+        where: { id: device.id },
+        data: { status: 'PAIRING', lastHeartbeatAt: now, ...(ip ? { ipAddress: ip } : {}), ...(port ? { port } : {}) },
+      })
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        select: { id: true, name: true, nameAr: true, nameFr: true },
+      })
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+      const command = await db.deviceCommand.create({
+        data: {
+          deviceId: device.id,
+          type: 'PAIRING_REQUEST',
+          payload: JSON.stringify({
+            agencyId: agency.id,
+            agencyName: agency.name,
+            agencyNameAr: agency.nameAr,
+            agencyNameFr: agency.nameFr,
+            sentBy: user.id,
+            sentByName: user.fullName || user.username,
+          }),
+          status: 'PENDING',
+          ttl: 600,
+        },
+      })
+      broadcastSafe('agency-device:pairing-request', {
+        agencyId: agency.id,
+        deviceId: device.id,
+        deviceName: device.name,
+        commandId: command.id,
+        agencyName: agency.name,
+      })
+      deviceEvents.deviceEvent('pairing_requested', `Pairing request (scan-result) sent to ${device.name} by ${user.fullName || user.username}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type || deviceType, agencyId: agency.id, sessionId: command.id })
+      return c.json({ success: true, created, deviceId: device.id, commandId: command.id, message: `Pairing request sent to ${device.name}` })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE pairing-by-identity error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to send pairing request' }, 500)
+    }
   })
 
   // ═══ Connect protocol (0.6.78) ═══════════════════════════════════════════
@@ -1027,11 +1235,43 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
 
   // ═══ Cast to TV ══════════════════════════════════════════════════════════
 
-  // POST /discovery/cast — cloud contract: Samsung/Roku HTTP attempts with a
-  // URL fallback. When the body carries an explicit protocol (the cast dialog
-  // does), route through the ported cast-service for a real device cast.
+  // 0.6.96 — LAN-REACHABLE URL BUILDER. The historic code built the board URL
+  // from the REQUEST origin — inside Electron that is http://127.0.0.1:3080,
+  // a loopback address NO TV can fetch. Every cast URL is now built from the
+  // host's real LAN IP (lan-origin.bestLanIp), so Samsung/LG/DLNA/Chromecast
+  // targets load the actual board.
+  const buildLanTvBoardUrl = (agencyIdForUrl) => {
+    let lanIp = null
+    let apiPort = Number(process.env.BLASTI_LOCAL_PORT) || 3080
+    try {
+      const lanOrigin = require('./lib/lan-origin')
+      lanIp = lanOrigin.bestLanIp()
+    } catch { /* fall through to loopback */ }
+    const base = lanIp ? `http://${lanIp}:${apiPort}` : `http://127.0.0.1:${apiPort}`
+    return `${base}/?mode=device&type=TV&agencyId=${agencyIdForUrl || ''}`
+  }
+
+  // Capture (or reuse a fresh) board snapshot and return its LAN URL — the
+  // media form DLNA / Chromecast / Roku renderers can actually display.
+  const snapshotMediaUrl = async (boardUrl, lanBase) => {
+    const buf = await castService.captureSnapshot(boardUrl)
+    if (!buf) return null
+    const ts = castService.getLastSnapshotTs() || Date.now()
+    return `${lanBase}/api/agency-devices/discovery/cast/snapshot.jpg?ts=${ts}`
+  }
+
+  // POST /discovery/cast — 0.6.96 rework. Cast order:
+  //   1. 'blasti-tv' (DIRECT): the target is a REGISTERED TV of this agency
+  //      (by deviceId or by IP) → CAST_URL device command → the TV's board
+  //      app navigates to the board. Live, LAN-direct, no browser involved.
+  //   2. Vendor protocols: Samsung Tizen WS, LG webOS WS (they load the board
+  //      URL in the TV's own web engine).
+  //   3. Media protocols: DLNA SOAP, Chromecast CASTv2, Roku ECP — these push
+  //      the board SNAPSHOT JPEG (a media renderer cannot load a web page).
+  //   4. NO browser fallback — if everything fails we say so honestly.
   app.post('/api/agency-devices/discovery/cast', authMiddleware, async (c) => {
     const user = c.get('user')
+    const db = c.get('db')
     try {
       if (!user || !user.agencyId) {
         return c.json({ success: false, error: 'No agency assigned' }, 403)
@@ -1043,32 +1283,75 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       const ssdpLocation = String(body.ssdpLocation || '')
       const mdnsService = String(body.mdnsService || '')
       const protocol = body.protocol ? String(body.protocol) : null
+      const deviceId = body.deviceId ? String(body.deviceId) : null
 
-      if (!ip) {
+      if (!ip && !deviceId) {
         return c.json({ success: false, error: 'IP required' }, 400)
       }
 
-      const origin = new URL(c.req.url).origin
-      // 0.6.74: the manager may send its OWN origin-built URL (mediaUrl) —
-      // the browser origin is what the LAN TV can actually reach.
-      let tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
-      if (typeof body.mediaUrl === 'string') {
-        try {
-          const parsed = new URL(body.mediaUrl)
-          if (parsed.protocol === 'http:' || parsed.protocol === 'https:') tvBoardUrl = parsed.toString()
-        } catch { /* invalid → keep the origin-built URL */ }
+      const apiPort = Number(process.env.BLASTI_LOCAL_PORT) || 3080
+      const lanIp = (() => { try { return require('./lib/lan-origin').bestLanIp() } catch { return null } })()
+      const lanBase = lanIp ? `http://${lanIp}:${apiPort}` : new URL(c.req.url).origin
+      const tvBoardUrl = buildLanTvBoardUrl(user.agencyId)
+
+      // ── 1. BLASTI-TV DIRECT ── a registered TV renders the board itself;
+      // casting = one CAST_URL command over the existing command channel.
+      let registeredTv = null
+      if (deviceId) {
+        registeredTv = await db.agencyDevice.findFirst({
+          where: { id: deviceId, agencyId: user.agencyId, type: { in: ['TV', 'DISPLAY'] }, status: { not: 'DISABLED' } },
+          select: { id: true, name: true, type: true, ipAddress: true },
+        })
+      } else if (ip) {
+        registeredTv = await db.agencyDevice.findFirst({
+          where: { agencyId: user.agencyId, type: { in: ['TV', 'DISPLAY'] }, ipAddress: ip, status: { not: 'DISABLED' } },
+          select: { id: true, name: true, type: true, ipAddress: true },
+        })
+      }
+      const wantsDirect = !protocol || protocol === 'blasti-tv' || protocol === 'direct'
+      if (registeredTv && wantsDirect) {
+        const command = await db.deviceCommand.create({
+          data: {
+            deviceId: registeredTv.id,
+            type: 'CAST_URL',
+            payload: JSON.stringify({ url: tvBoardUrl, agencyId: user.agencyId }),
+            status: 'PENDING',
+            ttl: 300,
+          },
+        })
+        broadcastSafe('agency-device:updated', { agencyId: user.agencyId, deviceId: registeredTv.id })
+        deviceEvents.deviceEvent('cast_sent', `Direct board cast to registered TV ${registeredTv.name || registeredTv.id} (CAST_URL)`, { deviceId: registeredTv.id, deviceName: registeredTv.name, deviceType: registeredTv.type, agencyId: user.agencyId, sessionId: command.id })
+        return c.json({
+          success: true,
+          protocol: 'blasti-tv',
+          castKind: 'direct',
+          tvBoardUrl,
+          message: `Board cast sent directly to ${registeredTv.name || 'TV'} (BLASTI app)`,
+        })
       }
 
-      // Explicit protocol from the cast dialog → use the cast service.
-      if (protocol && protocol !== 'url') {
-        const target = { ip, port, manufacturer, ssdpLocation, mdnsService, name: String(body.name || 'BLASTI TV') }
+      // ── 2/3. Vendor + media protocols ──
+      const target = { ip, port, manufacturer, ssdpLocation, mdnsService, name: String(body.name || 'BLASTI TV') }
+      const sendVia = async (proto) => {
+        // Webview-capable protocols load the live board URL; media renderers
+        // get the JPEG snapshot (captured from the real board).
+        const mediaProto = proto === 'dlna' || proto === 'roku-ecp' || proto === 'roku' || proto === 'google-cast'
+        let mediaUrl = tvBoardUrl
+        if (mediaProto && lanIp) {
+          mediaUrl = (await snapshotMediaUrl(tvBoardUrl, lanBase)) || tvBoardUrl
+        }
+        if (proto === 'dlna') return castService.castViaDlna(target, mediaUrl)
+        if (proto === 'samsung-tizen' || proto === 'samsung') return castService.castViaSamsungTizen(target, tvBoardUrl)
+        if (proto === 'lg-webos' || proto === 'lg') return castService.castViaLgWebOS(target, tvBoardUrl)
+        if (proto === 'roku-ecp' || proto === 'roku') return castService.castViaRokuEcp(target, mediaUrl)
+        if (proto === 'google-cast') return castService.castViaGoogleCast(target, mediaUrl, { title: 'BLASTI Queue Board' })
+        return { success: false, message: `Unknown protocol ${proto}` }
+      }
+
+      if (protocol && protocol !== 'url' && protocol !== 'auto') {
         try {
-          let result = null
-          if (protocol === 'dlna') result = await castService.castViaDlna(target, tvBoardUrl)
-          else if (protocol === 'samsung-tizen' || protocol === 'samsung') result = await castService.castViaSamsungTizen(target, tvBoardUrl)
-          else if (protocol === 'lg-webos' || protocol === 'lg') result = await castService.castViaLgWebOS(target, tvBoardUrl)
-          else if (protocol === 'roku-ecp' || protocol === 'roku') result = await castService.castViaRokuEcp(target, tvBoardUrl)
-          if (result && result.ok !== false && result.success !== false) {
+          const result = await sendVia(protocol)
+          if (result && result.success !== false) {
             return c.json({
               success: true,
               protocol: protocol.startsWith('samsung') ? 'samsung-tizen' : protocol.startsWith('lg') ? 'lg-webos' : protocol.startsWith('roku') ? 'roku-ecp' : protocol,
@@ -1094,54 +1377,35 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         }
       }
 
-      // Cloud-contract path — try Samsung Tizen REST, then Roku, then URL.
+      // Auto order: brand-native first, then CASTv2, then DLNA, then Roku.
       const man = manufacturer.toLowerCase()
-      const castTargets = []
-      if (man.includes('samsung') || port === 8001 || port === 9197) {
-        const samsungPort = port === 9197 ? 9197 : 8001
-        castTargets.push({
-          kind: 'samsung-tizen',
-          url: `http://${ip}:${samsungPort}/ws/app/WEBAPP`,
-          method: 'POST',
-          body: JSON.stringify({ method: 'ms.webapp.launch', id: tvBoardUrl, token: '' }),
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
-      if (man.includes('roku') || port === 8060) {
-        castTargets.push({
-          kind: 'roku',
-          url: `http://${ip}:8060/launch/11?contentId=${encodeURIComponent(tvBoardUrl)}`,
-          method: 'POST',
-        })
-      }
-      for (const target of castTargets) {
+      const autoOrder = []
+      if (man.includes('samsung') || port === 8001 || port === 9197) autoOrder.push('samsung-tizen')
+      if (man.includes('lg') || man.includes('webos') || port === 3000) autoOrder.push('lg-webos')
+      if (mdnsService.toLowerCase().includes('googlecast') || man.includes('google') || port === 8009 || port === 8008) autoOrder.push('google-cast')
+      autoOrder.push('dlna')
+      if (man.includes('roku') || port === 8060) autoOrder.push('roku-ecp')
+      for (const proto of autoOrder) {
         try {
-          const controller = new AbortController()
-          const timeout = setTimeout(() => controller.abort(), 3000)
-          const res = await fetch(target.url, {
-            method: target.method || 'GET',
-            headers: target.headers,
-            body: target.body,
-            signal: controller.signal,
-          })
-          clearTimeout(timeout)
-          if (res.ok || res.status < 500) {
+          const result = await sendVia(proto)
+          if (result && result.success !== false) {
             return c.json({
               success: true,
-              castKind: target.kind,
+              protocol: proto.startsWith('samsung') ? 'samsung-tizen' : proto.startsWith('lg') ? 'lg-webos' : proto.startsWith('roku') ? 'roku-ecp' : proto,
+              castKind: proto,
               tvBoardUrl,
-              message: `Cast sent to ${target.kind} at ${ip}`,
+              message: result.message || `Cast sent via ${proto} to ${ip}`,
             })
           }
-        } catch { /* try next target */ }
+        } catch { /* try the next protocol */ }
       }
       return c.json({
-        success: true,
-        castKind: 'url',
+        success: false,
+        castKind: 'none',
         tvBoardUrl,
         ssdpLocation,
-        message: 'Open the TV board URL on the TV or use Chromecast / HDMI',
-      })
+        message: 'No cast protocol reachable on this TV (DLNA/Tizen/webOS/CASTv2/Roku all failed). Save it and retry, or use HDMI.',
+      }, 200)
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE cast error: ' + (err && err.message))
       return c.json({ success: false, error: 'Cast failed' }, 500)
@@ -1149,13 +1413,16 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   })
 
   // Per-protocol cast endpoints the cast dialog calls (no cloud equivalent —
-  // desktop implements them for real device casting).
+  // desktop implements them for real device casting). 0.6.96: all URLs are
+  // LAN-reachable and DLNA pushes the board snapshot JPEG.
   app.post('/api/agency-devices/discovery/cast/dlna', authMiddleware, async (c) => {
     const user = c.get('user')
     try {
       const body = await c.req.json().catch(() => ({}))
-      const origin = new URL(c.req.url).origin
-      const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+      const tvBoardUrl = buildLanTvBoardUrl(user && user.agencyId)
+      const lanIp = (() => { try { return require('./lib/lan-origin').bestLanIp() } catch { return null } })()
+      const lanBase = lanIp ? `http://${lanIp}:${Number(process.env.BLASTI_LOCAL_PORT) || 3080}` : new URL(c.req.url).origin
+      const mediaUrl = lanIp ? ((await snapshotMediaUrl(tvBoardUrl, lanBase)) || tvBoardUrl) : tvBoardUrl
       const target = {
         ip: String(body.ip || ''),
         port: Number(body.port) || 0,
@@ -1164,7 +1431,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         mdnsService: String(body.mdnsService || ''),
       }
       if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
-      const result = await castService.castViaDlna(target, tvBoardUrl)
+      const result = await castService.castViaDlna(target, mediaUrl)
       return c.json({ success: !!(result && result.ok !== false && result.success !== false), protocol: 'dlna', tvBoardUrl, ...result })
     } catch (err) {
       return c.json({ success: false, protocol: 'dlna', message: err && err.message ? err.message : 'DLNA cast failed' })
@@ -1175,8 +1442,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const user = c.get('user')
     try {
       const body = await c.req.json().catch(() => ({}))
-      const origin = new URL(c.req.url).origin
-      const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+      const tvBoardUrl = buildLanTvBoardUrl(user && user.agencyId)
       const target = { ip: String(body.ip || ''), port: Number(body.port) || 8001, manufacturer: String(body.manufacturer || '') }
       if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
       const result = await castService.castViaSamsungTizen(target, tvBoardUrl)
@@ -1190,8 +1456,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const user = c.get('user')
     try {
       const body = await c.req.json().catch(() => ({}))
-      const origin = new URL(c.req.url).origin
-      const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+      const tvBoardUrl = buildLanTvBoardUrl(user && user.agencyId)
       const target = { ip: String(body.ip || ''), port: Number(body.port) || 3000, manufacturer: String(body.manufacturer || '') }
       if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
       const result = await castService.castViaLgWebOS(target, tvBoardUrl)
@@ -1205,14 +1470,33 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const user = c.get('user')
     try {
       const body = await c.req.json().catch(() => ({}))
-      const origin = new URL(c.req.url).origin
-      const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+      const tvBoardUrl = buildLanTvBoardUrl(user && user.agencyId)
+      const lanIp = (() => { try { return require('./lib/lan-origin').bestLanIp() } catch { return null } })()
+      const lanBase = lanIp ? `http://${lanIp}:${Number(process.env.BLASTI_LOCAL_PORT) || 3080}` : new URL(c.req.url).origin
+      const mediaUrl = lanIp ? ((await snapshotMediaUrl(tvBoardUrl, lanBase)) || tvBoardUrl) : tvBoardUrl
       const target = { ip: String(body.ip || ''), port: Number(body.port) || 8060, manufacturer: String(body.manufacturer || '') }
       if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
-      const result = await castService.castViaRokuEcp(target, tvBoardUrl)
+      const result = await castService.castViaRokuEcp(target, mediaUrl)
       return c.json({ success: !!(result && result.ok !== false && result.success !== false), protocol: 'roku-ecp', tvBoardUrl, ...result })
     } catch (err) {
       return c.json({ success: false, protocol: 'roku-ecp', message: err && err.message ? err.message : 'Roku cast failed' })
+    }
+  })
+
+  app.post('/api/agency-devices/discovery/cast/google-cast', authMiddleware, async (c) => {
+    const user = c.get('user')
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const tvBoardUrl = buildLanTvBoardUrl(user && user.agencyId)
+      const lanIp = (() => { try { return require('./lib/lan-origin').bestLanIp() } catch { return null } })()
+      const lanBase = lanIp ? `http://${lanIp}:${Number(process.env.BLASTI_LOCAL_PORT) || 3080}` : new URL(c.req.url).origin
+      const mediaUrl = lanIp ? ((await snapshotMediaUrl(tvBoardUrl, lanBase)) || tvBoardUrl) : tvBoardUrl
+      const target = { ip: String(body.ip || ''), port: 8009, manufacturer: String(body.manufacturer || '') }
+      if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
+      const result = await castService.castViaGoogleCast(target, mediaUrl, { title: 'BLASTI Queue Board' })
+      return c.json({ success: !!(result && result.success !== false), protocol: 'google-cast', tvBoardUrl, ...result })
+    } catch (err) {
+      return c.json({ success: false, protocol: 'google-cast', message: err && err.message ? err.message : 'Google Cast failed' })
     }
   })
 
@@ -1728,6 +2012,45 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     }
   })
 
+  // POST /:id/cast — Cast the board to a REGISTERED TV directly (0.6.96).
+  // Sends one CAST_URL command over the device command channel — the TV's
+  // BLASTI board app navigates to the board URL. Live board, LAN-direct,
+  // no browser, works offline through the local store.
+  app.post('/api/agency-devices/:id/cast', authMiddleware, async (c) => {
+    const db = c.get('db')
+    const agencyId = requireAgencyId(c)
+    if (!agencyId) return
+    try {
+      const existing = await db.agencyDevice.findFirst({
+        where: { id: c.req.param('id'), agencyId },
+      })
+      if (!existing) {
+        return c.json({ success: false, error: 'Device not found' }, 404)
+      }
+      if (!['TV', 'DISPLAY', 'KIOSK'].includes(existing.type)) {
+        return c.json({ success: false, error: `Casting applies to TV/DISPLAY devices (this is a ${existing.type})` }, 400)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      let url = buildLanTvBoardUrl(agencyId)
+      if (typeof body.url === 'string' && /^https?:\/\//.test(body.url)) url = body.url
+      const command = await db.deviceCommand.create({
+        data: {
+          deviceId: existing.id,
+          type: 'CAST_URL',
+          payload: JSON.stringify({ url, agencyId }),
+          status: 'PENDING',
+          ttl: 300,
+        },
+      })
+      broadcastSafe('agency-device:updated', { agencyId, deviceId: existing.id })
+      deviceEvents.deviceEvent('cast_sent', `Board cast sent to ${existing.name || existing.id} (CAST_URL)`, { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type, agencyId, sessionId: command.id })
+      return c.json({ success: true, command, url, message: `Cast sent to ${existing.name || 'TV'}` })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE cast-to-device error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to send cast command' }, 500)
+    }
+  })
+
   // POST /:id/command — Send a custom command
   app.post('/api/agency-devices/:id/command', authMiddleware, async (c) => {
     const db = c.get('db')
@@ -1946,5 +2269,58 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     }
   })
 
-  if (diagLog) diagLog('AGENCY-DEVICES routes registered (management + embedded discovery + cast)')
+  // ═══ 0.6.96 — AUTO-CONNECT on detection (beacon-driven) ═════════════════
+  // "After pairing the device becomes a registered device eligible for auto
+  // connection when detected." The lan-authority UDP listener hears every
+  // BLASTI beacon (desktop shells + phones in pairing standby); when the
+  // announcing identity matches a PAIRED device of ANY stored agency
+  // (deviceFingerprint == beacon uid, or same LAN IP) the device is flipped
+  // ONLINE immediately — no operator action, no scan required.
+  const beaconAutoConnectState = new Map() // ip → { deviceId, lastTouchAt }
+  const autoConnectFromBeacon = async (rec) => {
+    if (!rec || (!rec.ip && !rec.uid)) return
+    const db = typeof getDb === 'function' ? getDb() : null
+    if (!db) return
+    try {
+      const now = Date.now()
+      const seen = beaconAutoConnectState.get(rec.ip)
+      if (seen && now - seen.lastTouchAt < 60_000) return // throttle: one touch/minute per IP
+      const fingerprint = rec.uid || rec.instanceId || null
+      const candidates = await db.agencyDevice.findMany({
+        where: { agencyId: { not: null }, status: { not: 'DISABLED' } },
+        select: { id: true, name: true, type: true, status: true, agencyId: true, ipAddress: true, deviceFingerprint: true, port: true, connectedAt: true, appVersion: true },
+        take: 300,
+      })
+      const match = candidates.find((d) =>
+        (fingerprint && d.deviceFingerprint === fingerprint)
+        || (rec.ip && d.ipAddress === rec.ip))
+      if (!match) return
+      const wasOffline = match.status !== 'ONLINE'
+      const touchAt = new Date()
+      await db.agencyDevice.update({
+        where: { id: match.id },
+        data: {
+          status: 'ONLINE',
+          statusChangedAt: wasOffline ? touchAt : undefined,
+          lastHeartbeatAt: touchAt,
+          connectedAt: match.connectedAt || touchAt,
+          ...(rec.ip && match.ipAddress !== rec.ip ? { ipAddress: rec.ip } : {}),
+          ...(rec.appVersion && match.appVersion !== rec.appVersion ? { appVersion: rec.appVersion.slice(0, 32) } : {}),
+          ...(fingerprint && !match.deviceFingerprint ? { deviceFingerprint: fingerprint.slice(0, 200) } : {}),
+        },
+      })
+      beaconAutoConnectState.set(rec.ip, { deviceId: match.id, lastTouchAt: now })
+      if (beaconAutoConnectState.size > 200) beaconAutoConnectState.clear()
+      if (wasOffline) {
+        broadcastSafe('agency-device:connected', { agencyId: match.agencyId, deviceId: match.id, deviceName: match.name })
+        broadcastSafe('device:online', { agencyId: match.agencyId, deviceId: match.id })
+        deviceEvents.deviceEvent('device_online', `Auto-connected detected device: ${match.name || match.id} (beacon @ ${rec.ip})`, { deviceId: match.id, deviceName: match.name, deviceType: match.type, agencyId: match.agencyId, status: 'ONLINE' })
+      }
+    } catch { /* auto-connect is best-effort */ }
+  }
+  try {
+    lanAuthority.onBlastiBeacon((rec) => { autoConnectFromBeacon(rec).catch(() => {}) })
+  } catch { /* hook registration is best-effort */ }
+
+  if (diagLog) diagLog('AGENCY-DEVICES routes registered (management + embedded discovery + cast + live beacons)')
 }

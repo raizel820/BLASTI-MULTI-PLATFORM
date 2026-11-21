@@ -206,6 +206,7 @@ const ar = {
   catClinic: "عيادة",
   catLawFirm: "مكتب محاماة",
   catBarber: "حلاق",
+  catCustomBadge: "فئة مُنشأة",
   catFilter: "التصنيف",
 
   // ─── Queue Statuses ──────────────────────
@@ -1617,6 +1618,12 @@ const ar = {
   trAgentStatusProcessing: "قيد المعالجة",
   trAgentStatusDone: "مكتملة",
   trAgentStatusFailed: "فاشلة",
+  trAgentRetryAllFailed: "إعادة محاولة الفاشلة",
+  trAgentRetryOne: "إعادة محاولة هذه الترجمة",
+  trAgentJobRetried: "أُعيدت الترجمة إلى طابور الانتظار",
+  trAgentAllRetried: "أُعيدت {count} ترجمة فاشلة إلى طابور الانتظار",
+  trAgentRetryIn: "إعادة المحاولة بعد {min} د",
+  trAgentRetryHint: "الترجمات الفاشلة تُعاد محاولتها تلقائياً بعد 3 دقائق حتى 5 محاولات، وبعدها تبقى هنا حتى تضغط إعادة المحاولة يدوياً — والترجمات الفاشلة القديمة في الخادم أعيدت جميعها إلى الطابور عند التحديث.",
   trAgentDictHint: "يُستشار القاموس المحلي أولاً في كل طلب ترجمة — ولا يُستدعى الوكيل إلا للمفردات والجمل التي لم يرها من قبل. يخزّن الكلمات والجمل الكاملة بمفاتيح مشتقة من نص المصدر.",
   trAgentDictSearch: "ابحث في المصدر أو الترجمة…",
   trAgentDictEmpty: "القاموس فارغ — ينمو مع كل ترجمة جديدة",

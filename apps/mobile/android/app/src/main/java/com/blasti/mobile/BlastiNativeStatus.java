@@ -1708,6 +1708,12 @@ public class BlastiNativeStatus extends Plugin {
             if (!appVersion.isEmpty()) o.put("appVersion", appVersion);
             o.put("platform", "android");
             o.put("httpPort", 0);
+            // 0.6.96 — the BLASTI app SHARES its device information on the
+            // beacon (user requirement): self-announced type + platform + a
+            // timestamp. The desktop Device Manager trusts these fields
+            // instead of fingerprint-guessing the phone from its MAC.
+            o.put("deviceType", "phone");
+            o.put("ts", System.currentTimeMillis());
         } catch (Throwable ignored) {
             // JSON building cannot realistically fail with these literal keys;
             // the loop re-checks for an empty payload anyway.

@@ -125,6 +125,10 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
           blastiInfo: (d.blastiInfo && typeof d.blastiInfo === 'object')
             ? d.blastiInfo as RealDiscoveredDevice['blastiInfo']
             : undefined,
+          // 0.6.96 — app-shared device info (self-announced beacons) + live flag
+          deviceTypeShared: d.deviceTypeShared ? String(d.deviceTypeShared) : undefined,
+          platform: d.platform ? String(d.platform) : undefined,
+          pairable: Boolean(d.pairable),
         }));
         setDiscoveredDevices(devices);
       }

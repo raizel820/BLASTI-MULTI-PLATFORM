@@ -82,6 +82,7 @@ import {
   CheckCircle2,
   XCircle,
   Database,
+  RotateCcw,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { AdminAgenciesManagementSectionPage } from '@/components/admin/admin-agencies-management-section-page';
@@ -119,6 +120,8 @@ interface JobRow {
   error: string | null;
   createdAt: string;
   processedAt: string | null;
+  /** 0.6.98 — waiting-queue cooldown timestamp (failed jobs retry after 3 min). */
+  nextRetryAt?: string | null;
 }
 
 interface DictionaryEntry {
@@ -191,6 +194,9 @@ export function AdminTranslationAgent() {
   const [processingNow, setProcessingNow] = useState(false);
   const [jobs, setJobs] = useState<JobRow[] | null>(null);
   const [jobFilter, setJobFilter] = useState<string>('all');
+  // 0.6.98 — retry-queue busy flags (per-row + retry-all).
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const [retryingAll, setRetryingAll] = useState(false);
 
   // ── Dictionary ──
   const [entries, setEntries] = useState<DictionaryEntry[] | null>(null);
@@ -320,6 +326,46 @@ export function AdminTranslationAgent() {
     setProcessingNow(false);
   };
 
+  /**
+   * 0.6.98 — manually re-queue ONE failed (or stuck) job: fresh 5-try budget,
+   * processed on the next window. The retry button sits on every failed row.
+   */
+  const retryJob = async (jobId: string) => {
+    setRetryingJobId(jobId);
+    try {
+      const res = await apiFetch(`/api/translation-agent/jobs/${jobId}/retry`, { method: 'POST' });
+      const body = await res.json().catch(() => null);
+      if (res.ok) {
+        toast.success(t('trAgentJobRetried') as any);
+        await Promise.all([loadJobs(jobFilter), loadSettings()]);
+      } else {
+        toast.error(String(errTextOf(body) || t('error')));
+      }
+    } catch {
+      toast.error(t('error'));
+    }
+    setRetryingJobId(null);
+  };
+
+  /** 0.6.98 — re-queue EVERY parked failed job at once (retry-all button). */
+  const retryAllFailed = async () => {
+    setRetryingAll(true);
+    try {
+      const res = await apiFetch('/api/translation-agent/jobs/retry-all-failed', { method: 'POST' });
+      const body = await res.json().catch(() => null);
+      if (res.ok) {
+        const data = unwrapPayload<{ requeued?: number }>(body);
+        toast.success((t('trAgentAllRetried') as any as string).replace('{count}', String(data?.requeued ?? 0)));
+        await Promise.all([loadJobs(jobFilter), loadSettings()]);
+      } else {
+        toast.error(String(errTextOf(body) || t('error')));
+      }
+    } catch {
+      toast.error(t('error'));
+    }
+    setRetryingAll(false);
+  };
+
   const saveEntry = async () => {
     if (!editEntry || !editText.trim()) return;
     setSavingEntry(true);
@@ -440,10 +486,25 @@ export function AdminTranslationAgent() {
     setDeleteKeyId(null);
   };
 
-  const statusBadge = (status: string) => {
+  const statusBadge = (status: string, job?: JobRow) => {
     if (status === 'done') return <Badge className="bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-0"><CheckCircle2 className="h-3 w-3 me-1" />{t('trAgentStatusDone')}</Badge>;
-    if (status === 'failed') return <Badge className="bg-red-500/15 text-red-700 dark:text-red-400 border-0"><XCircle className="h-3 w-3 me-1" />{t('trAgentStatusFailed')}</Badge>;
+    if (status === 'failed') return (
+      <Badge className="bg-red-500/15 text-red-700 dark:text-red-400 border-0">
+        <XCircle className="h-3 w-3 me-1" />{t('trAgentStatusFailed')}
+        {/* 0.6.98 — attempts used out of the 5-try budget. */}
+        {job && job.attempts > 0 ? ` (${job.attempts}/5)` : ''}
+      </Badge>
+    );
     if (status === 'processing') return <Badge className="bg-amber-500/15 text-amber-700 dark:text-amber-400 border-0"><Loader2 className="h-3 w-3 me-1 animate-spin" />{t('trAgentStatusProcessing')}</Badge>;
+    // 0.6.98 — a pending job in the retry cooldown shows the countdown.
+    if (job?.nextRetryAt) {
+      const mins = Math.max(0, Math.ceil((new Date(job.nextRetryAt).getTime() - Date.now()) / 60000));
+      return (
+        <Badge variant="outline" className="text-muted-foreground">
+          <Clock className="h-3 w-3 me-1" />{(t('trAgentRetryIn') as any as string).replace('{min}', String(mins))}
+        </Badge>
+      );
+    }
     return <Badge variant="outline"><Clock className="h-3 w-3 me-1" />{t('trAgentStatusPending')}</Badge>;
   };
 
@@ -540,9 +601,30 @@ export function AdminTranslationAgent() {
                       <div key={key} className="rounded-xl border p-3 text-center">
                         <p className="text-xl font-bold text-foreground">{value}</p>
                         <p className="text-[11px] text-muted-foreground">{t(label as TranslationKeys)}</p>
+                        {/* 0.6.98 — retry-all parked failed jobs right from the stat card. */}
+                        {key === 'failed' && value > 0 && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 mt-2 w-full gap-1 text-[11px] text-red-600 dark:text-red-400 border-red-200 dark:border-red-900/50 hover:bg-red-50 dark:hover:bg-red-950/30"
+                            onClick={() => void retryAllFailed()}
+                            disabled={retryingAll}
+                          >
+                            {retryingAll
+                              ? <Loader2 className="h-3 w-3 animate-spin" />
+                              : <RotateCcw className="h-3 w-3" />}
+                            {t('trAgentRetryAllFailed' as TranslationKeys)}
+                          </Button>
+                        )}
                       </div>
                     ))}
                   </div>
+
+                  {/* 0.6.98 — retry-queue policy hint. */}
+                  <p className="text-[11px] text-muted-foreground flex items-start gap-1.5 -mt-1">
+                    <RotateCcw className="h-3 w-3 mt-0.5 shrink-0 text-teal-600" />
+                    <span>{t('trAgentRetryHint' as TranslationKeys)}</span>
+                  </p>
 
                   {/* Last run + process now */}
                   <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border bg-muted/30 p-3">
@@ -610,13 +692,14 @@ export function AdminTranslationAgent() {
                         <TableHead className="text-xs w-20">{t('trAgentColLangs')}</TableHead>
                         <TableHead className="text-xs w-24">{t('trAgentColStatus')}</TableHead>
                         <TableHead className="text-xs w-20">{t('trAgentColAge')}</TableHead>
+                        <TableHead className="text-xs w-14"><span className="sr-only">{t('trAgentColActions')}</span></TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
                       {!jobs ? (
-                        [...Array(3)].map((_, i) => <TableRow key={i}><TableCell colSpan={4}><Skeleton className="h-6 w-full" /></TableCell></TableRow>)
+                        [...Array(3)].map((_, i) => <TableRow key={i}><TableCell colSpan={5}><Skeleton className="h-6 w-full" /></TableCell></TableRow>)
                       ) : jobs.length === 0 ? (
-                        <TableRow><TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-6">{t('trAgentJobsEmpty')}</TableCell></TableRow>
+                        <TableRow><TableCell colSpan={5} className="text-center text-xs text-muted-foreground py-6">{t('trAgentJobsEmpty')}</TableCell></TableRow>
                       ) : jobs.map((job) => (
                         <TableRow key={job.id}>
                           <TableCell className="max-w-[280px]">
@@ -626,8 +709,26 @@ export function AdminTranslationAgent() {
                           <TableCell className="text-xs font-mono" dir="ltr">
                             {job.sourceLang}→{job.targetLang ?? '🏷'}
                           </TableCell>
-                          <TableCell>{statusBadge(job.status)}</TableCell>
+                          <TableCell>{statusBadge(job.status, job)}</TableCell>
                           <TableCell className="text-[11px] text-muted-foreground">{timeAgo(job.createdAt, lang)}</TableCell>
+                          {/* 0.6.98 — per-row Retry: re-queues the job with a fresh 5-try budget. */}
+                          <TableCell>
+                            {(job.status === 'failed' || (job.status === 'processing' && job.attempts > 0)) && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 w-7 p-0 text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/40"
+                                onClick={() => void retryJob(job.id)}
+                                disabled={retryingJobId === job.id}
+                                aria-label={t('trAgentRetryOne' as TranslationKeys)}
+                                title={t('trAgentRetryOne' as TranslationKeys)}
+                              >
+                                {retryingJobId === job.id
+                                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  : <RotateCcw className="h-3.5 w-3.5" />}
+                              </Button>
+                            )}
+                          </TableCell>
                         </TableRow>
                       ))}
                     </TableBody>

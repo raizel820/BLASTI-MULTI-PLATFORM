@@ -3,10 +3,17 @@
 /**
  * AdminServicesManagement — Task C (R-6).
  *
- * Per-agency-type service conditions. The admin decides, for EACH of the 4
- * agency types (doctor / clinic / law office / barber):
+ * Per-agency-type service conditions. The admin decides, for EACH agency
+ * category (the 4 built-ins PLUS every user-created category):
  *   - Service price policy: OPTIONAL | MANDATORY
  *   - enforce: whether the API actually rejects service writes without a price
+ *
+ * 0.6.98 — ALL AGENCY CATEGORIES: the card matrix is no longer the hardcoded
+ * 4 built-ins. It is driven by the BACKEND policy rows (GET /api/admin/
+ * service-policies ensures one row per dictionary category, custom ones
+ * included) enriched with the category dictionary (localized name + icon,
+ * GET /api/agency-categories). A custom category created anywhere appears
+ * here automatically — with its own policy card.
  *
  * API: GET/PUT /api/admin/service-policies (see apps/api routes/admin-service-policies.ts).
  * Design: RTL-first, semantic dark-mode tokens, emerald/teal palette only.
@@ -22,7 +29,7 @@ import { Switch } from '@/components/ui/switch';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Loader2, RefreshCw, Save, Tags, Info } from 'lucide-react';
 import { toast } from 'sonner';
-import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
+import { BUILT_IN_CATEGORY_OPTIONS, fetchAgencyCategoriesOnce, type AgencyCategoryRow } from '@/hooks/use-agency-categories';
 import { cn } from '@/lib/utils';
 import type { TranslationKeys } from '@/i18n';
 
@@ -34,12 +41,24 @@ interface ServicePolicy {
   updatedAt: string;
 }
 
+/** One card in the matrix: a policy row enriched with dictionary metadata. */
+interface CategoryCard {
+  value: string;
+  /** UI label: built-ins use the i18n key; customs use the localized name. */
+  labelKey: string | null;
+  fallbackName: string;
+  icon: string;
+  isCustom: boolean;
+}
+
 export function AdminServicesManagement() {
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
 
   const [policies, setPolicies] = useState<ServicePolicy[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [savingCategory, setSavingCategory] = useState<string | null>(null);
+  // 0.6.98 — the category dictionary (built-ins + customs) for names/icons.
+  const [categoryRows, setCategoryRows] = useState<AgencyCategoryRow[] | null>(null);
   // Local draft state per category (value shown in the card until saved)
   const [drafts, setDrafts] = useState<Record<string, { servicePriceMode: 'OPTIONAL' | 'MANDATORY'; enforce: boolean }>>({});
 
@@ -64,9 +83,44 @@ export function AdminServicesManagement() {
     }
   }, [t]);
 
+  // 0.6.98 — the category dictionary is the same module-cached store every
+  // other consumer uses (one fetch per session; a new category is visible
+  // everywhere instantly).
+  useEffect(() => {
+    fetchAgencyCategoriesOnce()
+      .then((rows) => setCategoryRows(rows))
+      .catch(() => { /* silent-degrade: cards still render from policy rows */ });
+  }, []);
+
   useEffect(() => {
     load();
   }, [load]);
+
+  /**
+   * 0.6.98 — build the card matrix from the policy rows (backend-ensured for
+   * EVERY dictionary category) enriched with dictionary metadata. Built-ins
+   * keep their i18n label; customs show the localized row name.
+   */
+  const buildCards = useCallback((): CategoryCard[] => {
+    if (!policies) return [];
+    return policies.map((p) => {
+      const slug = p.agencyCategory;
+      const builtIn = BUILT_IN_CATEGORY_OPTIONS.find((o) => o.value === slug.toUpperCase());
+      const dictRow = categoryRows?.find(
+        (r) => r.name === slug || r.name.toUpperCase() === slug.toUpperCase(),
+      );
+      const localizedCustomName = dictRow
+        ? (lang === 'ar' && dictRow.nameAr ? dictRow.nameAr : lang === 'fr' && dictRow.nameFr ? dictRow.nameFr : dictRow.name)
+        : slug;
+      return {
+        value: slug,
+        labelKey: builtIn?.labelKey ?? null,
+        fallbackName: builtIn ? '' : localizedCustomName,
+        icon: builtIn?.icon ?? dictRow?.icon ?? '🏷️',
+        isCustom: !builtIn,
+      };
+    });
+  }, [policies, categoryRows, lang]);
 
   const save = async (category: string) => {
     const draft = drafts[category];
@@ -131,14 +185,15 @@ export function AdminServicesManagement() {
         <span>{t('servicesManagementHint' as TranslationKeys)}</span>
       </div>
 
-      {/* Policy cards — one per agency type */}
+      {/* Policy cards — one per agency category (ALL dictionary categories) */}
       {loading ? (
         <div className="grid gap-4 md:grid-cols-2">
           {[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-56 rounded-2xl" />)}
         </div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          {BUILT_IN_CATEGORY_OPTIONS.map((opt) => {
+          {buildCards().map((card) => {
+            const opt = card;
             const policy = policies?.find((p) => p.agencyCategory === opt.value);
             const draft = drafts[opt.value] ?? { servicePriceMode: 'OPTIONAL' as const, enforce: false };
             const saving = savingCategory === opt.value;
@@ -149,7 +204,13 @@ export function AdminServicesManagement() {
                   <CardTitle className="flex items-center justify-between gap-2">
                     <span className="flex items-center gap-2.5 min-w-0">
                       <span className="text-2xl leading-none" aria-hidden>{opt.icon}</span>
-                      <span className="truncate">{t(opt.labelKey as TranslationKeys)}</span>
+                      <span className="truncate">{opt.labelKey ? t(opt.labelKey as TranslationKeys) : opt.fallbackName}</span>
+                      {/* 0.6.98 — mark user-created categories so the matrix reads clearly. */}
+                      {opt.isCustom && (
+                        <Badge variant="outline" className="text-[10px] text-muted-foreground shrink-0">
+                          {t('catCustomBadge' as TranslationKeys)}
+                        </Badge>
+                      )}
                     </span>
                     {policy?.enforce && draft.enforce ? (
                       <Badge className="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800 shrink-0">

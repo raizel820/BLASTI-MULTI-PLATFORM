@@ -70,6 +70,10 @@ interface AgencyProfileData {
   customCode: string;
   category: string;
   address: string | null;
+  // 0.6.98 — agent-transliterated address (GET /api/agencies/:id spreads the
+  // full Prisma row). Optional: older cached payloads may not carry them.
+  addressAr?: string | null;
+  addressFr?: string | null;
   city: string;
   wilaya: string;
   phone: string | null;
@@ -233,6 +237,11 @@ export function CustomerAgencyProfile() {
     : null;
   const localizedServiceName = (s: { name: string; nameFr: string | null; nameAr: string | null }) =>
     (lang === 'ar' && s.nameAr ? s.nameAr : lang === 'fr' && s.nameFr ? s.nameFr : s.name);
+  // 0.6.98 — localized street address (translation-agent filled), falling back
+  // to the base column like every other explicit-language pair.
+  const localizedAddress = agency
+    ? (lang === 'ar' && agency.addressAr ? agency.addressAr : lang === 'fr' && agency.addressFr ? agency.addressFr : agency.address)
+    : null;
 
   const formatDate = (dateStr: string) => {
     try {
@@ -284,7 +293,9 @@ export function CustomerAgencyProfile() {
     [agency],
   );
 
-  const addressText = agency ? [agency.address, agency.city, agency.wilaya].map((v) => (v ?? '').trim()).filter(Boolean).join(', ') : '';
+  // 0.6.98 — localized street address (translation-agent filled), falling back
+  // to the base column like every other explicit-language pair.
+  const addressText = agency ? [localizedAddress, agency.city, agency.wilaya].map((v) => (v ?? '').trim()).filter(Boolean).join(', ') : '';
   const mapsSearchUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addressText)}`;
   const websiteHref = agency?.website
     ? (agency.website.startsWith('http://') || agency.website.startsWith('https://') ? agency.website : `https://${agency.website}`)

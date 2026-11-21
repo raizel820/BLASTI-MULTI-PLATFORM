@@ -3387,6 +3387,10 @@ async function runDiscoveryScan(
         blastiMode: patch.blastiMode || existing.blastiMode,
         appVersion: patch.appVersion || existing.appVersion,
         blastiInfo: patch.blastiInfo || existing.blastiInfo,
+        // 0.6.96 — shared device identity (beacon) survives merges
+        fingerprint: patch.fingerprint || existing.fingerprint,
+        platform: patch.platform || existing.platform,
+        deviceTypeShared: patch.deviceTypeShared || existing.deviceTypeShared,
         identitySource: (patch.identitySource && (patch.identitySourcePriority ?? 0) >= (existing.identitySourcePriority ?? 0))
           ? patch.identitySource
           : existing.identitySource,
@@ -3462,6 +3466,10 @@ async function runDiscoveryScan(
         blastiMode: patch.blastiMode,
         appVersion: patch.appVersion,
         blastiInfo: patch.blastiInfo,
+        // 0.6.96 — app-shared identity fields (self-announced beacons)
+        fingerprint: patch.fingerprint,
+        platform: patch.platform,
+        deviceTypeShared: patch.deviceTypeShared,
         wsdType: patch.wsdType,
         // 0.6.86 — ICMP reply TTL (OS fingerprint source for classification)
         pingTtl: patch.pingTtl,
@@ -3648,6 +3656,14 @@ async function runDiscoveryScan(
         httpServer: isPhone ? undefined : 'blasti-local',
         friendlyName: b.name,
         name: isPhone && b.status ? `${b.name} — ${b.status}` : b.name,
+        // 0.6.96 — the app SHARED its identity: type/name/platform/ip travel
+        // in the beacon and the receiver trusts them (identitySource
+        // 'self-announced' — no more guessing phones from MAC randomization).
+        fingerprint: b.uid || undefined,
+        platform: b.platform || undefined,
+        deviceTypeShared: b.deviceType || undefined,
+        identitySource: 'self-announced',
+        confidence: 96,
         blastiMode: b.mode === 'kiosk'
           ? 'kiosk'
           : b.mode === 'desktop'

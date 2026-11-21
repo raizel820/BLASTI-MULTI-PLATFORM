@@ -77,7 +77,7 @@ export interface DeviceCommand {
 }
 
 // ── Discovery protocol types (contract with /discovery/* endpoints) ────────
-export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'tcp' | 'usb' | 'local' | 'ws-discovery' | 'udp-beacon';
+export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'tcp' | 'usb' | 'local' | 'ws-discovery' | 'udp-beacon' | 'live-beacon';
 export type DiscoveredDeviceCategory = 'BLASTI' | 'NETWORK' | 'UPNP' | 'LOCAL';
 
 export interface RealDiscoveredDevice {
@@ -127,7 +127,15 @@ export interface RealDiscoveredDevice {
   verifiedAt?: number;
   /** 'kiosk' | 'desktop' — for BLASTI instances. */
   blastiMode?: string;
-  blastiInfo?: { instanceId?: string; master?: boolean; role?: string; agencyId?: string };
+  blastiInfo?: { instanceId?: string; master?: boolean; role?: string; agencyId?: string; fingerprint?: string; pairingStatus?: string };
+  // ── 0.6.96 — app-SHARED device info (the BLASTI app announces these on the
+  // UDP beacon; receivers trust them instead of fingerprint-guessing) ──
+  /** Self-announced device type ('phone' | 'kiosk' | 'desktop' …). */
+  deviceTypeShared?: string;
+  /** Self-announced platform ('android' | 'win32' | 'darwin' | 'linux' …). */
+  platform?: string;
+  /** True when the card came from a live beacon (instant, no scan needed). */
+  pairable?: boolean;
 }
 
 export type ScanPhase = 'idle' | 'arp' | 'ping' | 'udp' | 'ssdp' | 'mdns' | 'tcp-sweep' | 'ws-discovery' | 'names' | 'http' | 'https' | 'local' | 'fingerprinting' | 'beacon' | 'complete' | 'error';
@@ -458,6 +466,8 @@ export const DISCOVERY_SOURCE_CONFIG: Record<
   mdns: { icon: Wifi, labelAr: 'mDNS', labelEn: 'mDNS', labelFr: 'mDNS', color: 'bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-400' },
   'ws-discovery': { icon: RadioTower, labelAr: 'WS-Discovery', labelEn: 'WSD', labelFr: 'WSD', color: 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-400' },
   'udp-beacon': { icon: Radio, labelAr: 'إعلان BLASTI', labelEn: 'BLASTI beacon', labelFr: 'Balise BLASTI', color: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400' },
+  // 0.6.96 — LIVE beacon card (heard on UDP :3081 between scans, status ONLINE)
+  'live-beacon': { icon: RadioTower, labelAr: 'إعلان مباشر', labelEn: 'Live beacon', labelFr: 'Balise directe', color: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400' },
   database: { icon: Database, labelAr: 'قاعدة البيانات', labelEn: 'Database', labelFr: 'Base de données', color: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400' },
   arp: { icon: Radio, labelAr: 'ARP', labelEn: 'ARP', labelFr: 'ARP', color: 'bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400' },
   ping: { icon: Radio, labelAr: 'Ping', labelEn: 'Ping', labelFr: 'Ping', color: 'bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400' },

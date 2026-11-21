@@ -9,6 +9,8 @@ import {
   enqueueCategoryTranslations,
   enqueueCategoryTermGeneration,
   logAgentAction,
+  retryTranslationJob,
+  retryAllFailedJobs,
   AGENT_LANGS,
   DEFAULT_AGENT_MODEL,
 } from '../lib/translation-agent'
@@ -169,9 +171,39 @@ app.get('/jobs', async (c) => {
         id: true, type: true, status: true, sourceLang: true, targetLang: true,
         sourceText: true, domain: true, key: true, refType: true, field: true,
         attempts: true, error: true, result: true, createdAt: true, processedAt: true,
+        nextRetryAt: true,
       },
     })
     return c.json({ success: true, data: { jobs } })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as 500)
+  }
+})
+
+// ─── 0.6.98 — retry queue (failed translations) ───────────────────────────
+// A failed job is auto-retried up to 5 times (3-minute waiting queue) and
+// then parks as 'failed'. These two endpoints let the admin re-queue parked
+// jobs ANY time — each gets a fresh 5-try budget.
+
+app.post('/jobs/retry-all-failed', async (c) => {
+  try {
+    const actor = await actorOf(c)
+    const requeued = await retryAllFailedJobs(actor)
+    return c.json({ success: true, data: { requeued } })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as 500)
+  }
+})
+
+app.post('/jobs/:id/retry', async (c) => {
+  try {
+    const actor = await actorOf(c)
+    const id = c.req.param('id')
+    const ok = await retryTranslationJob(id, actor)
+    if (!ok) return c.json({ success: false, error: 'job not found' }, 404)
+    return c.json({ success: true, data: { requeued: 1 } })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as 500)

@@ -24,6 +24,12 @@ model User {
   id                      String         @id @default(cuid())
   username                String         @unique
   fullName                String
+  /// 0.6.98 — transliterated display names filled by the translation agent
+  /// (only when EMPTY; manual edits always win). Staff/owner names surface
+  /// to customers in queue views and agency profiles, so they follow the
+  /// same explicit-language-column pattern as Agency.name.
+  fullNameAr              String?
+  fullNameFr              String?
   email                   String?        @unique
   phoneNumber             String?        @unique
   shortAppId              String?        @unique
@@ -303,6 +309,10 @@ model Agency {
   customCode            String          @unique
   category              String
   address               String?
+  /// 0.6.98 — translation agent fills these from `address` (only when EMPTY;
+  /// manual edits always win). Base column doubles as the EN display.
+  addressAr             String?
+  addressFr             String?
   city                  String          @default("M'Sila")
   wilaya                String          @default("28")
   phone                 String?
@@ -1220,9 +1230,16 @@ model TranslationJob {
   result      String?
   createdAt   DateTime  @default(now())
   processedAt DateTime?
+  /// 0.6.98 — WAITING QUEUE: when a batch fails the job goes back to
+  /// 'pending' with nextRetryAt = now + 3 minutes instead of being retried
+  /// on the very next window. The batch claim only picks jobs whose
+  /// nextRetryAt is null or due. After MAX_JOB_ATTEMPTS (5) the job parks
+  /// as 'failed' (nextRetryAt cleared) until an admin retries it manually.
+  nextRetryAt DateTime?
 
   @@index([status, createdAt])
   @@index([sourceHash, status])
+  @@index([status, nextRetryAt])
 }
 
 /// Singleton agent settings row (id fixed to 'singleton').

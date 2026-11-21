@@ -1498,8 +1498,13 @@ app.post('/device/pair', async (c) => {
       return c.json({ success: false, error: 'Invalid pairing code' }, 404)
     }
 
-    // C2: Cross-Agency Device Pairing — verify device belongs to same agency
-    if (targetDevice.agencyId !== device.agencyId) {
+    // C2: Cross-Agency Device Pairing — verify device belongs to same agency.
+    // 0.6.96 — ORPHAN ADOPTION FIX: an unpaired device (agencyId null) has no
+    // agency yet, so the old strict equality (`targetDevice.agencyId !==
+    // device.agencyId`) ALWAYS 403'd it with "Pairing code not valid for your
+    // agency" — the kiosk-visible error that looked like a missing-permission
+    // problem. An orphan may now adopt the target's agency via pairing code.
+    if (targetDevice.agencyId && device.agencyId && targetDevice.agencyId !== device.agencyId) {
       return c.json({ success: false, error: 'Pairing code not valid for your agency' }, 403)
     }
 
@@ -1989,8 +1994,11 @@ app.post('/:id/pairing-request', async (c) => {
       },
     })
 
-    // Emit realtime event to the device room
-    emitAgencyDeviceEvent('agency-device:pairing-request', 'discovery', {
+    // Emit realtime event to the AGENCY room (0.6.96 fix: the historic call
+    // passed the literal string 'discovery' as the agencyId, so the event
+    // went to a room no client was ever in — realtime pairing requests were
+    // silently dead and the kiosk only learned of them via the 5s poll).
+    emitAgencyDeviceEvent('agency-device:pairing-request', agency.id, {
       deviceId: device.id,
       deviceName: device.name,
       commandId: command.id,
@@ -2686,6 +2694,55 @@ app.post('/:id/refresh', async (c) => {
   }
 })
 
+// ─── POST /:id/cast — Direct board cast to a registered TV (0.6.96) ────────
+
+app.post('/:id/cast', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) {
+      return c.json({ success: false, error: 'No agency assigned' }, 403)
+    }
+    const existing = await db.agencyDevice.findFirst({
+      where: { id: c.req.param('id'), agencyId: user.agencyId },
+    })
+    if (!existing) {
+      return c.json({ success: false, error: 'Device not found' }, 404)
+    }
+    if (!['TV', 'DISPLAY', 'KIOSK'].includes(existing.type)) {
+      return c.json({ success: false, error: `Casting applies to TV/DISPLAY devices (this is a ${existing.type})` }, 400)
+    }
+    const body = await c.req.json().catch(() => ({}))
+    const origin = new URL(c.req.url).origin
+    let url = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+    if (body && typeof body.url === 'string' && /^https?:\/\//.test(body.url)) url = body.url
+    const command = await db.deviceCommand.create({
+      data: {
+        deviceId: existing.id,
+        type: 'CAST_URL',
+        payload: JSON.stringify({ url, agencyId: user.agencyId }),
+        status: 'PENDING',
+        ttl: 300,
+      },
+    })
+    emitAgencyDeviceEvent('agency-device:updated', user.agencyId, { deviceId: existing.id })
+    appendDeviceEvent({
+      event: 'cast_sent',
+      message: `Board cast sent to ${existing.name || existing.id} (CAST_URL)`,
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      agencyId: user.agencyId,
+      userId: user.id,
+      username: user.username,
+      data: { commandId: command.id },
+    })
+    return c.json({ success: true, command, url, message: `Cast sent to ${existing.name || 'TV'}` })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ─── POST /:id/command — Send custom command ───────────────────────────────
 
 app.post('/:id/command', async (c) => {
@@ -3076,12 +3133,7 @@ function devicesResponse(category?: string, status?: string) {
   let devices = [...scanDevices]
   if (category) devices = devices.filter((d) => d.category === category.toUpperCase())
   if (status) devices = devices.filter((d) => d.status === status.toUpperCase())
-  // 0.6.92 — routers/gateways NEVER appear in the manager's scan results
-  // (user report: "يظهر الرواتر أيضا رغم أنه لا داعي لإظهاره في النتائج").
-  // The scanner still classifies them (evidence for OTHER devices), but the
-  // listing is infrastructure the agency cannot pair, print to or cast to —
-  // pure noise in the results strip.
-  devices = devices.filter((d) => d.type !== 'ROUTER')
+  devices = devices.filter((d) => DISCOVERY_LIST_TYPES.has(String(d.type).toUpperCase()))
   return {
     devices,
     total: devices.length,
@@ -3089,6 +3141,15 @@ function devicesResponse(category?: string, status?: string) {
     scannedAt: scanState.scanId ? new Date().toISOString() : null,
   }
 }
+
+/**
+ * 0.6.96 — SCAN RESULT WHITELIST (user requirement): the manager listing
+ * keeps ONLY the device classes the agency can act on — BLASTI apps
+ * (desktop/kiosk/phone), TVs and printers. The scanner still fingerprints
+ * every host (evidence feeds TVs/printers), but PCs/IoT/routers/unknown
+ * noise never reach the manager. Mirrors the desktop local-api shaper.
+ */
+const DISCOVERY_LIST_TYPES = new Set(['APP', 'KIOSK', 'PHONE', 'TV', 'PRINTER', 'DISPLAY'])
 
 /**
  * 0.6.95 — registry merge (the "manager on the phone can never discover
@@ -3542,6 +3603,160 @@ app.post('/discovery/probe', async (c) => {
     }
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error ?? (error instanceof Error ? error.message : 'Internal server error') }, err.status as any)
+  }
+})
+
+// ─── POST /discovery/pairing-request-by-identity — pair from a scan card ────
+// 0.6.96 — "pairing request buttons on discovery results": a discovered BLASTI
+// card (live beacon / scan) carries its self-announced fingerprint; the cloud
+// matches (or creates) the device record and sends the PAIRING_REQUEST. The
+// waiting kiosk/phone polls /public/device-status (5s) and auto-accepts.
+//   fingerprint found + already ours  → auto-connect (mark ONLINE)
+//   fingerprint found + other agency → 409
+//   fingerprint unknown               → create the orphan, then request
+const pairByIdentitySchema = z.object({
+  fingerprint: z.string().min(1).max(200).optional(),
+  name: z.string().max(100).optional(),
+  ip: z.string().max(50).optional(),
+  port: z.coerce.number().int().min(1).max(65535).optional(),
+  deviceType: z.string().max(40).optional(),
+})
+
+app.post('/discovery/pairing-request-by-identity', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) {
+      return c.json({ success: false, error: 'No agency assigned' }, 403)
+    }
+    const rawBody = await c.req.json().catch(() => ({}))
+    const validation = validateBody(pairByIdentitySchema, rawBody)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+    const body = validation.data
+    const fingerprint = body.fingerprint || ''
+    if (!fingerprint && !body.ip) {
+      return c.json({ success: false, error: 'fingerprint or ip required' }, 400)
+    }
+
+    let device = fingerprint
+      ? await db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } })
+      : null
+    if (!device && body.ip && fingerprint) {
+      device = await db.agencyDevice.findFirst({ where: { ipAddress: body.ip, status: 'PAIRING' } })
+    }
+
+    if (device && device.agencyId && device.agencyId !== user.agencyId) {
+      return c.json({ success: false, error: 'Device is already paired with another agency' }, 409)
+    }
+
+    let created = false
+    if (!device) {
+      const rawType = String(body.deviceType || '').toUpperCase()
+      const deviceType = rawType === 'TV' ? 'TV' : rawType === 'KIOSK' ? 'KIOSK' : rawType === 'PRINTER' ? 'PRINTER' : 'APP'
+      device = await db.agencyDevice.create({
+        data: {
+          agencyId: null,
+          name: body.name || 'BLASTI Device',
+          type: deviceType,
+          status: 'PAIRING',
+          connectionType: 'LAN',
+          ipAddress: body.ip || null,
+          port: body.port || null,
+          deviceFingerprint: fingerprint || null,
+          lastHeartbeatAt: new Date(),
+          statusChangedAt: new Date(),
+        },
+      })
+      created = true
+    }
+
+    if (device.agencyId === user.agencyId) {
+      // Already ours → auto-connect (it was detected again).
+      const now = new Date()
+      const wasOffline = device.status !== 'ONLINE'
+      const updated = await db.agencyDevice.update({
+        where: { id: device.id },
+        data: {
+          status: 'ONLINE',
+          statusChangedAt: now,
+          connectedAt: device.connectedAt || now,
+          lastHeartbeatAt: now,
+          ...(body.ip && device.ipAddress !== body.ip ? { ipAddress: body.ip } : {}),
+          ...(body.port && device.port !== body.port ? { port: body.port } : {}),
+        },
+      })
+      emitAgencyDeviceEvent('agency-device:connected', user.agencyId, { deviceId: device.id, deviceName: device.name })
+      appendDeviceEvent({
+        event: 'connect_success',
+        message: `Auto-connected detected device: ${device.name || device.id}`,
+        deviceId: device.id,
+        deviceName: device.name,
+        deviceType: device.type,
+        agencyId: user.agencyId,
+        userId: user.id,
+        username: user.username,
+        data: { autoConnected: true, wasOffline },
+      })
+      return c.json({ success: true, autoConnected: true, wasOffline, device: updated })
+    }
+
+    // Orphan (existing or just created) → refresh presence + pairing request.
+    const now = new Date()
+    await db.agencyDevice.update({
+      where: { id: device.id },
+      data: {
+        status: 'PAIRING',
+        lastHeartbeatAt: now,
+        ...(body.ip ? { ipAddress: body.ip } : {}),
+        ...(body.port ? { port: body.port } : {}),
+      },
+    })
+    const agency = await db.agency.findUnique({
+      where: { id: user.agencyId },
+      select: { id: true, name: true, nameAr: true, nameFr: true },
+    })
+    if (!agency) {
+      return c.json({ success: false, error: 'Agency not found' }, 404)
+    }
+    const command = await db.deviceCommand.create({
+      data: {
+        deviceId: device.id,
+        type: 'PAIRING_REQUEST',
+        payload: JSON.stringify({
+          agencyId: agency.id,
+          agencyName: agency.name,
+          agencyNameAr: agency.nameAr,
+          agencyNameFr: agency.nameFr,
+          sentBy: user.id,
+          sentByName: user.fullName || user.username,
+        }),
+        status: 'PENDING',
+        ttl: 600,
+      },
+    })
+    emitAgencyDeviceEvent('agency-device:pairing-request', agency.id, {
+      deviceId: device.id,
+      deviceName: device.name,
+      commandId: command.id,
+      agencyId: agency.id,
+      agencyName: agency.name,
+    })
+    appendDeviceEvent({
+      event: 'pairing_requested',
+      message: `Pairing request (scan-result) sent to ${device.name} by ${user.fullName || user.username}`,
+      deviceId: device.id,
+      deviceName: device.name,
+      deviceType: device.type,
+      agencyId: agency.id,
+      userId: user.id,
+      username: user.username,
+      data: { commandId: command.id, created },
+    })
+    return c.json({ success: true, created, deviceId: device.id, commandId: command.id, message: `Pairing request sent to ${device.name}` })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 

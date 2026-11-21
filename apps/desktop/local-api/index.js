@@ -1916,6 +1916,35 @@ async function withOutboxTransaction(work) {
 }
 
 /**
+ * withQueueWriteLock — branch-wide queue read/write discipline (0.6.97 audit).
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The MASTER desktop is the branch's single write target (followers are
+ * write-gated via lan-authority.followerWriteGate and every kiosk / counter /
+ * TV client is repointed here), so ONE Node process owns every queue
+ * mutation. SQLite serializes the writes themselves — but the CANDIDATE and
+ * NUMBER-cursor READS must happen inside the same serialized section or two
+ * concurrent requests observe the same WAITING ticket / lastIssuedNumber
+ * (classic TOCTOU) and mint a DOUBLE-CALL (same customer at two counters) or
+ * a DUPLICATE ticket number. The lock serializes the whole critical section:
+ *
+ *   POST /api/reservations        — ticket number allocation + create
+ *   POST /api/agency/queue/walk-in— same allocation (offline path)
+ *   POST /api/queue/call-next     — candidate selection + OCC claim
+ *   POST /api/queue/call/:id      — conditional claim of a specific ticket
+ *
+ * The OCC conditional flip (updateMany WHERE status='WAITING', mirroring the
+ * cloud lib/queue-claim.ts) stays as the second line of defense.
+ * Simple promise-chain mutex — queued requests run in FIFO order, and a
+ * failed section can never poison the chain.
+ */
+let _queueWriteTail = Promise.resolve()
+function withQueueWriteLock(work) {
+  const run = _queueWriteTail.then(() => work(), () => work())
+  _queueWriteTail = run.then(() => undefined, () => undefined)
+  return run
+}
+
+/**
  * Get due outbox mutations (for sync service replay).
  * Part R: 'retry' rows re-join the queue once their backoff expires — a
  * transient failure NEVER removes a mutation from the retry pool.
@@ -7062,19 +7091,19 @@ function createApp() {
         return c.json({ success: false, error: 'Service not found' }, 404)
       }
 
-      // Get or create queue settings to determine next number
-      let qs = await db.queueSettings.findFirst({ where: { agencyId } })
-      const lastNumber = qs?.lastIssuedNumber || 0
-      const newNumber = lastNumber + 1
-      const servicePrefix = service.prefix || 'A'
-      const displayNumber = `${servicePrefix}${String(newNumber).padStart(3, '0')}`
+      // 0.6.97 audit — the number cursor read MOVED INSIDE the transaction and
+      // the whole issuance is serialized by the branch queue write lock: two
+      // kiosks (or a kiosk + walk-in counter) issuing at the same instant can
+      // no longer both read the same lastIssuedNumber and mint DUPLICATE
+      // ticket numbers. The cursor read, the create and the cursor advance
+      // commit as one atomic unit.
+      const reservation = await withQueueWriteLock(() => withOutboxTransaction(async (tx) => {
+        const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
+        const lastNumber = qsTx?.lastIssuedNumber || 0
+        const newNumber = lastNumber + 1
+        const servicePrefix = service.prefix || 'A'
+        const displayNumber = `${servicePrefix}${String(newNumber).padStart(3, '0')}`
 
-      // Calculate position in queue (number of WAITING reservations before this one)
-      const waitingCount = await db.reservation.count({
-        where: { agencyId, status: 'WAITING' },
-      })
-
-      const reservation = await withOutboxTransaction(async (tx) => {
         const created = await tx.reservation.create({
           data: {
             agencyId,
@@ -7097,9 +7126,9 @@ function createApp() {
 
         // Update queue settings (same transaction — the counter and the
         // ticket must commit or roll back together)
-        if (qs) {
+        if (qsTx) {
           await tx.queueSettings.update({
-            where: { id: qs.id },
+            where: { id: qsTx.id },
             data: { lastIssuedNumber: newNumber },
           })
         } else {
@@ -7127,7 +7156,7 @@ function createApp() {
         // POST /api/sync/push — deterministic, idempotent, id-preserving.
         await logDeterministicOutcome('Reservation', created.id, 'create', created, null, { tx })
         return created
-      })
+      }))
 
       emitEvent('reservation:created', { agencyId, reservation })
       // 0.6.89 — QUEUE event: LAN customer join created a LOCAL ticket
@@ -7305,11 +7334,16 @@ function createApp() {
   //      keeps the SQL identical to the legacy query.
   // Returns { candidates, where } — `where` is the binding-aware WAITING
   // filter for the caller's "no candidate" fallback diagnostics.
-  async function loadLocalCallCandidates(agencyId, serviceId, counterId) {
+  // 0.6.97 — `client` override: when called INSIDE the queue write lock's
+  // outbox transaction the selection must read the SAME tx snapshot the claim
+  // writes through (pass the `tx` client); the legacy callers omit it and
+  // read the root `db` as before.
+  async function loadLocalCallCandidates(agencyId, serviceId, counterId, client) {
+    const dbc = client || db
     let boundServiceIds = null
     if (counterId) {
       try {
-        const bound = await db.counterService.findMany({
+        const bound = await dbc.counterService.findMany({
           where: { counterId },
           select: { serviceId: true },
         })
@@ -7331,7 +7365,7 @@ function createApp() {
     } else if (serviceId) {
       where.serviceId = serviceId
     }
-    const candidates = await db.reservation.findMany({
+    const candidates = await dbc.reservation.findMany({
       where,
       orderBy: { queueNumber: 'asc' },
       take: 200,
@@ -7339,7 +7373,7 @@ function createApp() {
     if (candidates.length > 1) {
       try {
         const svcIds = [...new Set(candidates.map((r) => r.serviceId))]
-        const svcs = await db.service.findMany({ where: { id: { in: svcIds } }, select: { id: true, priority: true } })
+        const svcs = await dbc.service.findMany({ where: { id: { in: svcIds } }, select: { id: true, priority: true } })
         const prio = new Map(svcs.map((s) => [s.id, s.priority || 0]))
         candidates.sort((a, b) => {
           const pa = prio.get(a.serviceId) || 0
@@ -7382,51 +7416,66 @@ function createApp() {
       // tickets whose preferred time has not arrived yet.
       // P2-10 — shared loader adds the Counter↔Service binding filter and
       // the (priority DESC, queueNumber ASC) ordering.
-      const { candidates, where } = await loadLocalCallCandidates(agencyId, serviceId, effectiveCounterId)
+      const now = new Date()
 
-      const next = pickNextLocalCustomer(candidates, new Date())
+      // BRANCH-WIDE CLAIM DISCIPLINE (0.6.97 audit — "prevent calling the same
+      // customer from two counters"): the candidate selection AND the claim
+      // happen inside ONE serialized section — the in-process queue write
+      // lock (this master process owns every branch write) PLUS the outbox
+      // transaction — and the flip itself is the same OCC conditional update
+      // the CLOUD engine uses (lib/queue-claim.ts):
+      //   updateMany({ where: { id, status: 'WAITING' } })
+      // count===0 ⇒ a concurrent counter won THAT ticket — the loser advances
+      // to the next candidate instead of double-calling it.
+      const claim = await withQueueWriteLock(() => withOutboxTransaction(async (tx) => {
+        const { candidates } = await loadLocalCallCandidates(agencyId, serviceId, effectiveCounterId, tx)
+        let callableSeen = 0
+        for (const cand of candidates) {
+          if (!isCallableNowLocal(cand, now)) continue // Task 24: scheduled tickets stay put
+          callableSeen++
+          const occ = await tx.reservation.updateMany({
+            where: { id: cand.id, status: 'WAITING' },
+            data: {
+              status: 'CALLED',
+              calledAt: now,
+              // calledBy: removed — not a Reservation schema field
+              counterId: effectiveCounterId || null,
+            },
+          })
+          if (occ.count === 0) continue // lost THIS ticket to a racing counter — next candidate
 
-      if (!next) {
-        const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
-        if (!anyWaiting) {
+          // Update current serving number in queue settings (same tx)
+          const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
+          if (qsTx) {
+            await tx.queueSettings.update({
+              where: { id: qsTx.id },
+              data: { currentServingNumber: cand.queueNumber },
+            })
+          }
+
+          // P1-5 (Part Q): the CALLED flip, the serving-number advance and the
+          // outbox row commit as ONE transaction — a crash mid-call can never
+          // leave the ticket called locally while the cloud believes it WAITING.
+          const row = await tx.reservation.findUnique({ where: { id: cand.id } })
+          await logDeterministicOutcome('Reservation', row && row.id, 'update', row, null, { tx })
+          return { row, waitingCount: candidates.length, callableSeen }
+        }
+        return { row: null, waitingCount: candidates.length, callableSeen }
+      }))
+
+      const updated = claim && claim.row
+      if (!updated) {
+        if (!claim || claim.waitingCount === 0) {
           return c.json({ success: false, error: 'No customers in queue' }, 404)
         }
         return c.json({
           success: false,
-          error: 'All waiting reservations have preferred times in the future. No one to call yet.',
-          hasPreferredTimeOnly: true,
+          error: claim.callableSeen === 0
+            ? 'All waiting reservations have preferred times in the future. No one to call yet.'
+            : 'No callable ticket remained — a concurrent counter claimed it first.',
+          hasPreferredTimeOnly: claim.callableSeen === 0,
         })
       }
-
-      const now = new Date()
-
-      // P1-5 (Part Q): the CALLED flip, the serving-number advance and the
-      // outbox row commit as ONE transaction — a crash mid-call can never
-      // leave the ticket called locally while the cloud believes it WAITING.
-      const updated = await withOutboxTransaction(async (tx) => {
-        await tx.reservation.update({
-          where: { id: next.id },
-          data: {
-            status: 'CALLED',
-            calledAt: now,
-            // calledBy: removed — not a Reservation schema field
-            counterId: effectiveCounterId || null,
-          },
-        })
-
-        // Update current serving number in queue settings
-        const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
-        if (qsTx) {
-          await tx.queueSettings.update({
-            where: { id: qsTx.id },
-            data: { currentServingNumber: next.queueNumber },
-          })
-        }
-
-        const row = await tx.reservation.findUnique({ where: { id: next.id } })
-        await logDeterministicOutcome('Reservation', row && row.id, 'update', row, null, { tx })
-        return row
-      })
 
       // Update positions of remaining waiting reservations
       const remainingWaiting = await db.reservation.findMany({
@@ -7447,7 +7496,7 @@ function createApp() {
           serviceId: updated.serviceId,
           counterId: updated.counterId || effectiveCounterId || undefined,
           status: 'CALLED',
-          waitMs: next && next.joinedAt ? Date.now() - new Date(next.joinedAt).getTime() : undefined,
+          waitMs: updated && updated.joinedAt ? Date.now() - new Date(updated.joinedAt).getTime() : undefined,
         },
       )
 
@@ -7491,9 +7540,15 @@ function createApp() {
       }
 
       const now = new Date()
-      const updated = await withOutboxTransaction(async (tx) => {
-        await tx.reservation.update({
-          where: { id },
+      // 0.6.97 audit — the status check above happened OUTSIDE the transaction
+      // (read-then-write TOCTOU): two counters calling the same ticket in the
+      // same instant could both pass the check. The flip is now a CONDITIONAL
+      // updateMany (status must still be WAITING/CALLED when the write lands)
+      // under the branch queue write lock — the racing loser gets 409, never
+      // a silent double-call.
+      const updated = await withQueueWriteLock(() => withOutboxTransaction(async (tx) => {
+        const occ = await tx.reservation.updateMany({
+          where: { id, agencyId, status: { in: ['WAITING', 'CALLED'] } },
           data: {
             status: 'CALLED',
             calledAt: now,
@@ -7501,10 +7556,14 @@ function createApp() {
             counterId: effectiveCounterId || null,
           },
         })
+        if (occ.count === 0) return null // served/cancelled/completed mid-race
         const row = await tx.reservation.findUnique({ where: { id } })
         await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
         return row
-      })
+      }))
+      if (!updated) {
+        return c.json({ success: false, error: 'Ticket is no longer callable — its status just changed (served, cancelled or completed)' }, 409)
+      }
 
       emitEvent('queue:called', { agencyId, reservation: updated })
       // 0.6.89 — QUEUE event: local claim of a specific ticket.
@@ -8965,11 +9024,15 @@ function createApp() {
       }
 
       const now = new Date()
-      const qsWalkIn = await db.queueSettings.findFirst({ where: { agencyId } })
-      const newWalkInNumber = (qsWalkIn?.lastIssuedNumber || 0) + 1
-      const displayNumber = `${service.prefix || 'A'}${String(newWalkInNumber).padStart(3, '0')}`
+      // 0.6.97 audit — same issuance discipline as POST /api/reservations: the
+      // number cursor read moved INSIDE the transaction and the whole walk-in
+      // issuance is serialized by the branch queue write lock, so a walk-in
+      // racing a kiosk ticket can never duplicate a ticket number.
+      const reservation = await withQueueWriteLock(() => withOutboxTransaction(async (tx) => {
+        const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
+        const newWalkInNumber = (qsTx?.lastIssuedNumber || 0) + 1
+        const displayNumber = `${service.prefix || 'A'}${String(newWalkInNumber).padStart(3, '0')}`
 
-      const reservation = await withOutboxTransaction(async (tx) => {
         const created = await tx.reservation.create({
           data: {
             id: require('crypto').randomUUID(),
@@ -8986,8 +9049,8 @@ function createApp() {
           },
         })
         // Keep the global issued-number cursor in lockstep (same transaction).
-        if (qsWalkIn) {
-          await tx.queueSettings.update({ where: { id: qsWalkIn.id }, data: { lastIssuedNumber: newWalkInNumber } })
+        if (qsTx) {
+          await tx.queueSettings.update({ where: { id: qsTx.id }, data: { lastIssuedNumber: newWalkInNumber } })
         } else {
           await tx.queueSettings.create({
             data: { agencyId, lastIssuedNumber: newWalkInNumber, currentServingNumber: 0, isPaused: false },
@@ -8998,7 +9061,7 @@ function createApp() {
         // (403 for owners) — replay as a record-level create like /api/reservations.
         await logDeterministicOutcome('Reservation', created.id, 'create', created, null, { tx })
         return created
-      })
+      }))
 
       // Task 75: the payload MUST carry agencyId — the router routes queue:*
       // by data.agencyId and silently dropped this event before, so a staff

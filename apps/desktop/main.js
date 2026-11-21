@@ -774,6 +774,23 @@ const BEACON_PORT = 3081;
 const BEACON_INTERVAL_MS = 3000;
 let beaconSocket = null;
 let beaconInterval = null;
+// 0.6.96 — the beacon/mDNS identity FOLLOWS the app's display mode. When the
+// TV/kiosk window opens, this machine announces itself as a KIOSK (so the
+// Device Manager on another device shows a kiosk card and can send a pairing
+// request), not as a desktop.
+let beaconIdentityMode = 'desktop';
+
+function setLanBeaconMode(mode) {
+  beaconIdentityMode = mode === 'kiosk' ? 'kiosk' : 'desktop';
+  try {
+    const scannerLib = require('./local-api/lib/discovery-scanner');
+    if (typeof scannerLib.setBlastiMdnsIdentity === 'function') {
+      // mDNS TXT now advertises the same mode (_blasti-kiosk/_blasti-desktop).
+      scannerLib.setBlastiMdnsIdentity({ mode: beaconIdentityMode, deviceType: beaconIdentityMode });
+    }
+  } catch { /* mDNS identity is best-effort */ }
+  console.log(`[BLASTI Desktop] LAN beacon identity mode → ${beaconIdentityMode}`);
+}
 
 // ─── Windows Firewall self-heal (0.6.86) ────────────────────────────────────
 // LAN mode binds 0.0.0.0:3080 and broadcasts UDP :3081, but Windows Defender
@@ -869,15 +886,22 @@ function buildBeaconPayload() {
   // (and on any error) the beacon stays exactly the historic identity payload.
   let extras = {};
   try { extras = require('./local-api/lib/lan-authority').publicBeaconExtras() || {}; } catch { extras = {}; }
+  // 0.6.96 — the BLASTI app is RESPONSIBLE for sharing its device information
+  // (user requirement): type, name, platform and IP ride on every beacon so
+  // receivers TRUST self-announced fields instead of fingerprint-guessing.
   return JSON.stringify({
     service: 'blasti-local',
     name: getMachineDisplayName(),
     hostname: getMachineDisplayName(),
     lanIp: getLocalIP(),
+    ip: getLocalIP(),
     httpPort: 3080,
     // 0.6.78 — identity fields the Device Manager surfaces directly
     appVersion: (() => { try { return app.getVersion() } catch { return '' } })(),
-    mode: 'desktop',
+    mode: beaconIdentityMode,
+    // 0.6.96 — shared device info (type + platform)
+    deviceType: beaconIdentityMode === 'kiosk' ? 'kiosk' : 'desktop',
+    platform: process.platform,
     ...extras,
   });
 }
@@ -946,6 +970,60 @@ function stopLanBeacon() {
     beaconSocket = null;
   }
 }
+
+// ─── TV board snapshot capture (0.6.96) ─────────────────────────────────────
+// DLNA / Chromecast / Roku renderers can only display MEDIA — not a web page.
+// This provider renders the agency's TV board in a hidden offscreen window,
+// captures it as JPEG and hands the buffer to the local API's cast-service,
+// which pushes it to the TV (http://<lan-ip>:3080/.../cast/snapshot.jpg).
+let snapshotWindow = null;
+let snapshotInFlight = null;
+
+async function captureBoardSnapshot(url) {
+  const { BrowserWindow } = require('electron');
+  if (!BrowserWindow) return null;
+  // Serialize: one capture at a time (a second cast request reuses the result).
+  if (snapshotInFlight) return snapshotInFlight;
+  snapshotInFlight = (async () => {
+    try {
+      if (!snapshotWindow || snapshotWindow.isDestroyed()) {
+        snapshotWindow = new BrowserWindow({
+          show: false,
+          width: 1920,
+          height: 1080,
+          x: -32000,
+          y: -32000,
+          webPreferences: {
+            offscreen: true,
+            backgroundThrottling: false,
+            contextIsolation: true,
+            nodeIntegration: false,
+          },
+        });
+        snapshotWindow.setMenuBarVisibility(false);
+      }
+      await snapshotWindow.loadURL(String(url || `${DEV_URL}/?mode=device&type=TV`));
+      // Let the board register/fetch its first queue-status payload.
+      await new Promise((r) => setTimeout(r, 4000));
+      const image = await snapshotWindow.webContents.capturePage();
+      if (!image || image.isEmpty()) return null;
+      const jpeg = image.toJPEG(85);
+      return jpeg && jpeg.length > 0 ? jpeg : null;
+    } catch (err) {
+      console.warn('[BLASTI Desktop] Board snapshot capture failed (non-fatal):', err && err.message);
+      return null;
+    } finally {
+      snapshotInFlight = null;
+    }
+  })();
+  return snapshotInFlight;
+}
+
+// Register the provider with the local API's cast service (no-op until the
+// first DLNA/Chromecast/Roku cast actually needs a snapshot).
+try {
+  require('./local-api/lib/cast-service').setSnapshotProvider(captureBoardSnapshot, 'electron-offscreen');
+} catch { /* provider registration is best-effort */ }
 
 // ─── Single Instance Lock ─────────────────────────────────────────────────────
 
@@ -4479,6 +4557,11 @@ ipcMain.handle('tv-screen:open', async (event, { url } = {}) => {
   tvWindow.loadURL(tvUrl);
   tvWindow.setMenuBarVisibility(false);
 
+  // 0.6.96 — this machine now ANNOUNCES ITSELF as a kiosk while the TV/kiosk
+  // window is open (beacon mode + mDNS TXT), so other BLASTI apps' scans show
+  // a kiosk card and can send pairing requests to it.
+  try { setLanBeaconMode('kiosk'); } catch { /* identity switch is best-effort */ }
+
   // 0.6.91 — device event stream: kiosk/TV window opened (kiosk mode entered).
   try {
     require('./local-api/lib/device-event').deviceEvent(
@@ -4513,6 +4596,8 @@ ipcMain.handle('tv-screen:close', () => {
   if (tvWindow && !tvWindow.isDestroyed()) {
     tvWindow.close();
     tvWindow = null;
+    // 0.6.96 — identity back to desktop when the kiosk window closes.
+    try { setLanBeaconMode('desktop'); } catch { /* identity switch is best-effort */ }
     // 0.6.91 — device event stream: kiosk/TV window closed (kiosk mode exited).
     try {
       require('./local-api/lib/device-event').deviceEvent('kiosk_exit', 'TV/kiosk window closed', { deviceType: 'TV' });

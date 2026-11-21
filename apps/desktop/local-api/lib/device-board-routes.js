@@ -1249,7 +1249,11 @@ function registerDeviceBoardRoutes(app, ctx) {
       if (!targetDevice) return c.json({ success: false, error: 'Invalid pairing code' }, 404)
 
       // C2: cross-agency protection (cloud parity).
-      if (targetDevice.agencyId !== device.agencyId) {
+      // 0.6.96 — ORPHAN ADOPTION FIX: an unpaired device (agencyId null) has
+      // no agency yet, so strict equality ALWAYS 403'd it with "Pairing code
+      // not valid for your agency" — the kiosk-visible error that looked like
+      // a missing-permission problem. An orphan may adopt the target's agency.
+      if (targetDevice.agencyId && device.agencyId && targetDevice.agencyId !== device.agencyId) {
         return c.json({ success: false, error: 'Pairing code not valid for your agency' }, 403)
       }
 

@@ -1,6 +1,6 @@
 {
   "name": "@blasti/web",
-  "version": "0.6.95",
+  "version": "0.6.98",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000 -H 0.0.0.0",

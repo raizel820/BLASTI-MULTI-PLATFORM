@@ -92,6 +92,9 @@ interface Employee {
   userId: string;
   username: string;
   fullName: string;
+  // 0.6.98 — agent-transliterated display names (empty until filled).
+  fullNameAr?: string | null;
+  fullNameFr?: string | null;
   role: string;
   isActive: boolean;
   createdAt: string;
@@ -119,6 +122,9 @@ function mapStaffRows(rows: unknown[]): Employee[] {
     userId: s.userId,
     username: s.user?.username ?? '',
     fullName: s.user?.fullName ?? '',
+    // 0.6.98 — localized display names ride along (GET /agency/staff).
+    fullNameAr: s.user?.fullNameAr ?? null,
+    fullNameFr: s.user?.fullNameFr ?? null,
     role: s.role === 'OWNER' ? 'AGENCY_OWNER' : s.role === 'MANAGER' ? 'AGENCY_MANAGER' : s.role,
     isActive: s.isActive ?? s.user?.isActive ?? true,
     createdAt: s.joinedAt ?? s.user?.createdAt ?? new Date().toISOString(),
@@ -743,7 +749,8 @@ export function AgencyEmployees() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
                           <p className="font-semibold text-sm text-foreground truncate min-w-0" title={emp.fullName || '?'}>
-                            {emp.fullName || '?'}
+                            {/* 0.6.98 — localized display name (agent-transliterated) with base fallback. */}
+                            {(lang === 'ar' && emp.fullNameAr ? emp.fullNameAr : lang === 'fr' && emp.fullNameFr ? emp.fullNameFr : emp.fullName) || '?'}
                           </p>
                           {getRoleBadge(emp.role)}
                           {!emp.isActive && (
