@@ -338,7 +338,28 @@ async function probeTopologyServers(): Promise<DiscoveredServer | null> {
   } catch { /* no session / offline / unreachable — the sweep still runs */ return null; }
 }
 
-export async function quickDiscover(): Promise<DiscoveredServer | null> {
+/** Loopback check for a discovered server (0.6.99 device-surface logic). */
+function isLoopbackServer(s: DiscoveredServer | null): boolean {
+  if (!s) return false;
+  const ip = String(s.ip || '');
+  return ip === '127.0.0.1' || ip === 'localhost' || ip === '::1';
+}
+
+/**
+ * 0.6.99 — DEVICE-SURFACE discovery (kiosk/TV terminal on a PC running the
+ * BLASTI desktop app). A device surface is a TERMINAL of the branch store:
+ * when another BLASTI desktop answers on the LAN, prefer THAT store (it holds
+ * the agency data + the pairing commands) over this machine's own local API
+ * (whose db is empty when nobody signed in). Only when NO remote desktop
+ * answers does the sweep fall back to this machine's own server (the
+ * same-PC kiosk window — its store IS the branch store).
+ *
+ * `selfIps` are this machine's own LAN IPs (WebRTC-detected) — candidates on
+ * them are ignored so a kiosk PC never pins itself as "remote".
+ */
+export async function quickDiscover(opts?: { preferRemote?: boolean; selfIps?: string[] }): Promise<DiscoveredServer | null> {
+  const preferRemote = opts?.preferRemote === true;
+  const selfIps = new Set((opts?.selfIps || []).filter(Boolean));
   // M27: Check isScanning mutex
   if (isScanning) return null;
   if (typeof window === 'undefined') return null;
@@ -354,9 +375,13 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
     // 0.6.75 — stage 1 runs in PARALLEL: cached-server liveness, localhost
     // probe and all derived-subnet gateway probes used to run back-to-back,
     // each paying up to one full timeout before the next stage started.
+    // 0.6.99 — in device-surface mode (preferRemote) loopback/self candidates
+    // are DEMOTED: a kiosk PC must pair against the branch desktop, not
+    // against its own empty local store.
     const cached = getCachedServer();
     const cacheTask = (async (): Promise<DiscoveredServer | null> => {
       if (!cached) return null;
+      if (preferRemote && (isLoopbackServer(cached) || selfIps.has(cached.ip))) return null;
       // Filter out stale cache entries pointing to wrong ports (3003 = cloud, not LAN)
       const cachePort = cached.apiPort || cached.port;
       if (cachePort === 3000 || cachePort === 3003) {
@@ -382,6 +407,46 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
       gatewayTask,
       topologyTask,
     ]);
+
+    // ── 0.6.99 — device-surface (preferRemote) precedence ──────────────────
+    if (preferRemote) {
+      const demote = (s: DiscoveredServer | null): DiscoveredServer | null =>
+        s && !isLoopbackServer(s) && !selfIps.has(s.ip) ? s : null;
+      // Remote candidates only — the cached box, the cloud-topology box, then
+      // the gateway probe (a gateway that answers IS another BLASTI desktop).
+      const remoteWinner = demote(cachedAlive) || demote(topologyHit) || gateway || null;
+      if (remoteWinner) {
+        cacheServer(remoteWinner);
+        try { logDevice('scan_completed', `Device discovery pinned the branch desktop at ${remoteWinner.ip}:${remoteWinner.apiPort || remoteWinner.port}`, { deviceName: remoteWinner.name || undefined, deviceType: remoteWinner.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
+        return remoteWinner;
+      }
+      // No remote desktop answered yet — run the full sweep before giving up.
+      const remoteCandidates = derived;
+      const remoteFound = (
+        await Promise.all(remoteCandidates.map((subnet) => scanSubnet(subnet, DEFAULT_API_PORT)))
+      )
+        .filter((s): s is DiscoveredServer => s !== null)
+        .filter((s) => !isLoopbackServer(s) && !selfIps.has(s.ip))
+        .sort((a, b) => lanAuthorityRank(a) - lanAuthorityRank(b));
+      const sweepWinner = remoteFound[0] ?? null;
+      if (sweepWinner) {
+        cacheServer(sweepWinner);
+        try { logDevice('scan_completed', `Device discovery pinned the branch desktop at ${sweepWinner.ip}:${sweepWinner.apiPort || sweepWinner.port}`, { deviceName: sweepWinner.name || undefined, deviceType: sweepWinner.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
+        return sweepWinner;
+      }
+      // Nothing remote on this network → the same-PC device surface falls back
+      // to its own local server (whose store IS the branch store when the
+      // operator signed in on this machine).
+      const selfHit = (cachedAlive && (isLoopbackServer(cachedAlive) || selfIps.has(cachedAlive.ip)) ? cachedAlive : null)
+        || (localhost && (isLoopbackServer(localhost) || selfIps.has(localhost.ip)) ? localhost : null);
+      if (selfHit) {
+        cacheServer(selfHit);
+        try { logDevice('scan_completed', `No branch desktop found — device surface uses the local store at ${selfHit.ip}:${selfHit.apiPort || selfHit.port}`, { status: 'ONLINE' }); } catch { /* never block */ }
+        return selfHit;
+      }
+      try { logDevice('scan_failed', `Device discovery finished with NO desktop found (${remoteCandidates.length} subnet(s) swept)`, undefined, 'warn'); } catch { /* never block */ }
+      return null;
+    }
 
     // Strict precedence preserved from the sequential version:
     // a live cached server > localhost > topology-reported desktop > derived-subnet gateway.

@@ -82,6 +82,14 @@ import {
 // waited forever with no error (the "kiosk pairing never works" root).
 import { getKioskLanBase } from './kiosk-lan-base';
 
+// 0.6.99 — device-surface flag (sessionStorage; leaf module — no cycle).
+// A kiosk/TV surface running INSIDE the desktop webview is a TERMINAL of the
+// branch store, not a manager: when it pinned a REMOTE (non-loopback) LAN
+// desktop, device traffic must hit THAT store — the store that holds the
+// agency data and the pairing commands. The manager window never sets the
+// flag, so its local-first base is untouched.
+import { isDeviceSurfaceActive } from '@/components/devices/kiosk/kiosk-types';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /** Configuration for the ApiClient instance. */
@@ -318,6 +326,16 @@ export function getApiBaseUrl(): string {
     return lanOverride.baseUrl;
   }
 
+  // ── 0.6.99: DEVICE-SURFACE override (inside Electron too) ────────────────
+  // A kiosk/TV surface in the desktop webview pinned a REMOTE branch desktop
+  // → device traffic (register / pairing poll / accept / join-queue) goes to
+  // THAT store. Loopback pins (the same-PC kiosk) are ignored here so the
+  // manager's local-first base stays intact.
+  const kioskLanBaseEarly = getKioskLanBase();
+  if (kioskLanBaseEarly && isDeviceSurfaceActive() && !isLoopbackBase(kioskLanBaseEarly)) {
+    return kioskLanBaseEarly;
+  }
+
   // ── Electron: LOCAL-FIRST — always the embedded local API (:3080) ─────────────────────────
   // WHY (spec §7/§8): the desktop must operate fully offline. The local
   // SQLite-backed API is the operational source of truth for the UI; the
@@ -338,7 +356,7 @@ export function getApiBaseUrl(): string {
   // Set by the kiosk when a desktop LAN server was discovered (HTTP sweep)
   // or resolved from a branch code (cloud lan-topology resolve + beacon
   // probe). Kept AFTER the Electron branch (inside the desktop webview the
-  // local API IS the manager's store — never repoint it) and BEFORE the
+  // device-surface override above already handled that case) and BEFORE the
   // Capacitor/web branches (those are the ones that bake the cloud base).
   const kioskLanBase = getKioskLanBase();
   if (kioskLanBase) {
@@ -380,6 +398,20 @@ export function getApiBaseUrl(): string {
   // relative URL — buildUrl() injects XTransformPort=3003 so the single-port
   // gateway can route API requests to the cloud API.
   return '';
+}
+
+/**
+ * 0.6.99 — loopback check for a pinned kiosk LAN base. A loopback pin means
+ * "this machine's own local API" — the device-surface override ignores it so
+ * the same-PC kiosk keeps the local-first base.
+ */
+function isLoopbackBase(base: string): boolean {
+  try {
+    const host = new URL(base).hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  } catch {
+    return false;
+  }
 }
 
 /**

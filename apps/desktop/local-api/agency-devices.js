@@ -442,14 +442,17 @@ function healthResponse() {
   }
 }
 
-// 0.6.96 — SCAN RESULT WHITELIST (user requirement: "device manager scans can
-// only discover active BLASTI apps on other devices and TVs and printers").
-// The scanner still fingerprints every host (evidence feeds TVs/printers),
-// but the manager listing keeps ONLY the device classes the agency can act
-// on: BLASTI apps (desktop/kiosk/phone), TVs (cast targets) and printers.
-// PCs/IoT/routers/unknown noise never render. `?include=all` bypasses the
-// whitelist for the diagnostics surface.
-const DISCOVERY_LIST_TYPES = new Set(['APP', 'KIOSK', 'PHONE', 'TV', 'PRINTER', 'DISPLAY'])
+// 0.6.99 — SIGNAL-BACKED WHITELIST (user requirement: "device manager
+// discovery should discover ONLY devices with the BLASTI app running on them
+// (by responding to the app signal) or TVs, printers and kiosk mode on the
+// BLASTI app (responding to the signal)"). The predicate lives in the scanner
+// port (1:1 with apps/api) and requires POSITIVE signal evidence:
+//   BLASTI apps — answered the beacon / mDNS _blasti / /api/discover probe
+//   TVs         — answered cast mDNS/SSDP/TCP/HTTP signals
+//   Printers    — answered IPP/JetDirect/WSD/SSDP/USB/HTTP signals
+// PCs, routers, IoT, generic phones and UNKNOWN are never listed. An OUI
+// vendor guess alone does NOT qualify. `?include=all` bypasses the whitelist
+// for the diagnostics surface.
 
 /** Live BLASTI beacons → manager cards (source 'live-beacon', status ONLINE). */
 function liveBeaconDeviceCards() {
@@ -487,10 +490,12 @@ function devicesResponse(category, status, includeAll) {
   let devices = [...scanDevices]
   if (category) devices = devices.filter((d) => String(d.category).toUpperCase() === String(category).toUpperCase())
   if (status) devices = devices.filter((d) => String(d.status).toUpperCase() === String(status).toUpperCase())
-  // 0.6.96 — whitelist (routers AND generic PC/IoT/unknown noise filtered).
-  // 0.6.92 filtered ROUTER only; 0.6.96 narrows to actionable device classes.
+  // 0.6.99 — signal-based whitelist (routers AND generic PC/IoT/phone/unknown
+  // noise filtered; TVs and printers must have answered a discovery signal).
   if (!includeAll) {
-    devices = devices.filter((d) => DISCOVERY_LIST_TYPES.has(String(d.type).toUpperCase()))
+    devices = devices.filter((d) => {
+      try { return scanner.isSignalBackedDevice(d) } catch { return false }
+    })
   }
   // 0.6.96 — merge LIVE beacon cards so ACTIVE BLASTI apps appear INSTANTLY
   // (before/without a scan). Scan cards at the same IP win (they are richer).
@@ -898,6 +903,10 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
             type: deviceType,
             status: 'PAIRING',
             connectionType: 'LAN',
+            // 0.6.100 — the manager MINTS the device token: the device adopts
+            // it on accept, so both stores share ONE canonical token (this is
+            // what later authorizes USB print forwards to the host PC).
+            deviceToken: crypto.randomBytes(32).toString('hex'),
             ipAddress: ip,
             port,
             deviceFingerprint: fingerprint || null,
@@ -938,7 +947,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       })
       const agency = await db.agency.findUnique({
         where: { id: agencyId },
-        select: { id: true, name: true, nameAr: true, nameFr: true },
+        select: { id: true, name: true, nameAr: true, nameFr: true, customCode: true },
       })
       if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
       const command = await db.deviceCommand.create({
@@ -950,6 +959,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
             agencyName: agency.name,
             agencyNameAr: agency.nameAr,
             agencyNameFr: agency.nameFr,
+            customCode: agency.customCode || undefined,
             sentBy: user.id,
             sentByName: user.fullName || user.username,
           }),
@@ -965,7 +975,82 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         agencyName: agency.name,
       })
       deviceEvents.deviceEvent('pairing_requested', `Pairing request (scan-result) sent to ${device.name} by ${user.fullName || user.username}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type || deviceType, agencyId: agency.id, sessionId: command.id })
-      return c.json({ success: true, created, deviceId: device.id, commandId: command.id, message: `Pairing request sent to ${device.name}` })
+
+      // ── 0.6.99 — CROSS-STORE DELIVERY FALLBACKS ───────────────────────────
+      // The command above lives in THIS store. The waiting device may poll a
+      // DIFFERENT store (a kiosk shell polls its own local API; a tablet that
+      // missed the LAN sweep polls the cloud) — then the request never
+      // arrives ("pairing request is not reaching to the kiosk device").
+      // Two best-effort relays close the gap:
+      //   (1) LAN DIRECT — the discovered device runs its own BLASTI local
+      //       API: POST the offer straight to it, landing the command in the
+      //       store the kiosk actually polls.
+      //   (2) CLOUD RELAY — when the orphan was just created (the device has
+      //       never registered HERE), the device is likely registered in the
+      //       cloud store: relay the same pairing request there.
+      const delivery = { lanOffer: false, cloudRelay: false, needsApproval: false }
+      if (ip && port && port > 0) {
+        try {
+          const offerCtl = new AbortController()
+          const offerTimer = setTimeout(() => offerCtl.abort(), 2500)
+          const offerRes = await fetch(`http://${ip}:${port}/api/agency-devices/public/pairing-offer`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fingerprint: device.deviceFingerprint || fingerprint || undefined,
+              deviceName: device.name || undefined,
+              // 0.6.100 — shared identity + acceptance fields: the target PC
+              // uses deviceType to pop its Accept/Reject dialog, and adopts
+              // deviceToken on accept (single canonical token across stores).
+              deviceType: deviceType === 'APP' ? 'desktop' : deviceType.toLowerCase(),
+              deviceToken: device.deviceToken || undefined,
+              managerIp: ctx.getManagerIp ? ctx.getManagerIp() : undefined,
+              agencyId: agency.id,
+              agencyName: agency.name,
+              agencyNameAr: agency.nameAr || undefined,
+              agencyNameFr: agency.nameFr || undefined,
+              customCode: agency.customCode || undefined,
+              sentByName: user.fullName || user.username,
+            }),
+            signal: offerCtl.signal,
+          })
+          clearTimeout(offerTimer)
+          const offerData = await offerRes.json().catch(() => null)
+          delivery.lanOffer = !!(offerData && offerData.success)
+          delivery.needsApproval = !!(offerData && offerData.needsApproval)
+        } catch { /* offline / firewall — the local command + cloud relay remain */ }
+      }
+      if (created) {
+        try {
+          const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
+          if (token && typeof ctx.cloudFetch === 'function') {
+            const cloudRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+              body: JSON.stringify({
+                fingerprint: fingerprint || undefined,
+                name: rawName || device.name || undefined,
+                ip: ip || undefined,
+                port: port || undefined,
+                deviceType: deviceType,
+              }),
+            }, { timeoutMs: 6000, attempts: 1 })
+            const cloudData = await cloudRes.json().catch(() => null)
+            delivery.cloudRelay = !!(cloudData && cloudData.success)
+          }
+        } catch (relayErr) {
+          if (diagLog) diagLog('AGENCY-DEVICE pairing cloud relay skipped: ' + (relayErr && relayErr.message))
+        }
+      }
+
+      return c.json({
+        success: true,
+        created,
+        deviceId: device.id,
+        commandId: command.id,
+        delivery,
+        message: `Pairing request sent to ${device.name}`,
+      })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE pairing-by-identity error: ' + (err && err.message))
       return c.json({ success: false, error: 'Failed to send pairing request' }, 500)
@@ -1046,6 +1131,52 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const kioskDevice = c.get('printDevice')
     let ip = optStr(body.ip, 50)
     let port = optInt(body.port, 1, 65535)
+
+    // 0.6.100 — registered USB-attached printer (cascade peripherals): the
+    // printer is physically plugged into a HOST branch PC — the raw TCP path
+    // below cannot reach it. Resolve the AgencyDevice row and forward the job
+    // to the host's local API, authenticated with the host's adopted token.
+    const printerDeviceId = typeof body.printerDeviceId === 'string' ? body.printerDeviceId : ''
+    if (printerDeviceId) {
+      try {
+        const printerRow = await db.agencyDevice.findUnique({ where: { id: printerDeviceId } })
+        const cfg = printerRow && typeof printerRow.printerConfig === 'string'
+          ? JSON.parse(printerRow.printerConfig || '{}')
+          : (printerRow && printerRow.printerConfig) || {}
+        if (printerRow && printerRow.type === 'PRINTER' && cfg && cfg.attachment === 'USB' && cfg.hostIp) {
+          const hostPort = Number(cfg.hostPort) > 0 ? Number(cfg.hostPort) : 3080
+          const hostToken = printerRow.deviceToken || ''
+          if (!hostToken) {
+            return c.json({ success: false, error: 'HOST_NOT_PAIRED — pair the host PC first so print jobs can be authenticated' }, 409)
+          }
+          const ctl = new AbortController()
+          const timer = setTimeout(() => ctl.abort(), 20_000)
+          try {
+            const fwd = await fetch(`http://${cfg.hostIp}:${hostPort}/api/agency-devices/host/print-job`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + hostToken },
+              body: JSON.stringify({
+                printerName: cfg.cupsName || cfg.osPrinterName || printerRow.name || undefined,
+                cupsName: cfg.cupsName || undefined,
+                ticket: body.ticket || undefined,
+                escposBase64: body.escposBase64 || undefined,
+              }),
+              signal: ctl.signal,
+            })
+            const fwdData = await fwd.json().catch(() => null)
+            if (fwd.ok && fwdData && fwdData.success) {
+              try { deviceEvents.deviceEvent('print_job_done', `USB print job forwarded to host ${cfg.hostIp}:${hostPort} for ${printerRow.name}`, { deviceType: 'PRINTER', status: 'OK', sessionId: printerDeviceId, source: 'usb-forward' }) } catch { /* log only */ }
+              return c.json({ success: true, via: 'host-forward', host: `${cfg.hostIp}:${hostPort}` })
+            }
+            return c.json({ success: false, error: (fwdData && fwdData.error) || `Host print failed (${fwd.status})`, host: `${cfg.hostIp}:${hostPort}` }, 502)
+          } finally {
+            clearTimeout(timer)
+          }
+        }
+      } catch (fwdErr) {
+        if (diagLog) diagLog('AGENCY-DEVICE print usb-forward error: ' + (fwdErr && fwdErr.message))
+      }
+    }
 
     // No explicit target → the agency's saved default printer
     if (!ip) {
@@ -1160,6 +1291,87 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   })
 
   // ═══ Default Printer (per-agency) ════════════════════════════════════════
+
+  // 0.6.100 — CASCADE PERIPHERAL REGISTRATION: a discovered USB printer that
+  // is physically attached to ANOTHER branch PC (source 'peripheral-report',
+  // hostIp/hostName carry the host) is registered here as a PRINTER
+  // AgencyDevice. The printerConfig JSON pins the attachment: hostIp/hostPort
+  // is where print jobs get forwarded, cupsName/usb ids identify the queue.
+  app.post('/api/agency-devices/discovery/register-peripheral', authMiddleware, async (c) => {
+    const db = c.get('db')
+    const agencyId = requireAgencyId(c)
+    if (!agencyId) return
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const printer = body.printer && typeof body.printer === 'object' ? body.printer : {}
+      const name = (typeof printer.name === 'string' && printer.name.trim() && printer.name.trim()) ||
+        (typeof body.name === 'string' && body.name.trim() && body.name.trim()) || ''
+      const hostIp = (typeof body.hostIp === 'string' && body.hostIp.trim()) || (typeof printer.hostIp === 'string' && printer.hostIp.trim()) || ''
+      if (!name) return c.json({ success: false, error: 'printer.name is required' }, 400)
+      if (!hostIp) return c.json({ success: false, error: 'hostIp is required (which PC owns the USB printer?)' }, 400)
+      const hostPort = optInt(body.hostPort, 1, 65535) || 3080
+      // Idempotent: same host + same USB/CUPS identity updates the same row.
+      const cupsName = typeof printer.cupsName === 'string' ? printer.cupsName.slice(0, 120) : null
+      const usbVendorId = typeof printer.usbVendorId === 'string' ? printer.usbVendorId.slice(0, 20) : null
+      const usbProductId = typeof printer.usbProductId === 'string' ? printer.usbProductId.slice(0, 20) : null
+      const fingerprintKey = [cupsName || '', usbVendorId || '', usbProductId || '', name].join('|')
+      const existing = await db.agencyDevice.findFirst({
+        where: { agencyId, type: 'PRINTER', connectionType: 'USB' },
+      })
+      let row = null
+      for (const cand of (existing ? [existing] : [])) {
+        try {
+          const cfg = typeof cand.printerConfig === 'string' ? JSON.parse(cand.printerConfig || '{}') : (cand.printerConfig || {})
+          const candKey = [cfg.cupsName || '', cfg.usbVendorId || '', cfg.usbProductId || '', cand.name || ''].join('|')
+          if (cfg.hostIp === hostIp && candKey === fingerprintKey) { row = cand; break }
+        } catch { /* corrupt config — skip */ }
+      }
+      const printerConfig = JSON.stringify({
+        attachment: 'USB',
+        hostIp,
+        hostPort,
+        hostDeviceId: typeof body.hostDeviceId === 'string' ? body.hostDeviceId.slice(0, 80) : null,
+        hostInstanceId: typeof body.hostInstanceId === 'string' ? body.hostInstanceId.slice(0, 80) : null,
+        hostName: typeof body.hostName === 'string' ? body.hostName.slice(0, 100) : null,
+        cupsName,
+        cupsUri: typeof printer.cupsUri === 'string' ? printer.cupsUri.slice(0, 200) : null,
+        usbVendorId,
+        usbProductId,
+        osPrinterName: typeof printer.osPrinterName === 'string' ? printer.osPrinterName.slice(0, 120) : null,
+        registeredFrom: 'cascade-discovery',
+        registeredAt: new Date().toISOString(),
+      })
+      if (row) {
+        row = await db.agencyDevice.update({
+          where: { id: row.id },
+          data: { name: name.slice(0, 100), printerConfig, ipAddress: hostIp, port: hostPort, lastHeartbeatAt: new Date() },
+        })
+      } else {
+        row = await db.agencyDevice.create({
+          data: {
+            agencyId,
+            branchId: typeof body.branchId === 'string' && body.branchId ? body.branchId : null,
+            name: name.slice(0, 100),
+            type: 'PRINTER',
+            status: 'ONLINE',
+            statusChangedAt: new Date(),
+            connectionType: 'USB',
+            ipAddress: hostIp,
+            port: hostPort,
+            printerConfig,
+            autoDiscovery: true,
+            lastHeartbeatAt: new Date(),
+          },
+        })
+      }
+      broadcastSafe('device:registered', { agencyId, deviceId: row.id, deviceName: row.name, deviceType: row.type })
+      deviceEvents.deviceEvent('peripheral_registered', `USB printer "${row.name}" registered via host ${hostIp}:${hostPort} (cascade discovery)`, { deviceId: row.id, deviceName: row.name, deviceType: 'PRINTER', agencyId, status: 'ONLINE', source: 'cascade' })
+      return c.json({ success: true, device: row })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE register-peripheral error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to register peripheral' }, 500)
+    }
+  })
 
   app.post('/api/agency-devices/discovery/default-printer', authMiddleware, async (c) => {
     const db = c.get('db')

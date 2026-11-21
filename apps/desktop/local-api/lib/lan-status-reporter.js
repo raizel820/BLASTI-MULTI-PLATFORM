@@ -33,11 +33,15 @@ let ticks = 0
 let lastAppliedPin
 let lastPinAt = 0
 let lastErrorLoggedAt = 0
+let lastVerdictPullAt = '' // 0.6.100 — ISO cutoff for the verdict pull
 
 let opts = {
   getSession: null,        // () => ({ token, user } | null)
   statusSnapshot: null,    // () => lan-authority snapshot
   setPreferredMaster: null,// (instanceId|null) => Promise
+  // 0.6.100 — cloud join-verdict relay + USB peripheral reporting
+  applyJoinVerdicts: null, // (verdicts[]) => Promise<number>
+  getPeripherals: null,    // () => [{ kind:'printer', name, cupsName, ... }]
   diag: null,              // (msg) => void
 }
 
@@ -113,6 +117,38 @@ async function reportOnce() {
     // MASTER-only: the joined-device registry (phones/tablets/kiosks/PCs).
     devices: Array.isArray(snap.devices) ? snap.devices : [],
   }
+  // 0.6.100 — PENDING join requests ride the SAME devices array as
+  // kind-tagged entries (no schema change): the Device Manager renders them
+  // in the tree and posts verdicts back via /lan-topology/join-verdict.
+  if (Array.isArray(snap.joinRequests) && snap.joinRequests.length > 0) {
+    for (const jr of snap.joinRequests.slice(0, 20)) {
+      payload.devices.push({ kind: 'pending-join', ...jr })
+    }
+  }
+  // 0.6.100 — USB peripherals (printers) attached to THIS machine are
+  // reported so ANY branch device's discovery can list + register them.
+  if (typeof opts.getPeripherals === 'function') {
+    try {
+      const peripherals = opts.getPeripherals()
+      if (Array.isArray(peripherals)) {
+        for (const p of peripherals.slice(0, 12)) {
+          if (!p || typeof p !== 'object') continue
+          // Explicit field list — a bare spread would let p.kind clobber the
+          // 'peripheral' tag the cloud sanitizer routes on.
+          payload.devices.push({
+            kind: 'peripheral',
+            pkind: typeof p.kind === 'string' ? p.kind : 'printer',
+            name: typeof p.name === 'string' ? p.name : '',
+            cupsName: typeof p.cupsName === 'string' ? p.cupsName : undefined,
+            cupsUri: typeof p.cupsUri === 'string' ? p.cupsUri : undefined,
+            usbVendorId: typeof p.usbVendorId === 'string' ? p.usbVendorId : undefined,
+            usbProductId: typeof p.usbProductId === 'string' ? p.usbProductId : undefined,
+            state: typeof p.state === 'string' ? p.state : undefined,
+          })
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
   const data = await postJson(base + '/lan-topology/report', session.token, payload)
   if (!data || data.success !== true) {
     // Log failures at most once a minute — offline is normal, don't spam.
@@ -125,6 +161,17 @@ async function reportOnce() {
 
   ticks += 1
   const duePull = ticks % PREFERENCE_PULL_EVERY === 1
+  // 0.6.100 — join verdicts are pulled EVERY report (~30s): the owner's
+  // Accept/Reject from the web Device Manager must reach this master fast.
+  if (typeof opts.applyJoinVerdicts === 'function') {
+    try {
+      const vRes = await getJson(base + '/lan-topology/join-verdicts?agencyId=' + encodeURIComponent(snap.agencyId) + '&since=' + encodeURIComponent(lastVerdictPullAt || ''), session.token)
+      lastVerdictPullAt = new Date().toISOString()
+      if (vRes && vRes.success === true && Array.isArray(vRes.verdicts) && vRes.verdicts.length > 0) {
+        await opts.applyJoinVerdicts(vRes.verdicts)
+      }
+    } catch { /* offline — normal */ }
+  }
   // Pull the owner's manual pick: right after the first successful report,
   // then every ~90s, or when this node's report says the pin targets someone
   // else (isPreferredMaster=false while our local pin says ME — drift).

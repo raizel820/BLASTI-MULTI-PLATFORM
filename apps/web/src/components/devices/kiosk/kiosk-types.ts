@@ -11,6 +11,10 @@ export interface PairingRequest {
   agencyNameAr?: string;
   agencyNameFr?: string;
   branchName?: string;
+  /** Operator who sent the pairing request from the manager device. */
+  sentByName?: string;
+  /** 0.6.100 — the manager-issued token this device ADOPTS on accept. */
+  deviceToken?: string;
   sentAt: string;
 }
 
@@ -94,6 +98,14 @@ export const BACKOFF_DELAYS = [2000, 8000, 32000];
 
 // ─── Device Fingerprint Generator ───────────────────────────────
 
+/**
+ * 0.6.99 — collision-safe device fingerprint. The old hash (UA + screen +
+ * platform) produced IDENTICAL values on identical devices — two tablets of
+ * the same model registered the same deviceFingerprint and the manager's
+ * pairing-by-identity matched the WRONG kiosk. A random 8-hex suffix is now
+ * generated once and PERSISTED (per-device uniqueness), keeping the id stable
+ * across sessions.
+ */
 export function generateFingerprint(): string {
   const nav = navigator as any;
   const parts = [
@@ -111,7 +123,87 @@ export function generateFingerprint(): string {
     hash = ((hash << 5) - hash) + char;
     hash |= 0;
   }
-  return Math.abs(hash).toString(16);
+  // 0.6.99 — random suffix so identical hardware never collides.
+  let rand = '';
+  try {
+    const buf = new Uint8Array(4);
+    crypto.getRandomValues(buf);
+    rand = Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    rand = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
+  }
+  return Math.abs(hash).toString(16) + rand;
+}
+
+/**
+ * 0.6.99 — STABLE device-surface fingerprint, persisted in localStorage and
+ * shared by EVERY device surface on this machine (kiosk + TV board) and by
+ * the UDP beacon (`uid`). One identity end-to-end:
+ *   beacon uid === discover-register deviceFingerprint === the id the
+ *   manager's pairing-request-by-identity matches.
+ * Persisted once, reused forever (per-install).
+ */
+export function getStableDeviceFingerprint(): string {
+  try {
+    let fp = localStorage.getItem('blasti_device_beacon_uid') || localStorage.getItem('blasti_kiosk_beacon_uid');
+    if (!fp) {
+      fp = generateFingerprint();
+      localStorage.setItem('blasti_device_beacon_uid', fp);
+    } else if (!localStorage.getItem('blasti_device_beacon_uid')) {
+      // Migrate the pre-0.6.99 kiosk key so existing installs keep their id.
+      try { localStorage.setItem('blasti_device_beacon_uid', fp); } catch { /* ignore */ }
+    }
+    return fp;
+  } catch {
+    return generateFingerprint();
+  }
+}
+
+// ─── Device-surface session flag + Electron beacon identity bridge ──────────
+
+const DEVICE_SURFACE_FLAG = 'blasti_device_surface';
+
+/**
+ * 0.6.99 — marks THIS window as a device surface (kiosk/TV terminal).
+ * getApiBaseUrl() consults it: inside Electron a device surface with a
+ * REMOTE (non-loopback) pinned LAN desktop talks to THAT store — a kiosk/TV
+ * PC is a terminal of the branch store (which holds the agency data and the
+ * pairing commands), not a manager of its own (its local db is empty).
+ * sessionStorage = per-window: the manager window is never affected.
+ */
+export function setDeviceSurfaceActive(active: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (active) window.sessionStorage.setItem(DEVICE_SURFACE_FLAG, '1');
+    else window.sessionStorage.removeItem(DEVICE_SURFACE_FLAG);
+  } catch { /* ignore */ }
+}
+
+export function isDeviceSurfaceActive(): boolean {
+  if (typeof window === 'undefined') return false;
+  try { return window.sessionStorage.getItem(DEVICE_SURFACE_FLAG) === '1'; } catch { return false; }
+}
+
+/**
+ * 0.6.99 — tell the Electron main process this machine's device-surface
+ * identity. buildBeaconPayload() embeds the uid so the beacon advertises the
+ * SAME fingerprint the kiosk registers with — the missing half of pairing:
+ * the manager's pairing-by-identity could only see the lan-authority
+ * instanceId and paired a DIFFERENT orphan row, so the request never reached
+ * the waiting kiosk. Fire-and-forget: no-op outside Electron.
+ */
+export function reportDeviceSurfaceIdentity(mode: 'kiosk' | 'tv'): void {
+  try {
+    const api = (window as unknown as { electronAPI?: { setDeviceSurfaceIdentity?: (identity: { uid: string; mode: string } | null) => void } }).electronAPI;
+    api?.setDeviceSurfaceIdentity?.({ uid: getStableDeviceFingerprint(), mode });
+  } catch { /* never block the kiosk */ }
+}
+
+export function clearDeviceSurfaceIdentity(): void {
+  try {
+    const api = (window as unknown as { electronAPI?: { setDeviceSurfaceIdentity?: (identity: { uid: string; mode: string } | null) => void } }).electronAPI;
+    api?.setDeviceSurfaceIdentity?.(null);
+  } catch { /* ignore */ }
 }
 
 // ─── QR Generation Helper ───────────────────────────────────────

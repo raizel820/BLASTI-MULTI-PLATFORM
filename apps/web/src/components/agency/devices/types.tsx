@@ -28,6 +28,8 @@ export interface AgencyDevice {
   branchId?: string | null;
   displaySettings: string | Record<string, unknown>;
   printConfig?: string | Record<string, unknown> | null;
+  /** 0.6.100 — printer attachment config; attachment:'USB' pins the host PC. */
+  printerConfig?: string | Record<string, unknown> | null;
   serviceFilter?: string | null;
   appVersion?: string | null;
   deviceFingerprint?: string | null;
@@ -77,7 +79,7 @@ export interface DeviceCommand {
 }
 
 // ── Discovery protocol types (contract with /discovery/* endpoints) ────────
-export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'tcp' | 'usb' | 'local' | 'ws-discovery' | 'udp-beacon' | 'live-beacon';
+export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'tcp' | 'usb' | 'local' | 'ws-discovery' | 'udp-beacon' | 'live-beacon' | 'peripheral-report';
 export type DiscoveredDeviceCategory = 'BLASTI' | 'NETWORK' | 'UPNP' | 'LOCAL';
 
 export interface RealDiscoveredDevice {
@@ -108,6 +110,11 @@ export interface RealDiscoveredDevice {
   ssdpServer?: string;
   ssdpSt?: string;
   mdnsService?: string;
+  /** 0.6.99 — services confirmed by the server's TCP sweep ('jetdirect',
+   *  'googlecast', 'airplay', 'roku', 'samsung-tv' …) — signal evidence the
+   *  whitelist predicate reads (TVs found only via cast ports, printers via
+   *  JetDirect). */
+  tcpServices?: string[];
   usbVendorId?: string;
   usbProductId?: string;
   cupsUri?: string;
@@ -136,6 +143,16 @@ export interface RealDiscoveredDevice {
   platform?: string;
   /** True when the card came from a live beacon (instant, no scan needed). */
   pairable?: boolean;
+  // ── 0.6.100 — CASCADE PERIPHERALS (shared printer attached to a host PC) ──
+  /** LAN ip of the BLASTI host this peripheral is physically attached to. */
+  hostIp?: string;
+  /** Display name of that host ("Branch PC — reception"). */
+  hostName?: string;
+  /** The host's fingerprint / instanceId (correlates with registered PCs). */
+  hostFingerprint?: string;
+  hostInstanceId?: string;
+  /** Host's local API port (print jobs forward to hostIp:hostPort). */
+  hostPort?: number;
 }
 
 export type ScanPhase = 'idle' | 'arp' | 'ping' | 'udp' | 'ssdp' | 'mdns' | 'tcp-sweep' | 'ws-discovery' | 'names' | 'http' | 'https' | 'local' | 'fingerprinting' | 'beacon' | 'complete' | 'error';

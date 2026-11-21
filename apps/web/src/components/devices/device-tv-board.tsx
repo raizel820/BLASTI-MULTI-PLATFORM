@@ -27,6 +27,8 @@ import { TvFocus } from './tv/layouts/tv-focus';
 import { TvMinimal } from './tv/layouts/tv-minimal';
 import { useTvBoardData, type TvScreenLayout } from './tv/use-tv-board-data';
 import { useCategoryTermScope } from '@/hooks/use-category-terms';
+// 0.6.99 — device-surface flag + Electron beacon identity (shared with the kiosk)
+import { setDeviceSurfaceActive, reportDeviceSurfaceIdentity, clearDeviceSurfaceIdentity } from './kiosk/kiosk-types';
 
 const TV_LAYOUTS: TvScreenLayout[] = ['TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL'];
 
@@ -60,6 +62,21 @@ interface DeviceTvBoardProps {
 
 export function DeviceTvBoard({ agencyId, onBack, currentLang }: DeviceTvBoardProps) {
   const { lang: appLang } = useLanguage();
+
+  // ── 0.6.99 — device-surface flag + Electron beacon identity ─────────────
+  // The TV/kiosk window announces this machine with the SAME stable uid every
+  // device surface registers with, so the manager's pairing-by-identity
+  // matches the registered row (previously the beacon carried only the
+  // lan-authority instanceId and the pairing request never reached the TV).
+  useEffect(() => {
+    setDeviceSurfaceActive(true);
+    reportDeviceSurfaceIdentity('tv');
+    return () => {
+      setDeviceSurfaceActive(false);
+      clearDeviceSurfaceIdentity();
+    };
+  }, []);
+
   // ── Layout resolution ────────────────────────────────────────────────────
   const [configLayout, setConfigLayout] = useState<TvScreenLayout | null>(null);
   const [layoutResolved, setLayoutResolved] = useState(false);

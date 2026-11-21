@@ -107,6 +107,9 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
           ssdpServer: d.ssdpServer ? String(d.ssdpServer) : undefined,
           ssdpSt: d.ssdpSt ? String(d.ssdpSt) : undefined,
           mdnsService: d.mdnsService ? String(d.mdnsService) : undefined,
+          // 0.6.99 — TCP-sweep evidence (jetdirect/googlecast/airplay/roku …)
+          // feeds the signal-backed whitelist predicate on the client.
+          tcpServices: Array.isArray(d.tcpServices) ? d.tcpServices.map(String) : undefined,
           usbVendorId: d.usbVendorId ? String(d.usbVendorId) : undefined,
           usbProductId: d.usbProductId ? String(d.usbProductId) : undefined,
           cupsUri: d.cupsUri ? String(d.cupsUri) : undefined,

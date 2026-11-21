@@ -321,6 +321,13 @@ export function KioskDiscoveryLogin({
                             {getBranchLabel(req)}
                           </p>
                         )}
+                        {/* 0.6.100 — who sent the pairing request (mandatory
+                            acceptance: the operator knows whom they accept). */}
+                        {req.sentByName && (
+                          <p className="text-xs text-emerald-600 mt-0.5 truncate">
+                            {req.sentByName}
+                          </p>
+                        )}
                         <p className="text-xs text-gray-400 mt-1 flex items-center gap-1">
                           <Clock className="h-3 w-3" />
                           {new Date(req.sentAt).toLocaleTimeString(lang === 'ar' ? 'ar-SA' : lang === 'fr' ? 'fr-FR' : 'en-US', {

@@ -42,6 +42,8 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useDiscoveryService } from '@/hooks/use-discovery-service';
+// 0.6.99 — signal-based discovery whitelist (client mirror of the server shaper)
+import { isSignalBackedDevice } from '@/lib/device-signal';
 
 import { initDeviceTypeIcons } from './types';
 import {
@@ -53,6 +55,7 @@ import {
   getScanPhaseLabelKey, PulseDot, StatusDot, timeSince, useHeartbeatTick,
 } from './types';
 import { LanMasterCard } from './lan-master-card';
+import { DeviceTreeCard } from './device-tree';
 import {
   type DeviceFormState,
   EditDeviceDialog, PairDeviceDialog, CommandDialog, ConfirmDialog,
@@ -254,14 +257,14 @@ export function DeviceManager() {
   const onlineCount = devices.filter((d) => d.status === 'ONLINE').length;
   const needsAttention = devices.filter((d) => d.status === 'OFFLINE' || d.status === 'DISABLED').length;
   const visibleDiscovered = useMemo(
-    // 0.6.92 — ROUTER results dropped (defense in depth over the API shaper).
-    // 0.6.96 — SCAN RESULT WHITELIST: the manager only shows devices it can
-    // act on — BLASTI apps (desktop/kiosk/phone), TVs and printers. Generic
-    // PCs/IoT/unknown noise never renders (parity with the server shaper).
+    // 0.6.99 — SIGNAL-BASED whitelist (user requirement): only devices that
+    // ANSWERED a discovery signal render here — BLASTI apps (beacon/mDNS/
+    // probe), TVs and printers. Generic phones/PCs/routers/IoT/unknown noise
+    // never renders, even if a stale server build leaks them through.
     () => discoveredDevices.filter(
       (d) => !dismissedIds.has(d.id)
         && d.ip !== '127.0.0.1'
-        && ['APP', 'KIOSK', 'PHONE', 'TV', 'PRINTER', 'DISPLAY'].includes(d.type),
+        && isSignalBackedDevice(d),
     ),
     [discoveredDevices, dismissedIds],
   );
@@ -598,8 +601,10 @@ export function DeviceManager() {
 
   // 0.6.96 — "Request pairing" straight from a scan-result card: a discovered
   // BLASTI card carries its self-announced fingerprint; the desktop matches
-  // (or creates) the device record and sends the pairing request. The waiting
-  // kiosk/phone auto-accepts (3s grace) or shows Accept/Reject.
+  // (or creates) the device record and sends the pairing request. 0.6.100 —
+  // the DEVICE must ACCEPT before the pairing completes (the kiosk shows
+  // Accept/Reject cards, a PC pops a native dialog / lands in the master's
+  // approval queue). This button only DELIVERS the request.
   const [pairRequestedIds, setPairRequestedIds] = useState<Set<string>>(new Set());
   const handlePairByIdentity = async (device: RealDiscoveredDevice) => {
     setBusyDeviceId(device.id);
@@ -626,10 +631,17 @@ export function DeviceManager() {
             lang,
           ));
         } else {
+          // 0.6.99 — surface the delivery channels: the request lands in this
+          // store, and may ALSO be relayed straight to the device's own API
+          // (lanOffer) or to the cloud store the device polls (cloudRelay) —
+          // cross-store delivery is what previously left kiosks waiting.
+          const viaLan = Boolean(data.delivery?.lanOffer);
+          const viaCloud = Boolean(data.delivery?.cloudRelay);
+          const channel = viaLan && viaCloud ? ' + LAN + cloud' : viaLan ? ' + LAN' : viaCloud ? ' + cloud' : '';
           toast.success(getLocalizedString(
-            'تم إرسال طلب الربط — انتظر موافقة الجهاز',
-            "Demande de jumelage envoyée — en attente de l'appareil",
-            'Pairing request sent — waiting for the device to accept',
+            `تم إرسال طلب الربط${channel ? ` (${channel})` : ''} — انتظر موافقة الجهاز`,
+            `Demande de jumelage envoyée${channel ? ` (${channel})` : ''} — en attente de l'appareil`,
+            `Pairing request sent${channel ? ` (${channel})` : ''} — waiting for the device to accept`,
             lang,
           ));
         }
@@ -665,6 +677,66 @@ export function DeviceManager() {
         setDefaultPrinterIp(device.ip || null);
       } else {
         toast.error(data.error || getLocalizedString('فشل التعيين', 'Échec', 'Failed', lang));
+      }
+    } catch {
+      toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));
+    } finally { setBusyDeviceId(null); }
+  };
+
+  // 0.6.100 — CASCADE PERIPHERAL REGISTRATION: a discovered printer that is
+  // physically attached to ANOTHER branch PC (source 'peripheral-report') is
+  // registered as a shared PRINTER device — usable by every branch device
+  // (PCs + kiosks) for tickets, receipts and invoices through the host PC's
+  // print service. Works regardless of which device launched the scan and
+  // whether it is the master or not.
+  const registeredPeripheralKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const dev of devices) {
+      if (dev.type !== 'PRINTER') continue;
+      const cfg = typeof dev.printerConfig === 'string'
+        ? (() => { try { return JSON.parse(dev.printerConfig || '{}') as Record<string, unknown>; } catch { return {}; } })()
+        : ((dev.printerConfig || {}) as Record<string, unknown>);
+      if (cfg && cfg.attachment === 'USB' && cfg.hostIp) {
+        // Match a discovered peripheral card: host ip + printer name.
+        keys.add(`host:${cfg.hostIp}|name:${dev.name}`);
+      }
+    }
+    return keys;
+  }, [devices]);
+
+  const handleRegisterPeripheral = async (device: RealDiscoveredDevice) => {
+    setBusyDeviceId(device.id);
+    try {
+      const res = await apiFetch(deviceApi('/discovery/register-peripheral'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: device.name,
+          hostIp: device.hostIp || device.ip,
+          hostPort: device.hostPort || 3080,
+          hostInstanceId: device.hostInstanceId || device.hostFingerprint || undefined,
+          hostName: device.hostName || undefined,
+          printer: {
+            name: device.name,
+            manufacturer: device.manufacturer,
+            model: device.model,
+            cupsName: device.cupsName,
+            cupsUri: device.cupsUri,
+            usbVendorId: device.usbVendorId,
+            usbProductId: device.usbProductId,
+          },
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(getLocalizedString(
+          `تم تسجيل الطابعة "${device.name}" — كل أجهزة الفرع يمكنها الطباعة عليها الآن`,
+          `Imprimante "${device.name}" enregistrée — tout le réseau peut imprimer`,
+          `Printer "${device.name}" registered — every branch device can now print to it`,
+          lang,
+        ));
+        fetchDevices(true);
+      } else {
+        toast.error(data.error || getLocalizedString('فشل تسجيل الطابعة', "Échec de l'enregistrement", 'Failed to register printer', lang));
       }
     } catch {
       toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));
@@ -998,6 +1070,9 @@ export function DeviceManager() {
         {/* ── Branch PCs / LAN master ── */}
         <LanMasterCard agencyId={agencyId} lang={lang} />
 
+        {/* ── 0.6.100 — Branch DEVICE TREE (roles + status + pending pairings) ── */}
+        <DeviceTreeCard agencyId={agencyId} lang={lang} devices={devices} />
+
         {/* ── Discovery strip ── */}
         {hasDiscoveryContent && (
           <Card className="border-dashed">
@@ -1072,11 +1147,13 @@ export function DeviceManager() {
                         connecting={connectingId === d.id}
                         connectVerified={connectResults[d.id]}
                         printingTest={printingTestId === d.id}
+                        registeredPeripheral={registeredPeripheralKeys.has(d.id)}
                         onSaveTv={() => handleSaveTv(d)}
                         onCast={() => handleCastTv(d)}
                         onPair={() => handlePairByIdentity(d)}
                         pairRequested={pairRequestedIds.has(d.id)}
                         onSavePrinter={() => handleSavePrinter(d)}
+                        onRegisterPeripheral={() => handleRegisterPeripheral(d)}
                         onTestPrinter={() => handleTestPrinter(d)}
                         onPrintTest={() => handlePrintTestPage(d)}
                         onConnect={() => handleConnectDevice(d)}
@@ -1445,7 +1522,8 @@ function DiscoveredTypeIcon({ device }: { device: RealDiscoveredDevice }) {
 function DiscoveredCard({
   device, lang, busy, tvSaved, isDefaultPrinter,
   connecting, connectVerified, printingTest, pairRequested,
-  onSaveTv, onCast, onPair, onSavePrinter, onTestPrinter, onPrintTest, onConnect, onDismiss,
+  registeredPeripheral,
+  onSaveTv, onCast, onPair, onSavePrinter, onRegisterPeripheral, onTestPrinter, onPrintTest, onConnect, onDismiss,
 }: {
   device: RealDiscoveredDevice;
   lang: string;
@@ -1457,11 +1535,15 @@ function DiscoveredCard({
   printingTest: boolean;
   /** 0.6.96 — pairing request already sent from this card. */
   pairRequested?: boolean;
+  /** 0.6.100 — this USB peripheral printer is already registered. */
+  registeredPeripheral?: boolean;
   onSaveTv: () => void;
   onCast: () => void;
   /** 0.6.96 — request pairing from a discovered BLASTI card. */
   onPair: () => void;
   onSavePrinter: () => void;
+  /** 0.6.100 — register a host-attached USB printer as a shared branch printer. */
+  onRegisterPeripheral: () => void;
   onTestPrinter: () => void;
   onPrintTest: () => void;
   onConnect: () => void;
@@ -1469,6 +1551,7 @@ function DiscoveredCard({
 }) {
   const isTv = device.type === 'TV';
   const isPrinter = device.type === 'PRINTER';
+  const isPeripheralPrinter = isPrinter && device.source === 'peripheral-report';
   const isConnectable = !!device.ip && (device.port ?? 0) > 0 && device.connectionType !== 'USB'
     // 0.6.92 — ROUTER removed: the gateway is never a connectable peer.
     // PORT > 0 required: a BLASTI phone announcing itself via the UDP pairing
@@ -1529,6 +1612,12 @@ function DiscoveredCard({
               {device.platform}
             </span>
           )}
+          {/* 0.6.100 — CASCADE PERIPHERAL chip: this printer hangs off another PC */}
+          {isPeripheralPrinter && (
+            <span className="rounded-full bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400 px-1.5 py-px text-[9px]" dir="ltr">
+              USB · {getLocalizedString('عبر', 'via', 'via', lang)} {device.hostName || device.hostIp || device.ip}
+            </span>
+          )}
           {typeof confidence === 'number' && (
             <span className={`rounded-full px-1.5 py-px text-[9px] ${
               confidence >= 85
@@ -1579,15 +1668,34 @@ function DiscoveredCard({
         )}
         {isPrinter && (
           <>
-            {!isDefaultPrinter && (
+            {/* 0.6.100 — REGISTER a host-attached USB printer (shared printing) */}
+            {isPeripheralPrinter && !registeredPeripheral && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1 text-xs border-sky-300/60 text-sky-700 hover:bg-sky-50 dark:border-sky-900/50 dark:text-sky-400 dark:hover:bg-sky-950/30"
+                onClick={onRegisterPeripheral}
+              >
+                <Usb className="h-3 w-3" />
+                {getLocalizedString('تسجيل', 'Enregistrer', 'Register', lang)}
+              </Button>
+            )}
+            {registeredPeripheral && (
+              <span className="rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 px-1.5 py-px text-[9px]">
+                {getLocalizedString('مسجّلة ✓', 'Enregistrée ✓', 'Registered ✓', lang)}
+              </span>
+            )}
+            {!isPeripheralPrinter && !isDefaultPrinter && (
               <Button variant="outline" size="sm" className="h-7 text-xs" onClick={onSavePrinter}>
                 {getLocalizedString('تعيين', 'Définir', 'Set', lang)}
               </Button>
             )}
-            <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={onTestPrinter}>
-              {getLocalizedString('اختبار', 'Tester', 'Test', lang)}
-            </Button>
-            {device.ip && (
+            {!isPeripheralPrinter && (
+              <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={onTestPrinter}>
+                {getLocalizedString('اختبار', 'Tester', 'Test', lang)}
+              </Button>
+            )}
+            {!isPeripheralPrinter && device.ip && (
               <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={onPrintTest} disabled={printingTest} title="ESC/POS">
                 {printingTest ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
                 {getLocalizedString('صفحة اختبار', 'page test', 'test page', lang)}

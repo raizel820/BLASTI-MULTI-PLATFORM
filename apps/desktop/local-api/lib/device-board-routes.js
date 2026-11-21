@@ -719,6 +719,215 @@ function registerDeviceBoardRoutes(app, ctx) {
     }
   })
 
+  // ─── POST /public/pairing-offer — LAN DIRECT pairing delivery (0.6.99) ────
+  // THE missing half of "pairing request is not reaching to the kiosk device":
+  // a kiosk shell (BLASTI app in kiosk mode on its own PC) polls ITS OWN local
+  // API, but the manager's pairing request used to be written ONLY to the
+  // MANAGER's store — two databases, zero delivery. The manager's local API
+  // now ALSO posts the offer straight to the discovered device's HTTP API
+  // (this route), which lands the PAIRING_REQUEST command in the store the
+  // kiosk actually polls.
+  // 0.6.100 — MANDATORY ACCEPTANCE:
+  //   • The command payload now carries the manager-minted deviceToken — the
+  //     device ADOPTS it on accept, so the manager store and the device share
+  //     ONE token (this is what lets print jobs forward to the host PC later).
+  //   • A DESKTOP target (body.deviceType 'desktop'/'pc') that never created a
+  //     kiosk orphan gets one here, and ctx.onPairingOffer fires a NATIVE
+  //     Accept/Reject dialog on THIS machine — the PC operator must accept
+  //     before the pairing completes. Kiosk targets keep the on-screen
+  //     Accept/Reject cards (the 0.6.95 auto-accept is REMOVED).
+  //   target row match order:
+  //     1. deviceFingerprint === body.fingerprint (current builds)
+  //     2. newest unpaired PAIRING orphan (legacy beacons without uid)
+  //     3. desktop shell → create the orphan on the spot
+  // Public (device-surface route, like discover-register) — the offer only
+  // CREATES a request; the device still has to accept it. Rate-limited per IP.
+  const pairingOfferHits = new Map()
+  const PAIRING_OFFER_LIMIT = 12
+  const PAIRING_OFFER_WINDOW_MS = 60_000
+
+  app.post('/api/agency-devices/public/pairing-offer', async (c) => {
+    const db = getDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      // ── Per-IP rate limit (simple, in-memory) ──
+      const clientIp = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
+        || c.req.header('x-real-ip')
+        || 'lan'
+      const now = Date.now()
+      const entry = pairingOfferHits.get(clientIp) || { count: 0, windowStart: now }
+      if (now - entry.windowStart > PAIRING_OFFER_WINDOW_MS) {
+        entry.count = 0
+        entry.windowStart = now
+      }
+      entry.count += 1
+      pairingOfferHits.set(clientIp, entry)
+      if (entry.count > PAIRING_OFFER_LIMIT) {
+        return c.json({ success: false, error: 'Too many pairing offers — slow down' }, 429)
+      }
+
+      const body = await c.req.json().catch(() => ({}))
+      const fingerprint = typeof body.fingerprint === 'string' && body.fingerprint
+        ? body.fingerprint.slice(0, 200)
+        : ''
+      const agencyName = typeof body.agencyName === 'string' && body.agencyName.trim()
+        ? body.agencyName.trim().slice(0, 100)
+        : ''
+      if (!agencyName) {
+        return c.json({ success: false, error: 'agencyName is required' }, 400)
+      }
+
+      // ── Find the target device row on THIS machine's store ──
+      let device = null
+      if (fingerprint) {
+        try {
+          device = await db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } })
+        } catch { /* non-fatal */ }
+      }
+      if (!device) {
+        // Legacy fallback: the newest unpaired orphan heartbeat (≤90s) — the
+        // device that is currently WAITING on this machine.
+        try {
+          const ninetySecAgo = new Date(now - 90 * 1000)
+          device = await db.agencyDevice.findFirst({
+            where: { agencyId: null, status: 'PAIRING', lastHeartbeatAt: { gte: ninetySecAgo } },
+            orderBy: { lastHeartbeatAt: 'desc' },
+          })
+        } catch { /* non-fatal */ }
+      }
+      const offerDeviceType = typeof body.deviceType === 'string' ? body.deviceType.toLowerCase() : ''
+      const isDesktopTarget = offerDeviceType === 'desktop' || offerDeviceType === 'pc'
+      if (!device && isDesktopTarget) {
+        // 0.6.100 — DESKTOP SHELL TARGET: a PC running the BLASTI desktop app
+        // has no kiosk orphan, so the match above 404s and the pairing request
+        // never reached it. Create the shell's row here (the desktop's own
+        // fingerprint rides the offer) — then the native dialog asks the
+        // operator to accept.
+        try {
+          device = await db.agencyDevice.create({
+            data: {
+              name: typeof body.deviceName === 'string' && body.deviceName.trim()
+                ? body.deviceName.trim().slice(0, 100)
+                : 'BLASTI Desktop',
+              type: 'APP',
+              status: 'PAIRING',
+              connectionType: 'LAN',
+              deviceToken: typeof body.deviceToken === 'string' && /^[0-9a-f]{64}$/i.test(body.deviceToken)
+                ? body.deviceToken
+                : crypto.randomBytes(32).toString('hex'),
+              deviceFingerprint: fingerprint || null,
+              offlineCapable: true,
+              autoDiscovery: true,
+              lastHeartbeatAt: new Date(),
+            },
+          })
+        } catch (createErr) {
+          log('pairing-offer desktop orphan create failed:', errorMessage(createErr))
+        }
+      }
+      if (!device) {
+        return c.json({ success: false, error: 'No waiting device found on this machine' }, 404)
+      }
+      if (device.agencyId) {
+        return c.json({ success: false, error: 'Device is already paired' }, 409)
+      }
+
+      // ── Land the PAIRING_REQUEST in the store the kiosk POLLS ──
+      // 0.6.100 — the manager's token rides the payload: when the row has no
+      // token yet it is adopted NOW (single canonical token across stores);
+      // the device also receives it in the device-status payload so it uses
+      // the same id after accept.
+      const managerToken = typeof body.deviceToken === 'string' && /^[0-9a-f]{64}$/i.test(body.deviceToken)
+        ? body.deviceToken
+        : null
+      if (managerToken && !device.deviceToken) {
+        try {
+          await db.agencyDevice.update({ where: { id: device.id }, data: { deviceToken: managerToken } })
+          device.deviceToken = managerToken
+        } catch { /* non-fatal */ }
+      }
+      const command = await db.deviceCommand.create({
+        data: {
+          deviceId: device.id,
+          type: 'PAIRING_REQUEST',
+          payload: JSON.stringify({
+            agencyId: typeof body.agencyId === 'string' ? body.agencyId : undefined,
+            agencyName,
+            agencyNameAr: typeof body.agencyNameAr === 'string' ? body.agencyNameAr : undefined,
+            agencyNameFr: typeof body.agencyNameFr === 'string' ? body.agencyNameFr : undefined,
+            branchId: typeof body.branchId === 'string' ? body.branchId : undefined,
+            branchName: typeof body.branchName === 'string' ? body.branchName : undefined,
+            customCode: typeof body.customCode === 'string' ? body.customCode : undefined,
+            sentByName: typeof body.sentByName === 'string' ? body.sentByName.slice(0, 100) : undefined,
+            deviceToken: managerToken || device.deviceToken || undefined,
+            source: 'lan-offer',
+          }),
+          status: 'PENDING',
+          ttl: 600,
+        },
+      })
+
+      // Refresh the orphan's presence so the unpaired strip stays accurate.
+      try {
+        await db.agencyDevice.update({
+          where: { id: device.id },
+          data: {
+            lastHeartbeatAt: new Date(),
+            ...(body.managerIp ? { ipAddress: String(body.managerIp).slice(0, 50) } : {}),
+          },
+        })
+      } catch { /* non-fatal */ }
+
+      try {
+        broadcast('agency-device:pairing-request', {
+          agencyId: body.agencyId || undefined,
+          deviceId: device.id,
+          deviceName: device.name,
+          commandId: command.id,
+          agencyName,
+        })
+      } catch { /* non-fatal */ }
+
+      try {
+        require('./device-event').deviceEvent(
+          'pairing_requested',
+          `Pairing offer (LAN direct) delivered to ${device.name || device.id} from ${agencyName}`,
+          { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyName, sessionId: command.id, source: 'lan-offer' },
+        )
+      } catch { /* never block */ }
+
+      // 0.6.100 — DESKTOP TARGET: pop the native Accept/Reject dialog. The PC
+      // operator must accept BEFORE the pairing completes (mandatory
+      // acceptance). Kiosk targets keep their on-screen approval cards.
+      if (isDesktopTarget && typeof ctx.onPairingOffer === 'function') {
+        try {
+          ctx.onPairingOffer({
+            deviceId: device.id,
+            deviceName: device.name,
+            commandId: command.id,
+            agencyId: typeof body.agencyId === 'string' ? body.agencyId : null,
+            branchId: typeof body.branchId === 'string' ? body.branchId : null,
+            agencyName,
+            sentByName: typeof body.sentByName === 'string' ? body.sentByName : '',
+          })
+        } catch { /* dialog must never break the offer */ }
+      }
+
+      return c.json({
+        success: true,
+        delivered: true,
+        needsApproval: true,
+        deviceId: device.id,
+        commandId: command.id,
+        matchedBy: fingerprint && device.deviceFingerprint === fingerprint ? 'fingerprint' : isDesktopTarget && device.deviceFingerprint === fingerprint ? 'desktop-shell' : 'newest-orphan',
+        message: `Pairing offer delivered to ${device.name || 'device'} — the device must accept it`,
+      })
+    } catch (err) {
+      log('pairing-offer failed:', errorMessage(err))
+      return c.json({ success: false, error: errorMessage(err) }, 500)
+    }
+  })
+
   // ─── GET /public/device-status — poll status + pending pairing requests ───
   app.get('/api/agency-devices/public/device-status', async (c) => {
     const db = getDb()
@@ -746,6 +955,10 @@ function registerDeviceBoardRoutes(app, ctx) {
             agencyNameFr: payload.agencyNameFr,
             branchId: payload.branchId,
             branchName: payload.branchName,
+            sentByName: payload.sentByName,
+            // 0.6.100 — the manager-issued token the device adopts on accept
+            // (single canonical token across the manager store and this one).
+            deviceToken: payload.deviceToken,
             sentAt: cmd.createdAt,
           }
         })
@@ -1376,7 +1589,214 @@ function registerDeviceBoardRoutes(app, ctx) {
     }
   })
 
-  log('device board routes registered (public/*, device/*, discovery/probe)')
+  // ═════════════════════════════════════════════════════════════════════════
+  // 0.6.100 — HOST PRINT SERVICE (cascade peripherals / shared printer)
+  // ═════════════════════════════════════════════════════════════════════════
+  // A USB printer attached to THIS PC is usable by EVERY branch device: any
+  // kiosk / PC / manager sends its ticket here (directly or forwarded by the
+  // manager's store through POST /discovery/print) and THIS machine — the one
+  // with the physical USB link — does the OS printing.
+  //
+  // Auth: any registered device token (the caller device), the master's LAN
+  // token (blan-…), or the local session token — a kiosk paired on another
+  // store reaches this endpoint only through its manager's forward, which
+  // authenticates with the HOST's adopted token.
+  //
+  // Strategies (first match wins):
+  //   1. escposBase64 + CUPS queue  → raw ESC/POS via `lp -d <queue> -o raw`
+  //      (thermal receipts keep their exact formatting: QR + cut).
+  //   2. ticket JSON → HTML receipt rendered in a hidden Electron window and
+  //      silently printed to the named printer (cross-platform default).
+  const hostPrintLimiter = new Map()
+  const HOST_PRINT_LIMIT = 30
+  const HOST_PRINT_WINDOW_MS = 60_000
+
+  function hostPrintLimiterCheck(ip) {
+    const now = Date.now()
+    const entry = hostPrintLimiter.get(ip) || { count: 0, windowStart: now }
+    if (now - entry.windowStart > HOST_PRINT_WINDOW_MS) { entry.count = 0; entry.windowStart = now }
+    entry.count += 1
+    hostPrintLimiter.set(ip, entry)
+    return entry.count <= HOST_PRINT_LIMIT
+  }
+
+  /** Escape a string for HTML receipt rendering. */
+  function escHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+  }
+
+  /** 80mm receipt HTML — mirrors the kiosk browser fallback styling. */
+  function buildReceiptHtml(ticket) {
+    const lines = Array.isArray(ticket.lines) ? ticket.lines.slice(0, 40) : []
+    const lineRows = lines.map((l) => {
+      const left = typeof l === 'string' ? l : String(l.left || '')
+      const right = typeof l === 'object' && l && l.right != null ? String(l.right) : ''
+      return `<div class="row"><span>${escHtml(left)}</span><span>${escHtml(right)}</span></div>`
+    }).join('')
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+      @page { margin: 4mm; }
+      body { font-family: 'Courier New', monospace; width: 72mm; margin: 0; padding: 0; color: #000; }
+      .center { text-align: center; }
+      .title { font-size: 15px; font-weight: 700; margin: 4px 0 2px; }
+      .sub { font-size: 11px; margin: 1px 0; }
+      .num { font-size: 42px; font-weight: 700; letter-spacing: 2px; margin: 10px 0 6px; }
+      .row { display: flex; justify-content: space-between; font-size: 11px; margin: 1px 0; }
+      .sep { border-top: 1px dashed #000; margin: 6px 0; }
+      .footer { text-align: center; font-size: 10px; margin-top: 8px; letter-spacing: 3px; }
+    </style></head><body>
+      <div class="center title">${escHtml(ticket.agencyName || 'BLASTI')}</div>
+      ${ticket.branchName ? `<div class="center sub">${escHtml(ticket.branchName)}</div>` : ''}
+      <div class="sep"></div>
+      ${ticket.serviceName ? `<div class="center sub">${escHtml(ticket.serviceName)}</div>` : ''}
+      <div class="center num">${escHtml(ticket.ticketNumber || '—')}</div>
+      <div class="sep"></div>
+      ${lineRows}
+      <div class="sep"></div>
+      ${ticket.qrData ? `<div class="center"><img src="https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(ticket.qrData)}" width="120" height="120" alt="QR" /></div>` : ''}
+      <div class="footer">${escHtml(ticket.footer || 'BLASTI')}</div>
+    </body></html>`
+  }
+
+  /** Print HTML via a hidden Electron window (silent, named printer). */
+  async function printHtmlSilent(html, deviceName) {
+    const { BrowserWindow } = require('electron')
+    const win = new BrowserWindow({
+      show: false,
+      webPreferences: { offscreen: true, sandbox: true },
+    })
+    try {
+      await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
+      const printers = await win.webContents.getPrintersAsync().catch(() => [])
+      if (Array.isArray(printers) && printers.length === 0) {
+        return { ok: false, error: 'No printers available on this system' }
+      }
+      if (deviceName && Array.isArray(printers) && printers.length > 0 && !printers.some((p) => p.name === deviceName)) {
+        return { ok: false, error: `Printer "${deviceName}" not found on this system` }
+      }
+      return await new Promise((resolve) => {
+        win.webContents.print(
+          { silent: true, printBackground: true, ...(deviceName ? { deviceName } : {}), margins: { marginType: 'none' } },
+          (success, errorType) => resolve(success ? { ok: true } : { ok: false, error: errorType || 'print failed' }),
+        )
+      })
+    } catch (err) {
+      return { ok: false, error: errorMessage(err) }
+    } finally {
+      try { win.destroy() } catch { /* already gone */ }
+    }
+  }
+
+  /** Raw ESC/POS through CUPS (`lp -o raw`) — Linux / macOS hosts. */
+  function printEscposRaw(buffer, cupsName) {
+    const { spawnSync } = require('child_process')
+    const os = require('os')
+    const fs = require('fs')
+    const path = require('path')
+    const tmp = path.join(os.tmpdir(), `blasti-print-${Date.now()}-${Math.floor(Math.random() * 1e6)}.bin`)
+    try {
+      fs.writeFileSync(tmp, buffer)
+      const res = spawnSync('lp', ['-d', String(cupsName).slice(0, 120), '-o', 'raw', tmp], { timeout: 15_000 })
+      if (res.status === 0) return { ok: true, via: 'cups-raw' }
+      return { ok: false, error: (res.stderr && res.stderr.toString().slice(0, 200)) || 'lp failed' }
+    } catch (err) {
+      return { ok: false, error: errorMessage(err) }
+    } finally {
+      try { fs.unlinkSync(tmp) } catch { /* ignore */ }
+    }
+  }
+
+  // GET /api/agency-devices/host/printers — the OS printers of THIS machine
+  // (the manager uses it to pick a target for a USB-attached printer).
+  app.get('/api/agency-devices/host/printers', async (c) => {
+    const token = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Device-Token') || ''
+    const isLocalCaller = !!(ctx.sessionToken && token && token === ctx.sessionToken)
+    const db = getDb()
+    let isDeviceCaller = false
+    if (db && token) {
+      try { isDeviceCaller = !!(await db.agencyDevice.findFirst({ where: { deviceToken: token } })) } catch { /* not a device */ }
+    }
+    if (!isDeviceCaller) {
+      try { isDeviceCaller = !!require('./lib/lan-authority').verifyDeviceToken(token) } catch { /* not a lan token */ }
+    }
+    if (!isLocalCaller && !isDeviceCaller) {
+      return c.json({ success: false, error: 'Device or session token required' }, 401)
+    }
+    try {
+      const scanner = require('./lib/discovery-scanner')
+      const printers = typeof scanner.getLocalPeripheralsCached === 'function' ? scanner.getLocalPeripheralsCached() : []
+      return c.json({ success: true, host: { platform: process.platform }, printers })
+    } catch (err) {
+      return c.json({ success: false, error: errorMessage(err) }, 500)
+    }
+  })
+
+  // POST /api/agency-devices/host/print-job — print a ticket/receipt/invoice
+  // on THIS machine's printer. Body: { printerName?, cupsName?, ticket?, escposBase64? }
+  app.post('/api/agency-devices/host/print-job', async (c) => {
+    const clientIp = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || c.req.header('x-real-ip') || 'lan'
+    if (!hostPrintLimiterCheck(clientIp)) {
+      return c.json({ success: false, error: 'Too many print jobs — slow down' }, 429)
+    }
+    const bearer = c.req.header('Authorization')?.replace('Bearer ', '') || ''
+    const deviceHeader = c.req.header('X-Device-Token') || ''
+    const token = bearer || deviceHeader
+    const db = getDb()
+    let isDeviceCaller = false
+    if (db && token) {
+      try { isDeviceCaller = !!(await db.agencyDevice.findFirst({ where: { deviceToken: token } })) } catch { /* not a device */ }
+    }
+    if (!isDeviceCaller) {
+      try { isDeviceCaller = !!require('./lib/lan-authority').verifyDeviceToken(token) } catch { /* not a lan token */ }
+    }
+    if (!isDeviceCaller && !!(ctx.sessionToken && token === ctx.sessionToken)) isDeviceCaller = true
+    if (!isDeviceCaller) {
+      return c.json({ success: false, error: 'Device or session token required' }, 401)
+    }
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const printerName = typeof body.printerName === 'string' && body.printerName.trim() ? body.printerName.trim().slice(0, 120) : ''
+      const cupsName = typeof body.cupsName === 'string' && body.cupsName.trim() ? body.cupsName.trim().slice(0, 120) : printerName
+      const escposBase64 = typeof body.escposBase64 === 'string' ? body.escposBase64 : ''
+      const ticket = body.ticket && typeof body.ticket === 'object' ? body.ticket : null
+
+      // 1) Raw ESC/POS when the caller provides the buffer AND a CUPS queue.
+      if (escposBase64 && cupsName && process.platform !== 'win32') {
+        try {
+          const buf = Buffer.from(escposBase64, 'base64')
+          if (buf.length > 0 && buf.length < 1_000_000) {
+            const res = printEscposRaw(buf, cupsName)
+            if (res.ok) {
+              try { require('./device-event').deviceEvent('print_job_done', `Raw ESC/POS print via ${cupsName}`, { deviceType: 'PRINTER', status: 'OK', source: 'host-print-job' }) } catch { /* log only */ }
+              return c.json({ success: true, via: res.via })
+            }
+            log('host print-job lp failed:', res.error, '— falling back to HTML print')
+          }
+        } catch { /* fall through to HTML print */ }
+      }
+
+      // 2) HTML receipt via Electron silent print (cross-platform).
+      if (ticket && (ticket.ticketNumber || ticket.agencyName)) {
+        const html = buildReceiptHtml(ticket)
+        const res = await printHtmlSilent(html, printerName || undefined)
+        try {
+          require('./device-event').deviceEvent(res.ok ? 'print_job_done' : 'print_job_failed',
+            res.ok ? `Ticket ${ticket.ticketNumber || ''} printed on ${printerName || 'default printer'}` : `Host print failed: ${res.error}`,
+            { deviceType: 'PRINTER', status: res.ok ? 'OK' : 'FAILED', source: 'host-print-job', deviceName: printerName || undefined })
+        } catch { /* log only */ }
+        if (res.ok) return c.json({ success: true, via: 'electron-silent' })
+        return c.json({ success: false, error: res.error }, 500)
+      }
+
+      return c.json({ success: false, error: 'Nothing to print — provide ticket or escposBase64' }, 400)
+    } catch (err) {
+      log('host print-job failed:', errorMessage(err))
+      return c.json({ success: false, error: errorMessage(err) }, 500)
+    }
+  })
+
+  log('device board routes registered (public/*, device/*, discovery/probe, host/print-*)')
 }
 
 module.exports = { registerDeviceBoardRoutes }

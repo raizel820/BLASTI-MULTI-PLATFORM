@@ -51,6 +51,12 @@ const PROBE_TIMEOUT_MS = 2_000
 const DEVICE_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days, renewable
 const MAX_DEVICES = 50
 const MAX_PEERS = 20
+// 0.6.100 — devices must ACCEPT before they join the master. An unknown
+// device's join lands as a PENDING request (this TTL), and the master's
+// operator (native dialog, local route or the cloud Device Manager relay)
+// approves it before the next join attempt is granted.
+const JOIN_REQUEST_TTL_MS = 10 * 60 * 1000
+const MAX_JOIN_REQUESTS = 50
 
 // ─── Module state ────────────────────────────────────────────────────────────
 
@@ -74,6 +80,12 @@ const state = {
   broadcast: null,           // (event, payload) => void — local realtime
   secret: null,              // HMAC secret for device tokens (persisted)
   devices: [],               // joined-device registry (persisted)
+  // 0.6.100 — PENDING join requests (devices that must accept/approve before
+  // they are granted a lanToken). Persisted in _sync_meta, reported to the
+  // cloud via the lan-status reporter so the Device Manager can approve from
+  // ANY device (the verdict rides back on the reporter's preference pull).
+  joinRequests: [],
+  onJoinRequest: null,       // (req) => void — native dialog hook (index.js)
   // r21-9 — the OWNER's manual master pick (instanceId). Cloud-pinned via the
   // lan-status reporter, or set locally through POST /api/lan/preferred-master.
   // Persisted in _sync_meta so it survives restarts AND offline periods.
@@ -275,6 +287,27 @@ async function persistDevices() {
   } catch { /* non-fatal */ }
 }
 
+async function persistJoinRequests() {
+  try {
+    if (state.metaSet) await state.metaSet('lan_authority_join_requests', JSON.stringify(state.joinRequests.slice(-MAX_JOIN_REQUESTS)))
+  } catch { /* non-fatal */ }
+}
+
+/** Drop expired + decided requests (PENDING survives the TTL window only). */
+function pruneJoinRequests() {
+  const cutoff = Date.now() - JOIN_REQUEST_TTL_MS
+  state.joinRequests = state.joinRequests.filter((r) => {
+    const ts = Date.parse(r.requestedAt || '') || 0
+    if (r.status === 'PENDING') return ts >= cutoff
+    // Decided requests linger briefly so the joining device learns the verdict.
+    return ts >= cutoff - JOIN_REQUEST_TTL_MS
+  })
+}
+
+function findJoinRequest(deviceId) {
+  return state.joinRequests.find((r) => r.deviceId === deviceId) || null
+}
+
 // ─── Device tokens (user answer 3: per-device tokens) ────────────────────────
 
 function deviceHmac(payload) {
@@ -437,14 +470,57 @@ async function joinHandler(body, bearerToken) {
       log(`JOIN DENIED scope branch caller=${callerBranchId} master=${scope.branchId} device=${body.deviceName || '?'}`)
       return { status: 403, body: { success: false, code: 'LAN_SCOPE_MISMATCH', error: 'Device belongs to a different branch' } }
     }
-    // Register / refresh the device, mint its token.
+    // ── 0.6.100 — MANDATORY ACCEPTANCE (user requirement: "pairing request
+    // must reach the kiosk device or other pc and they must accept before
+    // pairing and connecting devices") ──
+    // A device already in the approved registry rejoins silently (reconnect —
+    // no prompt spam). A NEW device gets a PENDING join request: the master's
+    // operator accepts (native dialog / local route / cloud verdict relay)
+    // before the next join attempt is granted. 202 tells the client to wait.
     const deviceId = String(body.deviceFingerprint || randomBytes(12).toString('hex')).slice(0, 64)
-    let rec = state.devices.find((d) => d.deviceId === deviceId)
-    if (!rec) {
-      rec = { deviceId }
-      state.devices.push(rec)
-      if (state.devices.length > MAX_DEVICES) state.devices.shift()
+    pruneJoinRequests()
+    const knownRec = state.devices.find((d) => d.deviceId === deviceId)
+    if (!knownRec) {
+      const existingReq = findJoinRequest(deviceId)
+      if (existingReq && existingReq.status === 'REJECTED') {
+        log(`JOIN DENIED rejected-by-operator device=${existingReq.name || deviceId}`)
+        return { status: 403, body: { success: false, code: 'LAN_JOIN_REJECTED', error: 'The master operator rejected this pairing request' } }
+      }
+      if (!existingReq || existingReq.status !== 'PENDING') {
+        const req = {
+          deviceId,
+          name: String(body.deviceName || 'device').slice(0, 80),
+          platform: String(body.platform || 'web').slice(0, 16),
+          role: String(body.role || validatedUser.role || '').slice(0, 24) || null,
+          username: validatedUser.username || null,
+          userId: validatedUser.id || null,
+          agencyId: callerAgencyId,
+          branchId: callerBranchId,
+          requestedAt: nowIso(),
+          status: 'PENDING',
+        }
+        state.joinRequests.push(req)
+        if (state.joinRequests.length > MAX_JOIN_REQUESTS) state.joinRequests.shift()
+        await persistJoinRequests()
+        log(`JOIN PENDING device=${req.name} platform=${req.platform} — awaiting operator approval`)
+        try {
+          state.broadcast && state.broadcast('lan:join-request', { ...req, master: masterHint() })
+        } catch { /* non-fatal */ }
+        try { state.onJoinRequest && state.onJoinRequest(req) } catch { /* dialog must not break the join */ }
+      }
+      return {
+        status: 202,
+        body: {
+          success: true,
+          pending: true,
+          code: 'LAN_JOIN_PENDING',
+          requestId: deviceId,
+          master: masterHint(),
+          message: 'Pairing request delivered — the master operator must accept it',
+        },
+      }
     }
+    let rec = knownRec
     Object.assign(rec, {
       name: String(body.deviceName || 'device').slice(0, 80),
       platform: String(body.platform || 'web').slice(0, 16),
@@ -848,6 +924,7 @@ function followerWriteGate(method, pathname) {
 
 /** LAN status for /api/lan/status + the cloud reporter (r21-9). */
 function statusSnapshot() {
+  pruneJoinRequests()
   return {
     role: state.role,
     term: state.term,
@@ -858,6 +935,17 @@ function statusSnapshot() {
     master: masterHint(),
     startedAt: state.claimedAt,
     deviceCount: state.role === 'MASTER' ? state.devices.length : undefined,
+    // 0.6.100 — pending join requests ride the same snapshot → cloud report
+    joinRequests: state.role === 'MASTER'
+      ? state.joinRequests.filter((r) => r.status === 'PENDING').map((r) => ({
+          deviceId: r.deviceId,
+          name: r.name,
+          platform: r.platform,
+          role: r.role,
+          username: r.username,
+          requestedAt: r.requestedAt,
+        }))
+      : [],
     // r21-9 — identity + manual-master fields for the topology report/panel
     name: state.identity.name || state.identity.hostname || os.hostname(),
     hostname: state.identity.hostname || os.hostname(),
@@ -876,6 +964,96 @@ function statusSnapshot() {
         }))
       : [],
   }
+}
+
+/**
+ * 0.6.100 — register the native "incoming pairing request" hook. index.js
+ * passes a callback that shows the Electron Accept/Reject dialog on the
+ * MASTER machine whenever an unknown device asks to join.
+ */
+function setJoinRequestNotifier(cb) {
+  state.onJoinRequest = typeof cb === 'function' ? cb : null
+}
+
+/** Pending join requests (pruned). Local route + reporter use this. */
+function listJoinRequests() {
+  pruneJoinRequests()
+  return state.joinRequests.slice().reverse()
+}
+
+/**
+ * Approve a pending join request: the device moves into the approved registry
+ * (with the access/authority recorded at request time) so its NEXT join
+ * attempt is granted a lanToken at once.
+ */
+async function approveJoinRequest(deviceId) {
+  pruneJoinRequests()
+  const req = findJoinRequest(deviceId)
+  if (!req || req.status !== 'PENDING') return { ok: false, error: 'Join request not found or already processed' }
+  req.status = 'ACCEPTED'
+  let rec = state.devices.find((d) => d.deviceId === deviceId)
+  if (!rec) {
+    rec = { deviceId }
+    state.devices.push(rec)
+    if (state.devices.length > MAX_DEVICES) state.devices.shift()
+  }
+  Object.assign(rec, {
+    name: req.name,
+    platform: req.platform,
+    agencyId: req.agencyId,
+    branchId: req.branchId,
+    role: req.role,
+    userId: req.userId,
+    username: req.username,
+    joinedAt: rec.joinedAt || nowIso(),
+    lastSeenAt: nowIso(),
+    expiresAt: new Date(Date.now() + DEVICE_TOKEN_TTL_MS).toISOString(),
+  })
+  await persistDevices()
+  await persistJoinRequests()
+  log(`JOIN APPROVED device=${req.name} — token granted on next join attempt`)
+  try {
+    state.broadcast && state.broadcast('lan:join-approved', { deviceId, name: req.name })
+  } catch { /* non-fatal */ }
+  return { ok: true }
+}
+
+/** Reject a pending join request — the joining device gets 403 on retry. */
+async function rejectJoinRequest(deviceId) {
+  pruneJoinRequests()
+  const req = findJoinRequest(deviceId)
+  if (!req || req.status !== 'PENDING') return { ok: false, error: 'Join request not found or already processed' }
+  req.status = 'REJECTED'
+  await persistJoinRequests()
+  log(`JOIN REJECTED device=${req.name || deviceId}`)
+  try {
+    state.broadcast && state.broadcast('lan:join-rejected', { deviceId, name: req.name })
+  } catch { /* non-fatal */ }
+  return { ok: true }
+}
+
+/**
+ * 0.6.100 — apply join verdicts relayed through the cloud (the owner approved
+ * from the web Device Manager on ANOTHER device). Shape: [{ deviceId, verdict
+ *: 'ACCEPT'|'REJECT' }]. Already-decided local requests are left alone.
+ */
+async function applyJoinVerdicts(verdicts) {
+  if (!Array.isArray(verdicts)) return 0
+  let applied = 0
+  for (const v of verdicts.slice(0, 100)) {
+    if (!v || typeof v.deviceId !== 'string') continue
+    const req = findJoinRequest(v.deviceId)
+    if (!req || req.status !== 'PENDING') continue
+    if (String(v.verdict).toUpperCase() === 'ACCEPT') {
+      const res = await approveJoinRequest(v.deviceId)
+      if (res.ok) applied += 1
+    } else if (String(v.verdict).toUpperCase() === 'REJECT') {
+      const res = await rejectJoinRequest(v.deviceId)
+      if (res.ok) applied += 1
+    }
+  }
+  if (applied > 0) log(`JOIN VERDICTS applied from cloud: ${applied}`)
+  return applied
 }
 
 /**
@@ -912,8 +1090,15 @@ async function initAuthority(opts) {
       // r21-9 — resume the owner's manual master pick across restarts.
       const pref = await state.metaGet('lan_authority_preferred_master')
       if (pref) state.preferredMasterInstanceId = pref
+      // 0.6.100 — resume pending join requests across restarts.
+      const jrRaw = await state.metaGet('lan_authority_join_requests')
+      if (jrRaw) {
+        const parsedJr = JSON.parse(jrRaw)
+        if (Array.isArray(parsedJr)) state.joinRequests = parsedJr.slice(-MAX_JOIN_REQUESTS)
+      }
     }
   } catch { /* defaults hold */ }
+  pruneJoinRequests()
   if (!state.secret) {
     state.secret = randomBytes(32).toString('hex')
     try { if (state.metaSet) await state.metaSet('lan_authority_secret', state.secret) } catch { /* regenerates */ }
@@ -965,6 +1150,12 @@ module.exports = {
   setPreferredMaster,
   getPreferredMasterInstanceId,
   isPreferredMaster,
+  // 0.6.100 — mandatory join approval (devices must accept before pairing)
+  setJoinRequestNotifier,
+  listJoinRequests,
+  approveJoinRequest,
+  rejectJoinRequest,
+  applyJoinVerdicts,
   // 0.6.96 — live BLASTI beacon registry (phones + desktop shells)
   onBlastiBeacon,
   getLiveBlastiBeacons,

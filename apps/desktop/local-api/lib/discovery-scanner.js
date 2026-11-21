@@ -3327,6 +3327,77 @@ function fingerprintDevice(input) {
   return { ...cls, confidence, identitySource }
 }
 
+// ─── 0.6.99 — SIGNAL-BACKED DEVICE WHITELIST ─────────────────────────────────
+
+/**
+ * USER REQUIREMENT (0.6.99): "device manager discovery should discover ONLY
+ * devices with the BLASTI app running on them (by responding to the app
+ * signal) or TVs, printers and kiosk mode on the BLASTI app (responding to
+ * the signal)".
+ *
+ * 1:1 CommonJS port of isSignalBackedDevice() in
+ * apps/api/src/lib/discovery/scanner.ts. The scanner still fingerprints every
+ * host (evidence feeds TVs and printers), but the manager listing keeps ONLY
+ * devices that ANSWERED a discovery signal — BLASTI apps (UDP beacon, mDNS
+ * `_blasti-*`, /api/discover probe, registry), TVs (cast mDNS/SSDP/TCP/HTTP)
+ * and printers (IPP/JetDirect/WSD/SSDP/USB/HTTP). PCs, routers, IoT gadgets,
+ * generic phones and UNKNOWN are NEVER listed.
+ */
+function isSignalBackedDevice(d) {
+  if (!d) return false
+  const type = String(d.type || '').toUpperCase()
+  const cat = String(d.category || '').toUpperCase()
+  const src = String(d.source || '')
+  const caps = (Array.isArray(d.capabilities) ? d.capabilities : []).map((c) => String(c).toUpperCase())
+  const tcp = (Array.isArray(d.tcpServices) ? d.tcpServices : []).map((s) => String(s).toLowerCase())
+  const mdns = String(d.mdnsService || '').toLowerCase()
+  const ssdpSt = String(d.ssdpSt || '').toLowerCase()
+
+  // ── 1. The BLASTI app answered a BLASTI signal ──
+  const blastiSignal =
+    cat === 'BLASTI' ||
+    src === 'udp-beacon' || src === 'live-beacon' || src === 'database' ||
+    caps.includes('UDP_BEACON') ||
+    (typeof d.blastiMode === 'string' && d.blastiMode.length > 0) ||
+    /blasti/i.test(mdns) ||
+    /blasti/i.test(String(d.httpServer || ''))
+  if (blastiSignal) return true
+
+  // ── 2. TVs / displays must have ANSWERED a TV discovery signal ──
+  if (type === 'TV' || type === 'DISPLAY') {
+    const mdnsHit = !!mdns && /googlecast|airplay|roku|_rimedia|_samsung|_tcl|_viera|_bravia|_webos|_androidtv|_firetv|_firestick|_dial|_tv\./.test(mdns)
+    const ssdpHit = !!ssdpSt && /(media|avtransport|dial|screen|tv|display)/.test(ssdpSt)
+    const tcpHit = tcp.some((s) => /googlecast|airplay|roku|samsung-tv/.test(s))
+    // An HTTP response is also a signal (the TV answered our probe) — but an
+    // OUI-only guess with zero responses never reaches the manager.
+    const httpHit = !!(d.httpTitle || d.httpServer || d.httpUrl || d.ssdpLocation)
+    const wsdHit = !!d.wsdType && /display|tv|media/i.test(String(d.wsdType))
+    return Boolean(mdnsHit || ssdpHit || tcpHit || httpHit || wsdHit)
+  }
+
+  // ── 3. Printers must have ANSWERED a printer discovery signal ──
+  if (type === 'PRINTER') {
+    // 0.6.100 — CASCADE PERIPHERALS: a printer reported by a BLASTI host
+    // (the host itself answered the BLASTI signal) inherits that trust —
+    // this is how a USB printer plugged into ANOTHER branch PC becomes
+    // discoverable from a scan launched on any other device.
+    if (src === 'peripheral-report') return true
+    const mdnsHit = !!mdns && /ipp|ipps|_printer|_pdl|_uscan|jetdirect|_printing/.test(mdns)
+    const ssdpHit = !!ssdpSt && /print/.test(ssdpSt)
+    const wsdHit = !!d.wsdType && /print/i.test(String(d.wsdType))
+    const tcpHit = tcp.some((s) => /jetdirect|ipp|printer|pdl/.test(s))
+    const usbHit =
+      src === 'usb' || src === 'local' ||
+      !!(d.cupsName || d.cupsUri || d.usbVendorId || d.usbProductId)
+    const httpHit = /print|laserjet|deskjet|inkjet|thermal|epson|canon|brother|xerox|ricoh|lexmark|zebra|star\s*(tsp|sp)/i
+      .test(String(d.httpTitle || '') + ' ' + String(d.manufacturer || ''))
+    return Boolean(mdnsHit || ssdpHit || wsdHit || tcpHit || usbHit || httpHit)
+  }
+
+  // ── 4. Everything else is noise ──
+  return false
+}
+
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
 /**
@@ -3659,7 +3730,9 @@ async function runDiscoveryScan(
         // 0.6.96 — the app SHARED its identity: type/name/platform/ip travel
         // in the beacon and the receiver trusts them (identitySource
         // 'self-announced' — no more guessing phones from MAC randomization).
-        fingerprint: b.uid || undefined,
+        // 0.6.99 — fingerprint falls back to the lan-authority instanceId so
+        // pairing-by-identity can match the row the device registered with.
+        fingerprint: b.uid || b.instanceId || undefined,
         platform: b.platform || undefined,
         deviceTypeShared: b.deviceType || undefined,
         identitySource: 'self-announced',
@@ -3673,11 +3746,54 @@ async function runDiscoveryScan(
               : undefined,
         appVersion: b.appVersion,
         blastiInfo: b.instanceId
-          ? { instanceId: b.instanceId, master: !!b.master, role: b.role }
+          ? { instanceId: b.instanceId, fingerprint: b.uid || undefined, master: !!b.master, role: b.role }
           : isPhone && b.uid
-            ? { role: `pairing:${b.status || 'ready'}` }
+            ? { fingerprint: b.uid, role: `pairing:${b.status || 'ready'}` }
             : undefined,
         capabilities: isPhone ? ['UDP_BEACON', 'BLASTI_PHONE'] : ['UDP_BEACON'],
+      })
+    }
+
+    // ── 0.6.100 — CASCADE PERIPHERAL CARDS ──────────────────────────────────
+    // A BLASTI host that announced itself ALSO announces the USB peripherals
+    // (printers) attached to it. Each peripheral becomes its own PRINTER card
+    // (source 'peripheral-report') carrying hostIp/hostName — the manager can
+    // register it from ANY device (not just the host, not just the master),
+    // and every branch device can print to it through the host's print
+    // service. The whitelist accepts peripheral-report printers (they inherit
+    // the host's BLASTI-signal trust).
+    for (const b of beacons) {
+      if (cb.isAborted()) break
+      if (!Array.isArray(b.peripherals) || b.peripherals.length === 0) continue
+      if (!subnets.some((s) => b.ip.startsWith(s + '.'))) continue
+      b.peripherals.slice(0, 12).forEach((p, idx) => {
+        if (!p || typeof p !== 'object') return
+        const pname = typeof p.name === 'string' && p.name.trim() ? p.name.trim().slice(0, 100) : ''
+        if (!pname) return
+        upsertDevice(`${b.ip}-pp-${idx}`, {
+          source: 'peripheral-report',
+          category: 'LOCAL',
+          type: 'PRINTER',
+          connectionType: 'USB',
+          ip: b.ip, // the HOST's LAN ip — print jobs route through it
+          port: 0,
+          name: pname,
+          manufacturer: typeof p.manufacturer === 'string' ? p.manufacturer : undefined,
+          model: typeof p.model === 'string' ? p.model : undefined,
+          cupsName: typeof p.cupsName === 'string' ? p.cupsName : undefined,
+          cupsUri: typeof p.cupsUri === 'string' ? p.cupsUri : undefined,
+          usbVendorId: typeof p.usbVendorId === 'string' ? p.usbVendorId : undefined,
+          usbProductId: typeof p.usbProductId === 'string' ? p.usbProductId : undefined,
+          hostIp: b.ip,
+          hostName: b.name,
+          hostFingerprint: b.uid || b.instanceId || undefined,
+          hostPort: b.port || 3080,
+          friendlyName: pname,
+          status: 'ONLINE',
+          confidence: 92,
+          identitySource: 'host-reported',
+          capabilities: ['USB_HOST', 'PERIPHERAL_REPORT', 'SHARED_PRINT'],
+        })
       })
     }
 
@@ -3729,6 +3845,12 @@ async function runDiscoveryScan(
         model: txtModel && !isVirtualPrinterName(txtModel) ? txtModel : undefined,
         blastiMode: txtBlastiMode,
         appVersion: rec.txt && (rec.txt.appversion || rec.txt.ver) || undefined,
+        // 0.6.99 — the mDNS TXT `uid` is the app's stable fingerprint (same id
+        // the beacon carries and discover-register uses) → pairing-by-identity
+        // matches the REGISTERED row regardless of which transport found it.
+        fingerprint: (rec.txt && typeof rec.txt.uid === 'string' && rec.txt.uid.trim())
+          ? rec.txt.uid.trim().slice(0, 64)
+          : undefined,
         capabilities: [`mDNS:${rec.serviceType}`],
       })
     }
@@ -4123,8 +4245,48 @@ function sourcePriority(s) {
     case 'local': return 6  // CUPS queues are authoritative for local printers
     case 'usb': return 7    // USB probe is most authoritative
     case 'udp-beacon': return 6 // self-announcing BLASTI shells — high confidence
+    case 'peripheral-report': return 5 // reported by the host's BLASTI signal
     default: return 0
   }
+}
+
+// ─── 0.6.100 — cached local peripherals (beacon + /api/discover + report) ────
+// The USB printers attached to THIS machine, enumerated at most every
+// PERIPHERAL_CACHE_MS (the beacon broadcasts every 3s — re-running lpstat
+// that often would hammer the OS). Returns plain printer summaries.
+const PERIPHERAL_CACHE_MS = 120_000
+let peripheralCache = { at: 0, items: [] }
+let peripheralInFlight = null
+
+async function getLocalPeripheralsCached(force = false) {
+  const now = Date.now()
+  if (!force && now - peripheralCache.at < PERIPHERAL_CACHE_MS) return peripheralCache.items
+  if (peripheralInFlight) return peripheralInFlight
+  peripheralInFlight = (async () => {
+    try {
+      const rows = await discoverLocalPrinters({})
+      const items = rows.slice(0, 12).map((p) => ({
+        kind: 'printer',
+        name: String(p.name || p.model || 'Printer').slice(0, 100),
+        manufacturer: typeof p.manufacturer === 'string' ? p.manufacturer.slice(0, 60) : undefined,
+        model: typeof p.model === 'string' ? p.model.slice(0, 80) : undefined,
+        cupsName: typeof p.id === 'string' && p.id.startsWith('local-cups:') ? p.id.slice('local-cups:'.length).slice(0, 120) : undefined,
+        cupsUri: typeof p.cupsUri === 'string' ? p.cupsUri.slice(0, 200) : undefined,
+        usbVendorId: typeof p.usbVendorId === 'string' ? p.usbVendorId.slice(0, 20) : undefined,
+        usbProductId: typeof p.usbProductId === 'string' ? p.usbProductId.slice(0, 20) : undefined,
+        connection: 'USB',
+        state: 'idle',
+      }))
+      peripheralCache = { at: now, items }
+      return items
+    } catch {
+      peripheralCache = { at: now, items: [] }
+      return []
+    } finally {
+      peripheralInFlight = null
+    }
+  })()
+  return peripheralInFlight
 }
 
 /**
@@ -4186,6 +4348,12 @@ function listenForUdpBeacons({ timeoutMs = BEACON_LISTEN_MS, selfIps, isAborted 
           service: svc,
           uid: typeof payload.uid === 'string' ? payload.uid.slice(0, 64) : undefined,
           status: typeof payload.status === 'string' ? payload.status.slice(0, 40) : undefined,
+          // 0.6.100 — CASCADE DISCOVERY: the announcing app shares the USB
+          // peripherals (printers) attached to it, so a scan launched from ANY
+          // branch device finds the branch's shared printer.
+          peripherals: Array.isArray(payload.peripherals)
+            ? payload.peripherals.slice(0, 12)
+            : undefined,
         })
       } catch { /* non-JSON packet — ignore */ }
     })
@@ -4318,6 +4486,8 @@ module.exports = {
   readDhcpLeases,
   httpProbe,
   httpsProbe,
+  // 0.6.100 — cached local USB peripherals (beacon/identity/report source)
+  getLocalPeripheralsCached,
   fetchUpnpDescription,
   discoverLocalPrinters,
   // BLASTI identification + self-advertisement
@@ -4334,6 +4504,7 @@ module.exports = {
   nameQuality,
   // Fingerprinting + orchestration
   fingerprintDevice,
+  isSignalBackedDevice,
   runDiscoveryScan,
   sourcePriority,
   getProtocolAvailability,

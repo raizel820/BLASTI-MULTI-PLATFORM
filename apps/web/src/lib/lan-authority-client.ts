@@ -144,6 +144,12 @@ const STORAGE_KEY = 'blasti_lan_authority';
 const MASTER_CONTACT_TTL_MS = 30_000; // override stays live 30s after last contact
 const JOIN_TIMEOUT_MS = 3_000;
 const STATUS_TIMEOUT_MS = 3_000;
+// 0.6.100 — mandatory join approval: an unknown device's join lands as a
+// PENDING request on the master (native dialog / Device Manager). The client
+// retries until the operator decides (bounded — offline masters must never
+// wedge a session boot).
+const PENDING_JOIN_RETRY_MS = 4_000;
+const PENDING_JOIN_MAX_WAIT_MS = 4 * 60_000;
 
 let state: LanAuthorityState | null = null;
 let restored = false;
@@ -415,62 +421,113 @@ export async function joinMaster(
   }
 
   const url = `http://${ip}:${port}/api/lan/join`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), JOIN_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(session.token ? { Authorization: `Bearer ${session.token}` } : {}),
+
+  /** ONE join attempt (3s timeout). Returns the raw Response. */
+  const attemptJoin = async (): Promise<Response | null> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), JOIN_TIMEOUT_MS);
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        },
+        body: JSON.stringify({
+          sessionToken: session.token,
+          agencyId: session.agencyId ?? null,
+          branchId: session.branchId ?? null,
+          role: session.role ?? null,
+          deviceFingerprint,
+          deviceName: deviceNameLabel(),
+          platform: detectClientPlatform(),
+        }),
+        credentials: 'omit',
+        signal: controller.signal,
+      });
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  /** Handle a SUCCESSFUL join response (token mint + state store). */
+  const absorbJoin = async (res: Response): Promise<JoinOutcome> => {
+    const body = (await res.json().catch(() => null)) as { data?: JoinResponseData } | null;
+    const data = body?.data;
+    if (
+      !data || typeof data.lanToken !== 'string' || !data.lanToken ||
+      !data.master || typeof data.master.ip !== 'string' || typeof data.master.port !== 'number'
+    ) {
+      safeLog('lan-join', `join accepted by ${ip}:${port} but payload incomplete — not stored`, { ip, port, status: res.status });
+      return { joined: false, reason: 'bad-payload' };
+    }
+    state = {
+      active: true,
+      master: {
+        ip: data.master.ip,
+        port: data.master.port,
+        instanceId: typeof data.master.instanceId === 'string' ? data.master.instanceId : masterInstanceId,
+        name: typeof data.master.name === 'string' ? data.master.name : (discovered.displayName ?? discovered.hostname ?? discovered.name ?? null),
+        term: typeof data.term === 'number' ? data.term : (discovered.term ?? null),
       },
-      body: JSON.stringify({
-        sessionToken: session.token,
-        agencyId: session.agencyId ?? null,
-        branchId: session.branchId ?? null,
-        role: session.role ?? null,
-        deviceFingerprint,
-        deviceName: deviceNameLabel(),
-        platform: detectClientPlatform(),
-      }),
-      credentials: 'omit',
-      signal: controller.signal,
-    });
+      lanToken: data.lanToken,
+      joinedAt: new Date().toISOString(),
+      lastMasterContactAt: Date.now(),
+      expiresAt: typeof data.expiresAt === 'string' ? data.expiresAt : null,
+      role: 'FOLLOWER',
+    };
+    persist();
+    safeLog('lan-join', `joined master ${state.master.name ?? ''} ${state.master.ip}:${state.master.port} — term ${state.master.term ?? '?'}, instance ${state.master.instanceId ?? '?'}, expiresAt ${state.expiresAt ?? 'n/a'}, fingerprint ${deviceFingerprint.slice(0, 12)}…`, { master: { ...state.master }, term: state.master.term, expiresAt: state.expiresAt });
+    return { joined: true };
+  };
+
+  try {
+    let res = await attemptJoin();
+    if (!res) {
+      safeLog('lan-join', `join unreachable at ${ip}:${port} — network error`, { ip, port });
+      return { joined: false, reason: 'network-error' };
+    }
+
+    // ── 0.6.100 — 202 PENDING: the master operator must ACCEPT first ──
+    // Retry every 4s (bounded 4min) — the join succeeds automatically the
+    // moment the operator accepts (native dialog, local route or the cloud
+    // Device Manager verdict relay).
+    if (res.status === 202) {
+      safeLog('lan-join', `pairing request PENDING at ${ip}:${port} — waiting for the master operator to accept (retry every ${PENDING_JOIN_RETRY_MS / 1000}s, max ${PENDING_JOIN_MAX_WAIT_MS / 1000}s)`, { ip, port });
+      const deadline = Date.now() + PENDING_JOIN_MAX_WAIT_MS;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, PENDING_JOIN_RETRY_MS));
+        res = await attemptJoin();
+        if (!res) continue; // transient — keep waiting
+        if (res.status === 202) continue; // still awaiting acceptance
+        break;
+      }
+      if (!res) {
+        safeLog('lan-join', `pending join at ${ip}:${port} went unreachable while waiting`, { ip, port });
+        return { joined: false, reason: 'network-error' };
+      }
+      if (res.status === 202) {
+        safeLog('lan-join', `pairing request still PENDING after ${PENDING_JOIN_MAX_WAIT_MS / 1000}s at ${ip}:${port} — giving up for now (will re-request on next discovery)`, { ip, port });
+        return { joined: false, reason: 'pending-approval' };
+      }
+    }
 
     if (res.ok) {
-      const body = (await res.json().catch(() => null)) as { data?: JoinResponseData } | null;
-      const data = body?.data;
-      if (
-        !data || typeof data.lanToken !== 'string' || !data.lanToken ||
-        !data.master || typeof data.master.ip !== 'string' || typeof data.master.port !== 'number'
-      ) {
-        safeLog('lan-join', `join accepted by ${ip}:${port} but payload incomplete — not stored`, { ip, port, status: res.status });
-        return { joined: false, reason: 'bad-payload' };
-      }
-      state = {
-        active: true,
-        master: {
-          ip: data.master.ip,
-          port: data.master.port,
-          instanceId: typeof data.master.instanceId === 'string' ? data.master.instanceId : masterInstanceId,
-          name: typeof data.master.name === 'string' ? data.master.name : (discovered.displayName ?? discovered.hostname ?? discovered.name ?? null),
-          term: typeof data.term === 'number' ? data.term : (discovered.term ?? null),
-        },
-        lanToken: data.lanToken,
-        joinedAt: new Date().toISOString(),
-        lastMasterContactAt: Date.now(),
-        expiresAt: typeof data.expiresAt === 'string' ? data.expiresAt : null,
-        role: 'FOLLOWER',
-      };
-      persist();
-      safeLog('lan-join', `joined master ${state.master.name ?? ''} ${state.master.ip}:${state.master.port} — term ${state.master.term ?? '?'}, instance ${state.master.instanceId ?? '?'}, expiresAt ${state.expiresAt ?? 'n/a'}, fingerprint ${deviceFingerprint.slice(0, 12)}…`, { master: { ...state.master }, term: state.master.term, expiresAt: state.expiresAt });
-      return { joined: true };
+      return await absorbJoin(res);
     }
 
     if (res.status === 403) {
       const body = (await res.json().catch(() => null)) as { code?: unknown; error?: unknown } | null;
+      const code = typeof body?.code === 'string' ? body.code : '';
+      if (code === 'LAN_JOIN_REJECTED') {
+        // 0.6.100 — the operator REJECTED this pairing request.
+        safeLog('lan-join', `pairing request REJECTED by the master operator at ${ip}:${port} — not retrying`, { ip, port });
+        return { joined: false, reason: 'rejected-by-operator' };
+      }
       // LAN_SCOPE_MISMATCH — different agency/branch. Surface once, DO NOT retry.
-      safeLog('lan-scope-reject', `join rejected 403 ${typeof body?.code === 'string' ? body.code : 'LAN_SCOPE_MISMATCH'} by ${ip}:${port} — agency/branch scope differs from master scope; not retrying${typeof body?.error === 'string' ? `: ${body.error}` : ''}`, { ip, port, code: typeof body?.code === 'string' ? body.code : null });
+      safeLog('lan-scope-reject', `join rejected 403 ${code || 'LAN_SCOPE_MISMATCH'} by ${ip}:${port} — agency/branch scope differs from master scope; not retrying${typeof body?.error === 'string' ? `: ${body.error}` : ''}`, { ip, port, code: code || null });
       return { joined: false, reason: 'scope-mismatch' };
     }
 
@@ -492,10 +549,8 @@ export async function joinMaster(
     safeLog('lan-join', `join failed with HTTP ${res.status} at ${ip}:${port}`, { ip, port, status: res.status });
     return { joined: false, reason: `http-${res.status}` };
   } catch (err) {
-    safeLog('lan-join', `join unreachable at ${ip}:${port} — ${err instanceof Error ? err.message : 'network error'}`, { ip, port });
+    safeLog('lan-join', `join failed at ${ip}:${port} — ${err instanceof Error ? err.message : 'error'}`, { ip, port });
     return { joined: false, reason: 'network-error' };
-  } finally {
-    clearTimeout(timer);
   }
 }
 

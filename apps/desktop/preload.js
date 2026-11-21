@@ -399,6 +399,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   getTvScreenStatus: () => ipcRenderer.invoke('tv-screen:status'),
 
+  // ─── Device-surface identity (0.6.99 — pairing fix) ──────────────────────
+
+  /**
+   * Report this window's device-surface identity (kiosk/TV) to the main
+   * process. The LAN beacon embeds the SAME uid the kiosk registers with
+   * (discover-register deviceFingerprint) so the Device Manager's
+   * pairing-by-identity matches the REGISTERED row — without it the beacon
+   * carried only the lan-authority instanceId, the manager paired a different
+   * orphan row, and the request never reached the waiting kiosk.
+   * @param {{ uid: string, mode: 'kiosk'|'tv' } | null} identity - null clears
+   */
+  setDeviceSurfaceIdentity: (identity) => ipcRenderer.send('device-surface:identity', identity),
+
   // ─── Local Server Event Relay ────────────────────────────────────────────────
 
   /**

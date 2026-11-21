@@ -779,6 +779,36 @@ let beaconInterval = null;
 // Device Manager on another device shows a kiosk card and can send a pairing
 // request), not as a desktop.
 let beaconIdentityMode = 'desktop';
+// 0.6.99 — the device surface's SELF-ANNOUNCED fingerprint (the webapp's
+// stable uid, pushed over IPC when a kiosk/TV surface mounts). The beacon
+// carries it as `uid` so pairing-by-identity matches the row the kiosk
+// actually registered with — THE fix for "pairing request never reaches the
+// kiosk" (the manager used to pair the instanceId-only orphan instead).
+let deviceSurfaceIdentity = null;
+
+ipcMain.on('device-surface:identity', (_event, identity) => {
+  try {
+    if (!identity || typeof identity !== 'object') {
+      deviceSurfaceIdentity = null;
+      return;
+    }
+    const uid = typeof identity.uid === 'string' && identity.uid.trim()
+      ? identity.uid.trim().slice(0, 64)
+      : '';
+    const mode = identity.mode === 'kiosk' || identity.mode === 'tv' ? String(identity.mode) : '';
+    deviceSurfaceIdentity = uid ? { uid, mode } : null;
+    // 0.6.99 — the mDNS TXT advertises the same uid (_blasti-kiosk/_blasti-desktop
+    // answer set) so scan cards from BOTH discovery transports match the row the
+    // kiosk registered with.
+    try {
+      const scannerLib = require('./local-api/lib/discovery-scanner');
+      if (typeof scannerLib.setBlastiMdnsIdentity === 'function') {
+        scannerLib.setBlastiMdnsIdentity({ uid: uid || undefined, surfaceMode: mode || undefined });
+      }
+    } catch { /* mDNS identity is best-effort */ }
+    console.log(`[BLASTI Desktop] device-surface identity reported (uid=${uid ? uid.slice(0, 8) + '…' : '∅'}, mode=${mode || '∅'})`);
+  } catch { /* identity is best-effort */ }
+});
 
 function setLanBeaconMode(mode) {
   beaconIdentityMode = mode === 'kiosk' ? 'kiosk' : 'desktop';
@@ -879,6 +909,23 @@ function ensureWindowsFirewallRules() {
 }
 
 /** Build the beacon payload (mirrors the /api/discover beacon identity). */
+// 0.6.100 — CASCADE DISCOVERY: the USB peripherals (printers) attached to this
+// machine ride EVERY beacon, so a scan launched on ANY branch device (not the
+// host, not the master) still discovers the branch's shared printer. The
+// enumeration is OS-slow, so it is refreshed on a timer into a module var.
+let beaconPeripherals = []
+let beaconPeripheralsTimer = null
+function refreshBeaconPeripherals() {
+  try {
+    const scanner = require('./local-api/lib/discovery-scanner')
+    if (typeof scanner.getLocalPeripheralsCached === 'function') {
+      Promise.resolve(scanner.getLocalPeripheralsCached())
+        .then((items) => { if (Array.isArray(items)) beaconPeripherals = items })
+        .catch(() => { /* keep last known */ })
+    }
+  } catch { /* scanner unavailable (loopback dev) — stays empty */ }
+}
+
 function buildBeaconPayload() {
   // R-21F: merge the offline-authority fields (role/term/specScore/instance/
   // agency) so peer desktops can run the election off beacons alone. The
@@ -902,7 +949,15 @@ function buildBeaconPayload() {
     // 0.6.96 — shared device info (type + platform)
     deviceType: beaconIdentityMode === 'kiosk' ? 'kiosk' : 'desktop',
     platform: process.platform,
+    // 0.6.100 — shared USB peripherals (cascade discovery / shared printer)
+    peripherals: beaconPeripherals,
     ...extras,
+    // 0.6.99 — the device surface's self-announced fingerprint LAST so the
+    // lan-authority extras cannot shadow it. The kiosk's discover-register
+    // uses the exact same id → pairing-by-identity lands on the REGISTERED
+    // row and the request finally reaches the waiting kiosk.
+    uid: (deviceSurfaceIdentity && deviceSurfaceIdentity.uid) || '',
+    surfaceMode: (deviceSurfaceIdentity && deviceSurfaceIdentity.mode) || '',
   });
 }
 
@@ -949,6 +1004,12 @@ function startLanBeacon() {
         }
       } catch { /* non-fatal */ }
     }, BEACON_INTERVAL_MS);
+    // 0.6.100 — keep the shared-peripherals list fresh (OS enumeration is
+    // slow; 2min refresh is plenty for a printer being plugged/unplugged).
+    refreshBeaconPeripherals();
+    if (beaconPeripheralsTimer) clearInterval(beaconPeripheralsTimer);
+    beaconPeripheralsTimer = setInterval(refreshBeaconPeripherals, 120_000);
+    if (beaconPeripheralsTimer.unref) beaconPeripheralsTimer.unref();
     // Send one immediately so a fresh kiosk finds us within seconds.
     setImmediate(() => {
       try {
@@ -965,6 +1026,7 @@ function startLanBeacon() {
 
 function stopLanBeacon() {
   if (beaconInterval) { clearInterval(beaconInterval); beaconInterval = null; }
+  if (beaconPeripheralsTimer) { clearInterval(beaconPeripheralsTimer); beaconPeripheralsTimer = null; }
   if (beaconSocket) {
     try { beaconSocket.close(); } catch { /* already closed */ }
     beaconSocket = null;
@@ -4598,6 +4660,8 @@ ipcMain.handle('tv-screen:close', () => {
     tvWindow = null;
     // 0.6.96 — identity back to desktop when the kiosk window closes.
     try { setLanBeaconMode('desktop'); } catch { /* identity switch is best-effort */ }
+    // 0.6.99 — the device surface is gone: stop advertising its uid.
+    deviceSurfaceIdentity = null;
     // 0.6.91 — device event stream: kiosk/TV window closed (kiosk mode exited).
     try {
       require('./local-api/lib/device-event').deviceEvent('kiosk_exit', 'TV/kiosk window closed', { deviceType: 'TV' });

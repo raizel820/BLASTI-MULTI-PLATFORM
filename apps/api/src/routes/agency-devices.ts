@@ -33,6 +33,7 @@ import {
   tcpProbePort,
   httpProbe,
   fingerprintDevice,
+  isSignalBackedDevice,
   blastiIdentifyProbe,
   SCAN_PORTS as EMBEDDED_SCAN_PORTS,
   TCP_SWEEP_PORTS,
@@ -1281,6 +1282,10 @@ app.get('/public/device-status', async (c) => {
         agencyNameFr: payload.agencyNameFr,
         branchId: payload.branchId,
         branchName: payload.branchName,
+        sentByName: payload.sentByName,
+        // 0.6.100 — the manager-issued token the device adopts on accept
+        // (single canonical token across the manager store and this one).
+        deviceToken: payload.deviceToken,
         sentAt: cmd.createdAt,
       }
     })
@@ -3133,7 +3138,10 @@ function devicesResponse(category?: string, status?: string) {
   let devices = [...scanDevices]
   if (category) devices = devices.filter((d) => d.category === category.toUpperCase())
   if (status) devices = devices.filter((d) => d.status === status.toUpperCase())
-  devices = devices.filter((d) => DISCOVERY_LIST_TYPES.has(String(d.type).toUpperCase()))
+  // 0.6.99 — SIGNAL-BASED whitelist (user requirement): only devices that
+  // ANSWERED a discovery signal — BLASTI apps (beacon/mDNS/probe), TVs and
+  // printers. Generic phones/PCs/routers/IoT/unknown never reach the manager.
+  devices = devices.filter((d) => isSignalBackedDevice(d))
   return {
     devices,
     total: devices.length,
@@ -3141,15 +3149,6 @@ function devicesResponse(category?: string, status?: string) {
     scannedAt: scanState.scanId ? new Date().toISOString() : null,
   }
 }
-
-/**
- * 0.6.96 — SCAN RESULT WHITELIST (user requirement): the manager listing
- * keeps ONLY the device classes the agency can act on — BLASTI apps
- * (desktop/kiosk/phone), TVs and printers. The scanner still fingerprints
- * every host (evidence feeds TVs/printers), but PCs/IoT/routers/unknown
- * noise never reach the manager. Mirrors the desktop local-api shaper.
- */
-const DISCOVERY_LIST_TYPES = new Set(['APP', 'KIOSK', 'PHONE', 'TV', 'PRINTER', 'DISPLAY'])
 
 /**
  * 0.6.95 — registry merge (the "manager on the phone can never discover
@@ -3230,7 +3229,64 @@ async function devicesResponseWithRegistry(
         }
       })
     const existingIds = new Set(base.devices.map((d) => d.id))
-    const merged = [...base.devices, ...registryCards.filter((card: { id: string }) => !existingIds.has(card.id))]
+    // 0.6.100 — CASCADE PERIPHERALS (cloud): the desktops report their USB
+    // peripherals (printers) in the lan-topology report (devicesJson
+    // kind:'peripheral'). A manager scanning via the CLOUD sees them here as
+    // peripheral-report printer cards — the shared printer is discoverable
+    // even when the scan cannot touch the venue LAN.
+    const peripheralCards: Array<Record<string, unknown>> = []
+    try {
+      const lanNodes = await db.lanNode.findMany({
+        where: { agencyId, lastReportAt: { gte: new Date(Date.now() - 10 * 60 * 1000) } },
+        select: { instanceId: true, name: true, ipAddress: true, lanPort: true, devicesJson: true, lastReportAt: true },
+        take: 50,
+      })
+      for (const node of lanNodes) {
+        if (!node.ipAddress || !node.devicesJson) continue
+        let entries: Array<Record<string, unknown>> = []
+        try {
+          const parsed = JSON.parse(node.devicesJson)
+          if (Array.isArray(parsed)) entries = parsed as Array<Record<string, unknown>>
+        } catch { /* corrupt JSON — skip node */ }
+        entries.filter((e) => e && e.kind === 'peripheral').slice(0, 12).forEach((p, idx) => {
+          const pname = typeof p.name === 'string' && p.name.trim() ? p.name.trim().slice(0, 100) : ''
+          if (!pname) return
+          peripheralCards.push({
+            id: `peripheral-${node.instanceId}-${idx}`,
+            source: 'peripheral-report',
+            category: 'LOCAL',
+            type: 'PRINTER',
+            name: pname,
+            ip: node.ipAddress,
+            port: 0,
+            manufacturer: typeof p.manufacturer === 'string' ? p.manufacturer : undefined,
+            model: typeof p.model === 'string' ? p.model : undefined,
+            cupsName: typeof p.cupsName === 'string' ? p.cupsName : undefined,
+            cupsUri: typeof p.cupsUri === 'string' ? p.cupsUri : undefined,
+            usbVendorId: typeof p.usbVendorId === 'string' ? p.usbVendorId : undefined,
+            usbProductId: typeof p.usbProductId === 'string' ? p.usbProductId : undefined,
+            hostIp: node.ipAddress,
+            hostName: node.name,
+            hostInstanceId: node.instanceId,
+            hostPort: node.lanPort,
+            capabilities: ['USB_HOST', 'PERIPHERAL_REPORT', 'SHARED_PRINT'],
+            status: 'ONLINE',
+            lastSeen: node.lastReportAt.getTime(),
+            firstSeen: node.lastReportAt.getTime(),
+            connectionType: 'USB',
+            confidence: 92,
+          })
+        })
+      }
+    } catch { /* lanNode table absent on very old DBs — skip */ }
+    const merged = [
+      ...base.devices,
+      ...registryCards.filter((card: { id: string }) => !existingIds.has(card.id)),
+      ...peripheralCards.filter((card) => {
+        // Dedupe: same host IP + same printer name already surfaced by a scan.
+        return !base.devices.some((d) => d.type === 'PRINTER' && d.ip === (card as { hostIp?: string }).hostIp && d.name === card.name)
+      }),
+    ]
     return {
       devices: merged,
       total: merged.length,
@@ -3661,6 +3717,10 @@ app.post('/discovery/pairing-request-by-identity', async (c) => {
           type: deviceType,
           status: 'PAIRING',
           connectionType: 'LAN',
+          // 0.6.100 — the manager MINTS the device token: the device adopts it
+          // on accept, so the manager store and the device share ONE canonical
+          // token (what later authorizes cross-store commands).
+          deviceToken: crypto.randomBytes(32).toString('hex'),
           ipAddress: body.ip || null,
           port: body.port || null,
           deviceFingerprint: fingerprint || null,
@@ -3730,6 +3790,8 @@ app.post('/discovery/pairing-request-by-identity', async (c) => {
           agencyNameFr: agency.nameFr,
           sentBy: user.id,
           sentByName: user.fullName || user.username,
+          // 0.6.100 — the device adopts this token on accept (canonical id).
+          deviceToken: device.deviceToken || undefined,
         }),
         status: 'PENDING',
         ttl: 600,
@@ -3754,6 +3816,89 @@ app.post('/discovery/pairing-request-by-identity', async (c) => {
       data: { commandId: command.id, created },
     })
     return c.json({ success: true, created, deviceId: device.id, commandId: command.id, message: `Pairing request sent to ${device.name}` })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ── 0.6.100 — CASCADE PERIPHERAL REGISTRATION (cloud) ───────────────────────
+// A discovered USB printer attached to ANOTHER branch PC (source
+// 'peripheral-report') is registered here as a PRINTER AgencyDevice. The
+// printerConfig JSON pins the attachment: hostIp/hostPort is where LAN print
+// jobs get forwarded, cupsName/usb ids identify the queue on the host.
+app.post('/discovery/register-peripheral', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) {
+      return c.json({ success: false, error: 'No agency assigned' }, 403)
+    }
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
+    const printer = (body.printer && typeof body.printer === 'object' ? body.printer : {}) as Record<string, unknown>
+    const name = (typeof printer.name === 'string' && printer.name.trim() ? printer.name.trim() : '') ||
+      (typeof body.name === 'string' && body.name.trim() ? body.name.trim() : '')
+    const hostIp = (typeof body.hostIp === 'string' && body.hostIp.trim() ? body.hostIp.trim() : '') ||
+      (typeof printer.hostIp === 'string' && printer.hostIp.trim() ? printer.hostIp.trim() : '')
+    if (!name) return c.json({ success: false, error: 'printer.name is required' }, 400)
+    if (!hostIp) return c.json({ success: false, error: 'hostIp is required (which PC owns the USB printer?)' }, 400)
+    const hostPort = Number(body.hostPort) > 0 ? Math.min(65535, Math.max(1, Math.floor(Number(body.hostPort)))) : 3080
+    const cupsName = typeof printer.cupsName === 'string' ? printer.cupsName.slice(0, 120) : null
+    const usbVendorId = typeof printer.usbVendorId === 'string' ? printer.usbVendorId.slice(0, 20) : null
+    const usbProductId = typeof printer.usbProductId === 'string' ? printer.usbProductId.slice(0, 20) : null
+    const printerConfig = JSON.stringify({
+      attachment: 'USB',
+      hostIp,
+      hostPort,
+      hostInstanceId: typeof body.hostInstanceId === 'string' ? body.hostInstanceId.slice(0, 80) : null,
+      hostName: typeof body.hostName === 'string' ? body.hostName.slice(0, 100) : null,
+      cupsName,
+      cupsUri: typeof printer.cupsUri === 'string' ? printer.cupsUri.slice(0, 200) : null,
+      usbVendorId,
+      usbProductId,
+      registeredFrom: 'cascade-discovery',
+      registeredAt: new Date().toISOString(),
+    })
+    // Idempotent: same host + same printer name updates the same row.
+    const existing = await db.agencyDevice.findFirst({
+      where: { agencyId: user.agencyId, type: 'PRINTER', connectionType: 'USB', ipAddress: hostIp, name: name.slice(0, 100) },
+    })
+    let row
+    if (existing) {
+      row = await db.agencyDevice.update({
+        where: { id: existing.id },
+        data: { printerConfig, port: hostPort, status: 'ONLINE', statusChangedAt: new Date(), lastHeartbeatAt: new Date() },
+      })
+    } else {
+      row = await db.agencyDevice.create({
+        data: {
+          agencyId: user.agencyId,
+          name: name.slice(0, 100),
+          type: 'PRINTER',
+          status: 'ONLINE',
+          statusChangedAt: new Date(),
+          connectionType: 'USB',
+          ipAddress: hostIp,
+          port: hostPort,
+          printerConfig,
+          autoDiscovery: true,
+          lastHeartbeatAt: new Date(),
+        },
+      })
+    }
+    const shaped = await db.agencyDevice.findUnique({ where: { id: row.id }, select: DEVICE_SELECT }).catch(() => row)
+    emitAgencyDeviceEvent('agency-device:updated', user.agencyId, { deviceId: row.id, deviceName: row.name, action: 'peripheral-registered' })
+    appendDeviceEvent({
+      event: 'connect_success',
+      message: `USB printer "${row.name}" registered via host ${hostIp}:${hostPort} (cascade discovery)`,
+      deviceId: row.id,
+      deviceName: row.name,
+      deviceType: 'PRINTER',
+      agencyId: user.agencyId,
+      userId: user.id,
+      username: user.username,
+      data: { source: 'cascade', hostIp },
+    })
+    return c.json({ success: true, device: shaped ?? row })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -3914,6 +4059,9 @@ const printAuth: MiddlewareHandler<AgencyDevicesEnv> = async (c, next) => {
 const discoveryPrintSchema = z.object({
   ip: z.string().max(50).optional(),
   port: z.number().int().min(1).max(65535).optional(),
+  // 0.6.100 — target a REGISTERED printer device (cascade peripheral): the
+  // API resolves the row; USB-attached ones get a LAN-mode guidance error.
+  printerDeviceId: z.string().max(80).optional(),
   test: z.boolean().optional(),
   ticket: z.object({
     agencyName: z.string().max(200).optional(),
@@ -3941,6 +4089,27 @@ app.post('/discovery/print', printAuth, async (c) => {
     const kioskDevice = c.get('printDevice')
     let ip = printBody.ip
     let port = printBody.port
+
+    // 0.6.100 — USB-attached printers (cascade peripherals) cannot be raw-TCP
+    // printed from the CLOUD: the printer hangs off a branch PC's USB port.
+    // The print must go through the branch PC's local API (LAN mode) — give a
+    // clear error instead of a mysterious 502.
+    if (printBody.printerDeviceId) {
+      try {
+        const printerRow = await db.agencyDevice.findUnique({ where: { id: printBody.printerDeviceId } })
+        if (printerRow && printerRow.type === 'PRINTER') {
+          const cfg = typeof printerRow.printerConfig === 'string'
+            ? JSON.parse(printerRow.printerConfig || '{}')
+            : (printerRow.printerConfig || {}) as Record<string, unknown>
+          if (cfg && cfg.attachment === 'USB') {
+            return c.json({
+              success: false,
+              error: 'USB_PRINTER_NEEDS_LAN — this printer is attached to a branch PC; print via the branch desktop (LAN mode) so the job reaches the host',
+            }, 409)
+          }
+        }
+      } catch { /* fall through to the normal path */ }
+    }
 
     // No explicit target → the agency's saved default printer
     if (!ip) {

@@ -38,6 +38,8 @@ export type DeviceType = 'TV' | 'KIOSK' | 'DISPLAY' | 'PRINTER' | 'APP' | 'PHONE
  *  the /api/discover identification probe. */
 export interface BlastiDeviceInfo {
   instanceId?: string
+  /** 0.6.99 — the app's stable self-announced fingerprint (beacon uid). */
+  fingerprint?: string
   master?: boolean
   role?: string
   agencyId?: string
@@ -115,6 +117,13 @@ export interface DiscoveredDeviceRaw {
   /** WS-Discovery device class from the ProbeMatch Types field
    *  ('PC' | 'PRINTER' | 'TV'). */
   wsdType?: string
+  /** 0.6.99 — the device's self-announced BLASTI fingerprint (beacon `uid` or
+   *  lan-authority instanceId). The Device Manager sends EXACTLY this value to
+   *  pairing-request-by-identity, which lets the server match the row the
+   *  device itself registered with (discover-register uses the same id) —
+   *  without it the manager paired a DIFFERENT orphan row and the pairing
+   *  request never reached the waiting kiosk. */
+  fingerprint?: string
 }
 
 export type ScanPhase =
@@ -3565,6 +3574,95 @@ export function fingerprintDevice(input: FingerprintInput): FingerprintResult {
   return { ...cls, confidence, identitySource }
 }
 
+// ─── 0.6.99 — SIGNAL-BACKED DEVICE WHITELIST ─────────────────────────────────
+
+/**
+ * USER REQUIREMENT (0.6.99): "device manager discovery should discover ONLY
+ * devices with the BLASTI app running on them (by responding to the app
+ * signal) or TVs, printers and kiosk mode on the BLASTI app (responding to
+ * the signal)".
+ *
+ * The scanner still fingerprints every host (the evidence feeds TVs and
+ * printers), but the manager listing keeps ONLY devices that ANSWERED a
+ * discovery signal:
+ *
+ *   1. BLASTI app  — answered the BLASTI signal: UDP beacon (shell/phone),
+ *      mDNS `_blasti-*` TXT, the /api/discover probe, or a registry merge.
+ *   2. TV/Display  — answered a TV signal: cast mDNS (googlecast/airplay/…),
+ *      SSDP MediaRenderer/DIAL, cast/TV TCP ports, or an HTTP response.
+ *   3. Printer     — answered a printer signal: mDNS IPP, SSDP Print,
+ *      WS-Discovery Print, JetDirect/IPP TCP, USB/CUPS, or printer HTTP.
+ *
+ * PCs, routers, IoT gadgets, generic phones (TCP ios-sync hit / DHCP name /
+ * OUI guess) and anything UNKNOWN are NEVER listed — they answered nothing
+ * we can act on. A bare OUI guess (MAC vendor alone, zero responses) does
+ * NOT qualify even for TVs and printers.
+ */
+export function isSignalBackedDevice(d: {
+  type?: string; category?: string; source?: string
+  capabilities?: string[]; tcpServices?: string[]
+  mdnsService?: string; ssdpSt?: string; ssdpLocation?: string
+  httpTitle?: string; httpServer?: string; httpUrl?: string
+  wsdType?: string; blastiMode?: string; blastiInfo?: unknown
+  cupsName?: string; cupsUri?: string; usbVendorId?: string; usbProductId?: string
+  manufacturer?: string
+}): boolean {
+  const type = String(d.type || '').toUpperCase()
+  const cat = String(d.category || '').toUpperCase()
+  const src = String(d.source || '')
+  const caps = (Array.isArray(d.capabilities) ? d.capabilities : []).map((c) => String(c).toUpperCase())
+  const tcp = (Array.isArray(d.tcpServices) ? d.tcpServices : []).map((s) => String(s).toLowerCase())
+  const mdns = String(d.mdnsService || '').toLowerCase()
+  const ssdpSt = String(d.ssdpSt || '').toLowerCase()
+
+  // ── 1. The BLASTI app answered a BLASTI signal ──
+  const blastiSignal =
+    cat === 'BLASTI' ||
+    src === 'udp-beacon' || src === 'live-beacon' || src === 'database' ||
+    caps.includes('UDP_BEACON') ||
+    (typeof d.blastiMode === 'string' && d.blastiMode.length > 0) ||
+    /blasti/i.test(mdns) ||
+    /blasti/i.test(String(d.httpServer || ''))
+  if (blastiSignal) return true
+
+  // ── 2. TVs / displays must have ANSWERED a TV discovery signal ──
+  if (type === 'TV' || type === 'DISPLAY') {
+    const mdnsHit = !!mdns && /googlecast|airplay|roku|_rimedia|_samsung|_tcl|_viera|_bravia|_webos|_androidtv|_firetv|_firestick|_dial|_tv\./.test(mdns)
+    const ssdpHit = !!ssdpSt && /(media|avtransport|dial|screen|tv|display)/.test(ssdpSt)
+    const tcpHit = tcp.some((s) => /googlecast|airplay|roku|samsung-tv/.test(s))
+    // An HTTP response is also a signal (the TV answered our probe) — but an
+    // OUI-only guess with zero responses never reaches the manager.
+    const httpHit = !!(d.httpTitle || d.httpServer || d.httpUrl || d.ssdpLocation)
+    const wsdHit = !!d.wsdType && /display|tv|media/i.test(String(d.wsdType))
+    return Boolean(mdnsHit || ssdpHit || tcpHit || httpHit || wsdHit)
+  }
+
+  // ── 3. Printers must have ANSWERED a printer discovery signal ──
+  if (type === 'PRINTER') {
+    // 0.6.100 — CASCADE PERIPHERALS: a printer reported by a BLASTI host
+    // (the host itself answered the BLASTI signal) inherits that trust —
+    // this is how a USB printer plugged into ANOTHER branch PC becomes
+    // discoverable from a scan launched on any other device.
+    if (src === 'peripheral-report') return true
+    const mdnsHit = !!mdns && /ipp|ipps|_printer|_pdl|_uscan|jetdirect|_printing/.test(mdns)
+    const ssdpHit = !!ssdpSt && /print/.test(ssdpSt)
+    const wsdHit = !!d.wsdType && /print/i.test(String(d.wsdType))
+    const tcpHit = tcp.some((s) => /jetdirect|ipp|printer|pdl/.test(s))
+    const usbHit =
+      src === 'usb' || src === 'local' ||
+      !!(d.cupsName || d.cupsUri || d.usbVendorId || d.usbProductId)
+    const httpHit = /print|laserjet|deskjet|inkjet|thermal|epson|canon|brother|xerox|ricoh|lexmark|zebra|star\s*(tsp|sp)/i
+      .test(String(d.httpTitle || '') + ' ' + String(d.manufacturer || ''))
+    return Boolean(mdnsHit || ssdpHit || wsdHit || tcpHit || usbHit || httpHit)
+  }
+
+  // ── 4. Everything else is noise ──
+  // APP/KIOSK/PHONE cards without a BLASTI signal (generic iPhone via the
+  // ios-sync TCP hit, Android typed from a DHCP lease name), PCs, routers,
+  // IoT and UNKNOWN — the user asked these to never appear again.
+  return false
+}
+
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
 /**
@@ -3625,6 +3723,9 @@ export async function runDiscoveryScan(
         blastiMode: patch.blastiMode || existing.blastiMode,
         appVersion: patch.appVersion || existing.appVersion,
         blastiInfo: patch.blastiInfo || existing.blastiInfo,
+        // 0.6.99 — the self-announced fingerprint survives merges like the
+        // other identity fields (a later ARP/HTTP patch must never erase it).
+        fingerprint: patch.fingerprint || existing.fingerprint,
         identitySource: (patch.identitySource && (patch.identitySourcePriority ?? 0) >= (existing.identitySourcePriority ?? 0))
           ? patch.identitySource
           : existing.identitySource,
@@ -3699,6 +3800,7 @@ export async function runDiscoveryScan(
         blastiMode: patch.blastiMode,
         appVersion: patch.appVersion,
         blastiInfo: patch.blastiInfo,
+        fingerprint: patch.fingerprint,
         wsdType: patch.wsdType,
       }
       // Re-fingerprint using the raw friendlyName, not the display name.
@@ -3880,6 +3982,10 @@ export async function runDiscoveryScan(
         httpServer: isPhone ? undefined : 'blasti-local',
         friendlyName: b.name,
         name: isPhone && b.status ? `${b.name} — ${b.status}` : b.name,
+        // 0.6.99 — the self-announced fingerprint (the webapp's stable uid for
+        // shells, the native uid for phones). Pairing-by-identity matches the
+        // REGISTERED device row through this value.
+        fingerprint: b.uid || b.instanceId || undefined,
         blastiMode: b.mode === 'kiosk'
           ? 'kiosk'
           : b.mode === 'desktop'
@@ -3889,9 +3995,9 @@ export async function runDiscoveryScan(
               : undefined,
         appVersion: b.appVersion,
         blastiInfo: b.instanceId
-          ? { instanceId: b.instanceId, master: !!b.master, role: b.role }
+          ? { instanceId: b.instanceId, fingerprint: b.uid || undefined, master: !!b.master, role: b.role }
           : isPhone && b.uid
-            ? { role: `pairing:${b.status || 'ready'}` }
+            ? { fingerprint: b.uid, role: `pairing:${b.status || 'ready'}` }
             : undefined,
         capabilities: isPhone ? ['UDP_BEACON', 'BLASTI_PHONE'] : ['UDP_BEACON'],
       })
@@ -3945,6 +4051,12 @@ export async function runDiscoveryScan(
         model: txtModel && !isVirtualPrinterName(txtModel) ? txtModel : undefined,
         blastiMode: txtBlastiMode,
         appVersion: rec.txt && (rec.txt.appversion || rec.txt.ver) || undefined,
+        // 0.6.99 — the mDNS TXT `uid` is the app's stable fingerprint (same id
+        // the beacon carries and discover-register uses) → pairing-by-identity
+        // matches the REGISTERED row regardless of which transport found it.
+        fingerprint: (rec.txt && typeof rec.txt.uid === 'string' && rec.txt.uid.trim())
+          ? rec.txt.uid.trim().slice(0, 64)
+          : undefined,
         capabilities: [`mDNS:${rec.serviceType}`],
       })
     }

@@ -2751,6 +2751,40 @@ function createApp() {
     return c.json({ success: true, data: { preferredMasterInstanceId: applied, ...lanAuthority.statusSnapshot() } })
   })
 
+  // ─── 0.6.100: LAN join-approval routes (devices must ACCEPT before pairing)
+  // GET    /api/lan/join-requests            — pending pairing requests
+  // POST   /api/lan/join-requests/:id/accept — grant access/authority on the
+  //                                            device's next join attempt
+  // POST   /api/lan/join-requests/:id/reject — refuse it (403 on retry)
+  // Auth: the shared session token (the master's own UI) or any device token.
+  app.get('/api/lan/join-requests', async (c) => {
+    const token = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Local-Token') || ''
+    const isLocalCaller = !!(token && sessionToken && token === sessionToken)
+    const isDeviceCaller = !!lanAuthority.verifyDeviceToken(token)
+    if (!isLocalCaller && !isDeviceCaller) {
+      return c.json({ success: false, code: 'AUTH_NO_TOKEN', error: 'Session or device token required' }, 401)
+    }
+    return c.json({ success: true, data: { requests: lanAuthority.listJoinRequests().filter((r) => r.status === 'PENDING'), role: lanAuthority.statusSnapshot().role } })
+  })
+  app.post('/api/lan/join-requests/:id/:verdict', async (c) => {
+    const token = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Local-Token') || ''
+    const isLocalCaller = !!(token && sessionToken && token === sessionToken)
+    const isDeviceCaller = !!lanAuthority.verifyDeviceToken(token)
+    if (!isLocalCaller && !isDeviceCaller) {
+      return c.json({ success: false, code: 'AUTH_NO_TOKEN', error: 'Session or device token required' }, 401)
+    }
+    const deviceId = c.req.param('id')
+    const verdict = String(c.req.param('verdict') || '').toUpperCase()
+    if (verdict !== 'ACCEPT' && verdict !== 'REJECT') {
+      return c.json({ success: false, error: 'verdict must be accept or reject' }, 400)
+    }
+    const result = verdict === 'ACCEPT'
+      ? await lanAuthority.approveJoinRequest(deviceId)
+      : await lanAuthority.rejectJoinRequest(deviceId)
+    if (!result.ok) return c.json({ success: false, error: result.error }, 404)
+    return c.json({ success: true, verdict: verdict.toLowerCase() })
+  })
+
   app.get('/api/health', async (c) => {
     // Task 42: build identity — lets diagnostics (and the second-launch guard
     // in main.js) tell a CURRENT local API from a STALE one left running by an
@@ -2826,6 +2860,17 @@ function createApp() {
     // Additive — legacy clients ignore the extra fields entirely.
     let lanAuth = null
     try { lanAuth = lanAuthority.publicIdentity() } catch { /* non-fatal */ }
+    // 0.6.100 — CASCADE DISCOVERY: the USB peripherals (printers) attached to
+    // this machine ride the identity response, so a scan launched from ANY
+    // other branch device sees them (the host answered the BLASTI signal →
+    // its peripherals inherit that trust) and can register + use them.
+    let peripherals = []
+    try {
+      const scanner = require('./lib/discovery-scanner')
+      if (typeof scanner.getLocalPeripheralsCached === 'function') {
+        peripherals = scanner.getLocalPeripheralsCached()
+      }
+    } catch { /* non-fatal */ }
     return c.json({
       service: 'blasti-local',
       version,
@@ -2841,6 +2886,7 @@ function createApp() {
       networkInterface: LAN_ENABLED ? primaryLanInterface(lanIp) : null,
       syncReady: true,
       ...(lanAuth || {}),
+      peripherals,
       capabilities: [
         'auth',
         'agency',
@@ -12980,6 +13026,71 @@ function createApp() {
       try { localRealtime.broadcastLocalRealtime(type, payload) } catch { /* non-fatal */ }
     },
     diagLog,
+    // 0.6.100 — the local session token, so the host print service can accept
+    // the master's own UI as a caller.
+    sessionToken,
+    // 0.6.100 — incoming pairing offer for a DESKTOP target: this PC's
+    // operator must ACCEPT (native dialog) before the pairing completes.
+    onPairingOffer: (offer) => {
+      try {
+        const { dialog, BrowserWindow } = require('electron')
+        const win = BrowserWindow.getFocusedWindow() || null
+        const opts = {
+          type: 'question',
+          buttons: ['Accept', 'Reject'],
+          defaultId: 0,
+          cancelId: 1,
+          title: 'BLASTI — Pairing request',
+          message: `Allow "${offer.deviceName || 'this device'}" to pair?`,
+          detail: `${offer.agencyName || 'An agency'}${offer.sentByName ? ` (sent by ${offer.sentByName})` : ''} wants to pair THIS PC with the branch devices. Accept to grant it access and authority.`,
+          noLink: true,
+        }
+        const run = win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts)
+        Promise.resolve(run).then(async ({ response }) => {
+          const db2 = db
+          if (!db2) return
+          const now = new Date()
+          if (response === 0) {
+            try {
+              await db2.agencyDevice.update({
+                where: { id: offer.deviceId },
+                data: {
+                  agencyId: offer.agencyId || null,
+                  branchId: offer.branchId || null,
+                  status: 'ONLINE',
+                  statusChangedAt: now,
+                  connectedAt: now,
+                  lastHeartbeatAt: now,
+                },
+              })
+              if (offer.commandId) {
+                await db2.deviceCommand.updateMany({
+                  where: { id: offer.commandId, deviceId: offer.deviceId, type: 'PAIRING_REQUEST' },
+                  data: { status: 'COMPLETED', completedAt: now },
+                }).catch(() => {})
+              }
+              try {
+                emitEvent('agency-device:connected', { agencyId: offer.agencyId, deviceId: offer.deviceId, deviceName: offer.deviceName })
+                localRealtime.broadcastLocalRealtime('agency-device:connected', { agencyId: offer.agencyId, deviceId: offer.deviceId, deviceName: offer.deviceName })
+              } catch { /* non-fatal */ }
+              try { require('./lib/device-event').deviceEvent('pairing_accepted', `Desktop shell accepted pairing from ${offer.agencyName || 'manager'} (native dialog)`, { deviceId: offer.deviceId, deviceName: offer.deviceName, status: 'ONLINE' }) } catch { /* log only */ }
+            } catch (acceptErr) {
+              console.warn('[LocalAPI] pairing dialog accept failed:', acceptErr && acceptErr.message)
+            }
+          } else {
+            try {
+              if (offer.commandId) {
+                await db2.deviceCommand.updateMany({
+                  where: { id: offer.commandId, deviceId: offer.deviceId, type: 'PAIRING_REQUEST', status: 'PENDING' },
+                  data: { status: 'FAILED', error: 'Rejected by PC operator (native dialog)' },
+                }).catch(() => {})
+              }
+              try { require('./lib/device-event').deviceEvent('pairing_rejected', `Desktop shell rejected pairing from ${offer.agencyName || 'manager'} (native dialog)`, { deviceId: offer.deviceId, deviceName: offer.deviceName }) } catch { /* log only */ }
+            } catch { /* non-fatal */ }
+          }
+        }).catch(() => { /* dialog failed — device-status poll remains */ })
+      } catch { /* Electron unavailable — non-fatal */ }
+    },
     // Kiosk join-queue → local walk-in Reservation must reach the cloud via
     // the canonical outbox (same transactional pattern as /queue/walk-in).
     withOutboxTransaction,
@@ -13212,7 +13323,48 @@ async function startLocalApi(dbPath, port, options) {
       getSession: () => (sessionToken && sessionUser ? { token: sessionToken, user: sessionUser } : null),
       statusSnapshot: () => lanAuthority.statusSnapshot(),
       setPreferredMaster: (id) => lanAuthority.setPreferredMaster(id),
+      // 0.6.100 — cloud verdict relay: the owner approved/rejected pending LAN
+      // join requests from the web Device Manager on another device.
+      applyJoinVerdicts: (verdicts) => lanAuthority.applyJoinVerdicts(verdicts),
+      // 0.6.100 — USB peripherals (printers) attached to THIS machine ride the
+      // report so every branch device can discover + register + use them.
+      getPeripherals: () => {
+        try {
+          const scanner = require('./lib/discovery-scanner')
+          return typeof scanner.getLocalPeripheralsCached === 'function'
+            ? scanner.getLocalPeripheralsCached()
+            : []
+        } catch { return [] }
+      },
       diag: diagLog,
+    })
+    // 0.6.100 — the master machine ASKS ITS OPERATOR: when an unknown device
+    // asks to join, an Electron Accept/Reject dialog pops immediately (the
+    // cloud relay + local routes stay available for remote approval).
+    lanAuthority.setJoinRequestNotifier((req) => {
+      try {
+        const { dialog, BrowserWindow } = require('electron')
+        const win = BrowserWindow.getFocusedWindow() || null
+        const detail = `${req.name || 'A device'} (${req.platform || 'unknown platform'}) wants to pair with this branch PC and join the workspace of ${req.username || 'a staff member'}.`
+        const opts = {
+          type: 'question',
+          buttons: ['Accept', 'Reject'],
+          defaultId: 0,
+          cancelId: 1,
+          title: 'BLASTI — Pairing request',
+          message: 'Allow this device to pair?',
+          detail,
+          noLink: true,
+        }
+        const run = win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts)
+        Promise.resolve(run).then(({ response }) => {
+          if (response === 0) {
+            lanAuthority.approveJoinRequest(req.deviceId).catch(() => {})
+          } else {
+            lanAuthority.rejectJoinRequest(req.deviceId).catch(() => {})
+          }
+        }).catch(() => { /* dialog failed — routes/verdicts remain */ })
+      } catch { /* Electron unavailable — non-fatal */ }
     })
   } catch (lanAuthErr) {
     console.warn('[LocalAPI] LAN authority init failed (non-fatal):', lanAuthErr?.message || lanAuthErr)

@@ -66,7 +66,10 @@ import {
   type TicketInfo,
   MAX_RETRIES,
   BACKOFF_DELAYS,
-  generateFingerprint,
+  getStableDeviceFingerprint,
+  setDeviceSurfaceActive,
+  reportDeviceSurfaceIdentity,
+  clearDeviceSurfaceIdentity,
   generateQRDataURL,
   getLocalizedName,
   getPageVariants,
@@ -95,18 +98,13 @@ import { useCategoryTermScope } from '@/hooks/use-category-terms';
  * had nothing to match). Persisted once, reused for: the UDP beacon `uid`,
  * every discover-register/kiosk-auth `deviceFingerprint`, and the manager's
  * pairing-by-identity lookup — one stable identity end-to-end.
+ *
+ * 0.6.99 — moved to kiosk-types.ts as getStableDeviceFingerprint() so the TV
+ * board surface shares the SAME per-machine identity (and the beacon, the
+ * register calls and the manager all agree). Collision-safe (random suffix).
  */
 function getStableKioskFingerprint(): string {
-  try {
-    let fp = localStorage.getItem('blasti_kiosk_beacon_uid');
-    if (!fp) {
-      fp = generateFingerprint();
-      localStorage.setItem('blasti_kiosk_beacon_uid', fp);
-    }
-    return fp;
-  } catch {
-    return generateFingerprint();
-  }
+  return getStableDeviceFingerprint();
 }
 
 export function DeviceKiosk() {
@@ -161,6 +159,24 @@ export function DeviceKiosk() {
     } catch { /* never block the kiosk */ }
   }, []);
 
+  // ─── 0.6.99 — device-surface flag + Electron beacon identity ──────────
+  // (1) The flag lets getApiBaseUrl() point a kiosk running INSIDE the
+  //     desktop webview at a REMOTE branch desktop it discovered (a kiosk PC
+  //     is a terminal of the branch store, which holds the agency data and
+  //     the pairing commands — its own local db is empty).
+  // (2) The Electron IPC report makes the UDP beacon advertise the SAME
+  //     fingerprint the kiosk registers with — the missing half of pairing
+  //     (the manager paired the instanceId-only beacon card and the request
+  //     never reached the waiting kiosk).
+  useEffect(() => {
+    setDeviceSurfaceActive(true);
+    reportDeviceSurfaceIdentity('kiosk');
+    return () => {
+      setDeviceSurfaceActive(false);
+      clearDeviceSurfaceIdentity();
+    };
+  }, []);
+
   // Inactivity timer
   const [inactivitySeconds, setInactivitySeconds] = useState(0);
 
@@ -211,11 +227,18 @@ export function DeviceKiosk() {
 
 
   // ─── LAN Auto-Discovery ────────────────────────────────────
+  // 0.6.99 — device surfaces prefer a REMOTE branch desktop: a kiosk/TV PC is
+  // a terminal of the branch store (which holds the agency data and the
+  // pairing commands) — its own local db is empty when nobody signed in, and
+  // pairing/queue ops against it could never work. `selfIps` keeps the sweep
+  // from pinning this machine as "remote". When no remote desktop answers,
+  // the same-PC kiosk falls back to its own store (which IS the branch store
+  // when the operator signed in here).
   useEffect(() => {
     let mounted = true;
     async function discover() {
       try {
-        const server = await quickDiscover();
+        const server = await quickDiscover({ preferRemote: true, selfIps: kioskIp ? [kioskIp] : [] });
         if (mounted && server) {
           setLanServer(server);
           // 0.6.86 — ROOT FIX (store mismatch): pin the device API base to the
@@ -234,7 +257,7 @@ export function DeviceKiosk() {
     }
     discover();
     return () => { mounted = false; };
-  }, []);
+  }, [kioskIp]);
 
   // ─── Detect Kiosk's Own IP ──────────────────────────────────
   useEffect(() => {
@@ -1118,6 +1141,20 @@ export function DeviceKiosk() {
       });
       const data = await res.json();
       if (data.success && data.agency) {
+        // 0.6.100 — ADOPT the manager-issued device token when the pairing
+        // request carries one: from now on the manager store and THIS device
+        // share ONE canonical token (this is what authorizes shared-printer
+        // jobs and other cross-store commands).
+        const adoptedToken = request.deviceToken;
+        if (adoptedToken && adoptedToken !== token) {
+          try {
+            saveDeviceToken(adoptedToken);
+            discoveryTokenRef.current = adoptedToken;
+            setDiscoveryToken(adoptedToken);
+            setDeviceToken(adoptedToken);
+            logDevice('kiosk_token_adopted', 'Adopted the manager-issued device token after pairing', { deviceType: 'KIOSK', status: 'ONLINE' });
+          } catch { /* keep the old token — pairing still works */ }
+        }
         // Use agency + services directly from the accept-pairing response
         setAgency({
           id: data.agency.id,
@@ -1144,7 +1181,8 @@ export function DeviceKiosk() {
         setIsDeviceRegistered(true);
         setPairingRequests([]);
         // Restart heartbeat to ensure it uses the correct token post-pairing
-        startDeviceHeartbeat(token);
+        // (0.6.100 — the ADOPTED manager-issued token when one was carried).
+        startDeviceHeartbeat(discoveryTokenRef.current || token);
         setStep('services');
         toast.success(t('kioskPairedSuccessfully') || 'Successfully connected!');
       } else {
@@ -1174,37 +1212,16 @@ export function DeviceKiosk() {
     }
   }, [discoveryToken, t]);
 
-  // ─── 0.6.95 — AUTOMATIC PAIRING ────────────────────────────────────────
-  // USER REQUEST: "الأجهزة التي تشغل تطبيق بلاستي في وضع الكشك في انتظار
-  // الربط التلقائي" — a kiosk in standby waits for AUTOMATIC pairing. The
-  // manager's pairing request already arrives here via the device-status
-  // poll (5s); previously a HUMAN TAP on the kiosk was still required, so
-  // unattended kiosks never paired. Now the FIRST incoming request
-  // auto-accepts after a 3-second grace window (enough to read the agency
-  // name, and Reject still wins if tapped in time).
-  const autoPairTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const autoPairFiredRef = useRef(false);
+  // ─── 0.6.100 — MANDATORY ACCEPTANCE ─────────────────────────────────
+  // The 0.6.95 auto-accept (3s grace) is REMOVED per the user requirement:
+  // "pairing request must reach the kiosk device or other pc and they must
+  // ACCEPT before pairing and connecting devices". The operator now always
+  // taps Accept (or Reject) on the discovery screen — unattended kiosks are
+  // paired by a human walking past, not silently by the manager.
   const handleAcceptPairingRef = useRef(handleAcceptPairing);
   const handleRejectPairingRef = useRef(handleRejectPairing);
   useEffect(() => { handleAcceptPairingRef.current = handleAcceptPairing; }, [handleAcceptPairing]);
   useEffect(() => { handleRejectPairingRef.current = handleRejectPairing; }, [handleRejectPairing]);
-
-  useEffect(() => {
-    if (discoveryStatus !== 'waiting' || pairingRequests.length === 0 || autoPairFiredRef.current) return;
-    autoPairFiredRef.current = true;
-    const request = pairingRequests[0];
-    try {
-      logDevice('kiosk_auto_pairing', `Auto-pairing in 3s — agency "${request.agencyName || request.agencyId}" sent a pairing request`, { deviceType: 'KIOSK', status: 'ONLINE' });
-    } catch { /* never block */ }
-    autoPairTimerRef.current = setTimeout(() => {
-      autoPairTimerRef.current = null;
-      void handleAcceptPairingRef.current(request);
-    }, 3_000);
-    return () => {
-      if (autoPairTimerRef.current) { clearTimeout(autoPairTimerRef.current); autoPairTimerRef.current = null; }
-      autoPairFiredRef.current = false;
-    };
-  }, [discoveryStatus, pairingRequests]);
 
   // Cleanup discovery poll on unmount
   useEffect(() => {

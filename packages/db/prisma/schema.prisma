@@ -419,6 +419,7 @@ model Agency {
   devices               AgencyDevice[]
   savedTvs              SavedTv[]
   lanNodes              LanNode[]
+  lanJoinVerdicts       LanJoinVerdict[]
   defaultPrinter        DefaultPrinter?
   hardwareOrders        HardwareOrder[]
   enterpriseRequests    EnterpriseContractRequest[]
@@ -1444,6 +1445,26 @@ model LanNode {
   @@unique([agencyId, instanceId])
   @@index([agencyId, lastReportAt])
   @@index([role])
+}
+
+/// 0.6.100 — remote LAN join-approval verdicts. A branch PC's pairing request
+/// waits on the master (native dialog / local routes); when the owner approves
+/// from the Device Manager on ANOTHER device, the verdict is stored here and
+/// the master's reporter pull applies it to its pending join request.
+model LanJoinVerdict {
+  id             String   @id @default(cuid())
+  agencyId       String
+  agency         Agency   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  /// Joining device id (= the desktop lan-authority deviceFingerprint)
+  deviceId       String
+  /// ACCEPT | REJECT
+  verdict        String
+  decidedById    String?
+  decidedByName  String?
+  createdAt      DateTime @default(now())
+
+  @@unique([agencyId, deviceId])
+  @@index([agencyId, createdAt])
 }
 
 model Counter {
