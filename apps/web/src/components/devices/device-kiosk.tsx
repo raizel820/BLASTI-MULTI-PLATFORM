@@ -196,6 +196,54 @@ export function DeviceKiosk() {
   const [pairingRequests, setPairingRequests] = useState<PairingRequest[]>([]);
   const discoveryPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // ─── 0.6.101 — LIVE pairing-request delivery (socket rooms) ──────────────
+  // The 5s /device-status poll stays as the fallback, but the request now
+  // ALSO arrives instantly: while the kiosk is waiting for pairing it joins
+  // the public `pairing-wait` rooms (keyed by its device id + stable
+  // fingerprint) and the manager's pairing request is pushed into those
+  // rooms by both the local API and the cloud. socket.io-client buffers the
+  // join while disconnected and flushes it on connect; the effect re-runs
+  // whenever `connected` flips, so a reconnect (which creates a fresh
+  // server-side connection with NO rooms) re-joins automatically.
+  const pairingWaitActive =
+    discoveryStatus === 'waiting' || step === 'discovery' || step === 'pairing-approval';
+  useEffect(() => {
+    if (!pairingWaitActive) return;
+    realtime.emit('join:pairing-wait', {
+      deviceId: deviceId || undefined,
+      fingerprint: getStableKioskFingerprint(),
+    });
+  }, [pairingWaitActive, deviceId, realtime.connected, realtime]);
+
+  useEffect(() => {
+    if (!pairingWaitActive) return;
+    const handler = (...args: unknown[]) => {
+      const payload = args[0] as Partial<PairingRequest> | undefined;
+      if (!payload || typeof payload.id !== 'string' || !payload.id) return;
+      const agencyId = typeof payload.agencyId === 'string' ? payload.agencyId : '';
+      if (!agencyId) return;
+      // Build the full request BEFORE the updater so TypeScript keeps the
+      // narrowed types (the guard above guarantees id/agencyId are strings).
+      const request: PairingRequest = {
+        id: payload.id,
+        agencyId,
+        agencyName: payload.agencyName || '',
+        agencyNameAr: payload.agencyNameAr || undefined,
+        agencyNameFr: payload.agencyNameFr || undefined,
+        branchName: payload.branchName || undefined,
+        sentByName: payload.sentByName || undefined,
+        deviceToken: payload.deviceToken || undefined,
+        sentAt: payload.sentAt || new Date().toISOString(),
+      };
+      // Dedupe: the same request may also arrive through the 5s poll.
+      setPairingRequests((prev) => {
+        if (prev.some((r) => r.id === request.id)) return prev;
+        return [...prev, request];
+      });
+    };
+    return realtime.on('pairing-request', handler);
+  }, [pairingWaitActive, realtime]);
+
   // Offline mode
   const [isOfflineMode, setIsOfflineMode] = useState(false);
   const [offlineTickets, setOfflineTickets] = useState<OfflineTicket[]>(() => loadOfflineTickets());
@@ -584,6 +632,11 @@ export function DeviceKiosk() {
       name: 'BLASTI App',
       uid: getStableKioskFingerprint(),
       status: 'ready-for-pairing',
+      // 0.6.102 — audit fix: the kiosk beacon never carried its surface, so
+      // the scanner classified this device as a generic PHONE card. The
+      // manager's strict result filters need mode 'kiosk' to render it as
+      // "PHONE/TABLET WITH BLASTI APP IN KIOSK MODE".
+      mode: 'kiosk',
     });
     return () => { void stopPairingBeacon(); };
   }, [step, discoveryStatus]);

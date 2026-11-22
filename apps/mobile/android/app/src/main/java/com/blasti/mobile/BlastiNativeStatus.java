@@ -1664,18 +1664,25 @@ public class BlastiNativeStatus extends Plugin {
         String uid = call.getString("uid");
         String appVersion = call.getString("appVersion");
         String status = call.getString("status");
+        // 0.6.102 — WHICH BLASTI surface is announcing ('phone' | 'kiosk').
+        // The manager's strict result filters separate PHONE WITH BLASTI APP
+        // from PHONE/TABLET WITH BLASTI APP IN KIOSK MODE — without this the
+        // scanner classified every phone beacon as a generic phone.
+        String mode = call.getString("mode");
         if (name == null || name.trim().isEmpty()) name = "BLASTI App";
         if (status == null || status.trim().isEmpty()) status = "ready-for-pairing";
+        if (mode == null || mode.trim().isEmpty()) mode = "phone";
 
         final String payloadName = name.trim();
         final String payloadUid = uid == null ? "" : uid.trim();
         final String payloadStatus = status.trim();
         final String payloadVersion = appVersion == null ? "" : appVersion.trim();
+        final String payloadMode = mode.trim();
 
         // One beacon at a time — restart the loop when called again.
         stopBeaconLoop();
         beaconRunning.set(true);
-        final String json = buildBeaconPayload(payloadName, payloadUid, payloadStatus, payloadVersion);
+        final String json = buildBeaconPayload(payloadName, payloadUid, payloadStatus, payloadVersion, payloadMode);
         Thread t = new Thread(() -> beaconLoop(json), "BLASTI-PairingBeacon");
         t.setDaemon(true);
         beaconThread = t;
@@ -1698,7 +1705,7 @@ public class BlastiNativeStatus extends Plugin {
     }
 
     /** Build the scanner-compatible beacon JSON (never throws). */
-    private static String buildBeaconPayload(String name, String uid, String status, String appVersion) {
+    private static String buildBeaconPayload(String name, String uid, String status, String appVersion, String mode) {
         JSONObject o = new JSONObject();
         try {
             o.put("service", BEACON_SERVICE);
@@ -1708,11 +1715,15 @@ public class BlastiNativeStatus extends Plugin {
             if (!appVersion.isEmpty()) o.put("appVersion", appVersion);
             o.put("platform", "android");
             o.put("httpPort", 0);
+            // 0.6.102 — the announcing surface rides the beacon so the
+            // desktop Device Manager renders the strict result-filter
+            // category (phone app vs kiosk mode).
+            if (mode != null && !mode.isEmpty()) o.put("mode", mode);
             // 0.6.96 — the BLASTI app SHARES its device information on the
             // beacon (user requirement): self-announced type + platform + a
             // timestamp. The desktop Device Manager trusts these fields
             // instead of fingerprint-guessing the phone from its MAC.
-            o.put("deviceType", "phone");
+            o.put("deviceType", "kiosk".equals(mode) ? "kiosk" : "phone");
             o.put("ts", System.currentTimeMillis());
         } catch (Throwable ignored) {
             // JSON building cannot realistically fail with these literal keys;

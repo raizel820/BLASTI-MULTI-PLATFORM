@@ -390,6 +390,45 @@ export async function emitDeviceEvent(
 }
 
 /**
+ * 0.6.101 — Push a PAIRING REQUEST into the waiting device's pre-pairing
+ * socket room(s). The historic flow only wrote a DeviceCommand row and let
+ * the device's 5-second /device-status poll discover it — and whenever the
+ * device polled a DIFFERENT store (or the poll raced the write) the request
+ * never arrived ("pairing request is not reaching to the kiosk device").
+ * The payload matches the poll's pairingRequests shape so the kiosk handles
+ * both channels with one code path.
+ */
+export async function emitPairingWaitEvent(
+  data: {
+    id: string
+    deviceId: string
+    fingerprint?: string | null
+    agencyId?: string
+    agencyName?: string
+    agencyNameAr?: string
+    agencyNameFr?: string
+    sentByName?: string
+    deviceToken?: string
+    sentAt?: string
+  },
+): Promise<boolean> {
+  try {
+    const body = JSON.stringify({ type: 'pairing-request', data })
+    const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
+      method: 'POST',
+      headers: emitHeaders(),
+      body,
+      signal: AbortSignal.timeout(3000),
+    })
+    if (response.ok) recordEmitUsage(body, { agencyId: data.agencyId ?? null }, response.status, '/realtime/emit')
+    return response.ok
+  } catch (error) {
+    console.warn(`[Realtime] Failed to emit pairing-request for device ${data.deviceId}:`, error instanceof Error ? error.message : error)
+    return false
+  }
+}
+
+/**
  * Emit an agency device event to the agency room.
  * Used when a TV/Kiosk/Display device connects, disconnects, or is updated.
  */

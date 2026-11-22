@@ -386,7 +386,18 @@ scanDevices = loadDiscoveryCache().map(markCachedDevice)
         scanState.devicesFound = p.devicesFound
       },
       onDevice: (d) => {
-        const idx = scanDevices.findIndex((x) => x.ip === d.ip)
+        // 0.6.101 — dedupe by CARD IDENTITY first, IP second. The IP-only rule
+        // collapsed every locally-attached printer (all keyed ip 127.0.0.1)
+        // into one entry — only the last USB printer survived the scan.
+        // Local printer cards carry unique ids ('local-cups:*'/'local-usb:*');
+        // network cards fall back to the IP merge as before.
+        let idx = -1
+        if (d && d.id && !String(d.id).startsWith('beacon:')) {
+          idx = scanDevices.findIndex((x) => x.id === d.id)
+        }
+        if (idx < 0 && d && d.ip && d.ip !== '127.0.0.1') {
+          idx = scanDevices.findIndex((x) => x.ip === d.ip)
+        }
         if (idx >= 0) scanDevices[idx] = d
         else scanDevices.push(d)
         scheduleDiscoveryCacheSave()
@@ -462,9 +473,16 @@ function liveBeaconDeviceCards() {
     id: 'beacon:' + b.ip,
     source: 'live-beacon',
     category: 'BLASTI',
-    type: b.service === 'blasti-phone'
-      ? 'PHONE'
-      : String(b.mode || '').toUpperCase() === 'KIOSK' ? 'KIOSK' : 'APP',
+    // 0.6.102 — STRICT result-filter categories (audit fix): the announcing
+    // mode decides the card type. A phone beacon in kiosk mode must render
+    // as KIOSK ("PHONE/TABLET WITH BLASTI APP IN KIOSK MODE"), NOT as a
+    // generic phone — the old `blasti-phone → PHONE` first-match hid the
+    // kiosk category entirely for phones/tablets running kiosk mode.
+    type: String(b.mode || '').toUpperCase() === 'KIOSK'
+      ? 'KIOSK'
+      : b.service === 'blasti-phone' || String(b.mode || '').toUpperCase() === 'PHONE'
+        ? 'PHONE'
+        : 'APP',
     name: b.name || `BLASTI @ ${b.ip}`,
     ip: b.ip,
     port: b.httpPort || 0,
@@ -499,11 +517,21 @@ function devicesResponse(category, status, includeAll) {
   }
   // 0.6.96 — merge LIVE beacon cards so ACTIVE BLASTI apps appear INSTANTLY
   // (before/without a scan). Scan cards at the same IP win (they are richer).
+  // 0.6.101 — dedupe by FINGERPRINT too: a beacon card and a scan card for the
+  // same physical device (same uid, transiently different IPs) must never
+  // both render — "discovered apps double appeared in results".
   const seenIps = new Set(devices.map((d) => d.ip).filter(Boolean))
+  const seenFingerprints = new Set(
+    devices
+      .map((d) => String(d.fingerprint || (d.blastiInfo && d.blastiInfo.fingerprint) || (d.blastiInfo && d.blastiInfo.instanceId) || '').toLowerCase())
+      .filter(Boolean),
+  )
   for (const card of liveBeaconDeviceCards()) {
-    if (card.ip && !seenIps.has(card.ip)) {
+    const cardFp = String(card.fingerprint || '').toLowerCase()
+    if (card.ip && !seenIps.has(card.ip) && !(cardFp && seenFingerprints.has(cardFp))) {
       devices.push(card)
       seenIps.add(card.ip)
+      if (cardFp) seenFingerprints.add(cardFp)
     }
   }
   return {
@@ -875,10 +903,15 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       const port = optInt(body.port, 1, 65535) || null
       const rawName = typeof body.name === 'string' ? body.name.slice(0, 100) : ''
       const rawType = String(body.deviceType || body.blastiMode || '').toUpperCase()
+      // 0.6.102 — audit fix: a PHONE card pairs into a PHONE row. The old
+      // mapping collapsed every non-TV/KIOSK/PRINTER type into APP, so a
+      // paired phone rendered as "BLASTI App" (desktop) in the registry and
+      // the device tree — wrong role for the shared-queue purpose.
       const deviceType = rawType === 'TV' ? 'TV'
         : rawType === 'KIOSK' ? 'KIOSK'
           : rawType === 'PRINTER' ? 'PRINTER'
-            : 'APP'
+            : rawType === 'PHONE' ? 'PHONE'
+              : 'APP'
       if (!fingerprint && !ip) {
         return c.json({ success: false, error: 'fingerprint or ip required' }, 400)
       }
@@ -974,6 +1007,23 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         commandId: command.id,
         agencyName: agency.name,
       })
+      // 0.6.101 — INSTANT delivery: push the request into the waiting device's
+      // pre-pairing socket room (keyed by device id + fingerprint). The 5s
+      // poll stays as the fallback, but the socket push removes the whole
+      // "pairing request never reached the kiosk" class of delays.
+      broadcastSafe('pairing-request', {
+        id: command.id,
+        agencyId: agency.id,
+        agencyName: agency.name,
+        agencyNameAr: agency.nameAr,
+        agencyNameFr: agency.nameFr,
+        sentByName: user.fullName || user.username,
+        deviceId: device.id,
+        fingerprint: device.deviceFingerprint || fingerprint || undefined,
+        deviceToken: device.deviceToken || undefined,
+        sentAt: command.createdAt,
+      })
+
       deviceEvents.deviceEvent('pairing_requested', `Pairing request (scan-result) sent to ${device.name} by ${user.fullName || user.username}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type || deviceType, agencyId: agency.id, sessionId: command.id })
 
       // ── 0.6.99 — CROSS-STORE DELIVERY FALLBACKS ───────────────────────────
@@ -985,9 +1035,12 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       //   (1) LAN DIRECT — the discovered device runs its own BLASTI local
       //       API: POST the offer straight to it, landing the command in the
       //       store the kiosk actually polls.
-      //   (2) CLOUD RELAY — when the orphan was just created (the device has
-      //       never registered HERE), the device is likely registered in the
-      //       cloud store: relay the same pairing request there.
+      //   (2) CLOUD RELAY — 0.6.101: attempted for EVERY orphan, not just
+      //       freshly-created ones. The old `if (created)` gate silently
+      //       dropped the relay whenever the device had ALREADY registered
+      //       here — but that says nothing about which store the DEVICE
+      //       polls; a kiosk registered locally yet polling the cloud never
+      //       saw its request.
       const delivery = { lanOffer: false, cloudRelay: false, needsApproval: false }
       if (ip && port && port > 0) {
         try {
@@ -1020,24 +1073,25 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
           delivery.needsApproval = !!(offerData && offerData.needsApproval)
         } catch { /* offline / firewall — the local command + cloud relay remain */ }
       }
-      if (created) {
+      // 0.6.101 — ALWAYS relay (not only when `created`): which store the
+      // DEVICE polls is unknowable from here, so a session token + cloud
+      // session means the relay is cheap insurance against the store mismatch.
+      const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
+      if (token && typeof ctx.cloudFetch === 'function') {
         try {
-          const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
-          if (token && typeof ctx.cloudFetch === 'function') {
-            const cloudRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-              body: JSON.stringify({
-                fingerprint: fingerprint || undefined,
-                name: rawName || device.name || undefined,
-                ip: ip || undefined,
-                port: port || undefined,
-                deviceType: deviceType,
-              }),
-            }, { timeoutMs: 6000, attempts: 1 })
-            const cloudData = await cloudRes.json().catch(() => null)
-            delivery.cloudRelay = !!(cloudData && cloudData.success)
-          }
+          const cloudRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+            body: JSON.stringify({
+              fingerprint: fingerprint || undefined,
+              name: rawName || device.name || undefined,
+              ip: ip || undefined,
+              port: port || undefined,
+              deviceType: deviceType,
+            }),
+          }, { timeoutMs: 6000, attempts: 1 })
+          const cloudData = await cloudRes.json().catch(() => null)
+          delivery.cloudRelay = !!(cloudData && cloudData.success)
         } catch (relayErr) {
           if (diagLog) diagLog('AGENCY-DEVICE pairing cloud relay skipped: ' + (relayErr && relayErr.message))
         }
@@ -2335,7 +2389,9 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       const deviceId = c.req.param('id')
       const device = await db.agencyDevice.findUnique({
         where: { id: deviceId },
-        select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true },
+        // 0.6.101 — deviceFingerprint selected: the socket push and the cloud
+        // relay both key the delivery on the device's stable identity.
+        select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true, deviceFingerprint: true, deviceToken: true },
       })
       if (!device) {
         return c.json({ success: false, error: 'Device not found' }, 404)
@@ -2383,6 +2439,38 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         commandId: command.id,
         agencyName: agency.name,
       })
+      // 0.6.101 — INSTANT delivery into the waiting device's pre-pairing room
+      // (same channel + payload shape as pairing-request-by-identity above).
+      broadcastSafe('pairing-request', {
+        id: command.id,
+        agencyId: agency.id,
+        agencyName: agency.name,
+        agencyNameAr: agency.nameAr,
+        agencyNameFr: agency.nameFr,
+        sentByName: user.fullName || user.username,
+        deviceId: device.id,
+        fingerprint: device.deviceFingerprint || undefined,
+        deviceToken: device.deviceToken || undefined,
+        sentAt: command.createdAt,
+      })
+      // 0.6.101 — cross-store relay: the device may poll the CLOUD store even
+      // though its orphan row lives here (discovered locally, registered in
+      // the cloud earlier). Relay the same request so it lands wherever the
+      // device actually listens. Best-effort — never blocks the response.
+      try {
+        const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
+        if (token && device.deviceFingerprint && typeof ctx.cloudFetch === 'function') {
+          await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+            body: JSON.stringify({
+              fingerprint: device.deviceFingerprint,
+              name: device.name || undefined,
+              deviceType: device.type === 'TV' ? 'TV' : device.type === 'KIOSK' ? 'KIOSK' : 'APP',
+            }),
+          }, { timeoutMs: 6000, attempts: 1 })
+        }
+      } catch { /* relay is best-effort */ }
       // 0.6.88 — device event stream: agency sent a pairing request to a kiosk.
       deviceEvents.deviceEvent('pairing_requested', `Pairing request sent to ${device.name} by ${user.fullName || user.username}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId: agency.id, sessionId: command.id })
       return c.json({

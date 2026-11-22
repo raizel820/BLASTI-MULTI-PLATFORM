@@ -9,7 +9,7 @@ import { z } from 'zod'
 import { recordSyncChange } from '../lib/sync-helpers'
 import crypto from 'crypto'
 import { validateBody, kioskJoinSchema } from '../lib/validations'
-import { emitQueueEvent, emitKioskEvent, emitAgencyDeviceEvent } from '../lib/realtime-emit'
+import { emitQueueEvent, emitKioskEvent, emitAgencyDeviceEvent, emitPairingWaitEvent } from '../lib/realtime-emit'
 // Task 2-a — device walk-in joins create reservations → invalidate cached
 // public GETs that expose reservation-derived numbers.
 import { invalidateResponseCacheTag } from '../lib/response-cache'
@@ -309,7 +309,10 @@ const discoverRegisterSchema = z.object({
   // NOTE: No agencyCode — discovery registers orphan devices (agencyId: null) in PAIRING status.
   // The manager sends a pairing request later to assign an agency.
   deviceName: z.string().max(100).optional(),
-  deviceType: z.enum(['KIOSK', 'TV', 'DISPLAY', 'PRINTER', 'APP'], { message: 'Invalid device type' }).default('KIOSK'),
+  // 0.6.102 — audit fix: PHONE joins the whitelist so a phone running the
+  // BLASTI app (agency account opened) can register as a "PHONE WITH BLASTI
+  // APP" device waiting for approval (same channels the kiosk uses).
+  deviceType: z.enum(['KIOSK', 'TV', 'DISPLAY', 'PRINTER', 'APP', 'PHONE'], { message: 'Invalid device type' }).default('KIOSK'),
   connectionType: z.enum(['LAN', 'WIFI', 'CABLE', 'MANUAL'], { message: 'Invalid connection type' }).optional(),
   deviceFingerprint: z.string().max(200).optional(),
 })
@@ -1224,11 +1227,10 @@ app.post('/public/discover-register', async (c) => {
     }
 
     if (newDevice) {
-      emitAgencyDeviceEvent('device:registered', 'discovery', {
-        deviceId: newDevice.id,
-        deviceName: newDevice.name,
-        deviceType: newDevice.type,
-      })
+      // 0.6.101 — the historic emit passed the literal 'discovery' agencyId →
+      // room agency:discovery, which NO client ever joins — dead air. The
+      // unpaired strip discovers new orphans via its 10s poll; pairing
+      // requests now use the pairing-wait rooms instead.
       // 0.6.88 — device event stream: kiosk self-registered for discovery.
       appendDeviceEvent({
         event: 'kiosk_registered',
@@ -1943,7 +1945,9 @@ app.post('/:id/pairing-request', async (c) => {
     // Verify device exists and is unpaired
     const device = await db.agencyDevice.findUnique({
       where: { id: deviceId },
-      select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true },
+      // 0.6.101 — deviceFingerprint/deviceToken selected: the pairing-wait
+      // socket push and the adopted-token payload key on the device identity.
+      select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true, deviceFingerprint: true, deviceToken: true },
     })
 
     if (!device) {
@@ -2009,6 +2013,22 @@ app.post('/:id/pairing-request', async (c) => {
       commandId: command.id,
       agencyId: agency.id,
       agencyName: agency.name,
+    })
+    // 0.6.101 — INSTANT delivery into the waiting device's pre-pairing socket
+    // room (keyed by device id + fingerprint). The 5s /device-status poll
+    // stays as the fallback — the socket push removes the whole "pairing
+    // request never reached the kiosk" class of failures.
+    void emitPairingWaitEvent({
+      id: command.id,
+      deviceId: device.id,
+      fingerprint: device.deviceFingerprint || undefined,
+      agencyId: agency.id,
+      agencyName: agency.name,
+      agencyNameAr: agency.nameAr || undefined,
+      agencyNameFr: agency.nameFr || undefined,
+      sentByName: user.fullName || user.username,
+      deviceToken: device.deviceToken || undefined,
+      sentAt: command.createdAt instanceof Date ? command.createdAt.toISOString() : String(command.createdAt),
     })
 
     // 0.6.88 — device event stream: agency sent a pairing request to a kiosk.
@@ -3709,7 +3729,10 @@ app.post('/discovery/pairing-request-by-identity', async (c) => {
     let created = false
     if (!device) {
       const rawType = String(body.deviceType || '').toUpperCase()
-      const deviceType = rawType === 'TV' ? 'TV' : rawType === 'KIOSK' ? 'KIOSK' : rawType === 'PRINTER' ? 'PRINTER' : 'APP'
+      // 0.6.102 — audit fix: a PHONE card pairs into a PHONE row (the old
+      // mapping collapsed phones into APP, rendering them as desktop shells
+      // in the registry + device tree).
+      const deviceType = rawType === 'TV' ? 'TV' : rawType === 'KIOSK' ? 'KIOSK' : rawType === 'PRINTER' ? 'PRINTER' : rawType === 'PHONE' ? 'PHONE' : 'APP'
       device = await db.agencyDevice.create({
         data: {
           agencyId: null,
@@ -3803,6 +3826,20 @@ app.post('/discovery/pairing-request-by-identity', async (c) => {
       commandId: command.id,
       agencyId: agency.id,
       agencyName: agency.name,
+    })
+    // 0.6.101 — INSTANT delivery into the waiting device's pre-pairing socket
+    // room (scan-result path — same channel as /:id/pairing-request).
+    void emitPairingWaitEvent({
+      id: command.id,
+      deviceId: device.id,
+      fingerprint: device.deviceFingerprint || fingerprint || undefined,
+      agencyId: agency.id,
+      agencyName: agency.name,
+      agencyNameAr: agency.nameAr || undefined,
+      agencyNameFr: agency.nameFr || undefined,
+      sentByName: user.fullName || user.username,
+      deviceToken: device.deviceToken || undefined,
+      sentAt: command.createdAt instanceof Date ? command.createdAt.toISOString() : String(command.createdAt),
     })
     appendDeviceEvent({
       event: 'pairing_requested',

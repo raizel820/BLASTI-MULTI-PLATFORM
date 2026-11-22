@@ -170,7 +170,28 @@ function canJoinAdmin(user) {
   return !!user && user.role === 'SUPER_ADMIN'
 }
 
-/** Apply the cloud-compatible room protocol to a socket. */
+/**
+ * 0.6.101 — room keys for the pre-pairing delivery rooms. Accepts either a
+ * plain object { deviceId?, fingerprint? } or a bare string (fingerprint).
+ * Keys are sanitized to safe room suffixes (alnum, dash, underscore, colon —
+ * max 200 chars) so a malicious payload can never craft a wildcard room.
+ */
+function pairingWaitRoomKeys(payload) {
+  const keys = []
+  const push = (val) => {
+    if (typeof val !== 'string') return
+    const clean = val.trim().slice(0, 200).replace(/[^a-zA-Z0-9:_-]/g, '')
+    if (clean && !keys.includes(clean)) keys.push(clean)
+  }
+  if (typeof payload === 'string') {
+    push(payload)
+  } else if (payload && typeof payload === 'object') {
+    push(payload.deviceId)
+    push(payload.fingerprint)
+  }
+  return keys
+}
+
 function _registerRoomHandlers(socket, authRef) {
   const ensureAuth = () => authRef.user
 
@@ -244,6 +265,29 @@ function _registerRoomHandlers(socket, authRef) {
 
   socket.on('leave:kiosk', (agencyId) => {
     if (agencyId) socket.leave('kiosk:' + agencyId)
+  })
+
+  // ─── 0.6.101 — PRE-PAIRING DELIVERY ROOMS ────────────────────────────────
+  // A kiosk / phone / desktop shell WAITING for pairing has no agency room
+  // (it joins rooms only AFTER it has a token + agency). Its 5-second
+  // /device-status poll was the ONLY delivery channel, so a pairing request
+  // written while the poll was mid-flight (or aimed at the other store)
+  // waited up to a full poll cycle — or never arrived ("pairing request is
+  // not reaching to the kiosk device"). These PUBLIC rooms are keyed by the
+  // waiting device's OWN identity (device id and/or stable fingerprint) and
+  // carry exactly one event type: 'pairing-request'. No secrets, no agency
+  // data — the same payload the poll already returns to the device itself.
+  socket.on('join:pairing-wait', (payload) => {
+    const keys = pairingWaitRoomKeys(payload)
+    if (!keys.length) {
+      warn('socket', socket.id, 'join:pairing-wait without a usable identity — ignored')
+      return
+    }
+    for (const key of keys) socket.join('pairing-wait:' + key)
+  })
+
+  socket.on('leave:pairing-wait', (payload) => {
+    for (const key of pairingWaitRoomKeys(payload)) socket.leave('pairing-wait:' + key)
   })
 
   // Device rooms (TV boards / kiosks authenticated by deviceToken — mirrors
@@ -489,6 +533,20 @@ function broadcastLocalRealtime(type, payload) {
       _io.to('agency:' + agencyId).emit('realtime-event', { type, data })
       recipients += room('agency:' + agencyId)
     }
+  } else if (type === 'pairing-request') {
+    // 0.6.101 — INSTANT pairing delivery to the waiting device. The payload is
+    // the SAME shape the /device-status poll returns for pairingRequests, so
+    // the kiosk handles both channels with one code path. Rooms are keyed by
+    // device id AND fingerprint — whichever identity the waiting device used
+    // to join. Delivered FLAT (not wrapped in {type,data}) to match the poll.
+    const pushed = pairingWaitRoomKeys({ deviceId: data.deviceId, fingerprint: data.fingerprint })
+    for (const key of pushed) {
+      _io.to('pairing-wait:' + key).emit('pairing-request', {
+        ...data,
+        sentAt: data.sentAt || new Date().toISOString(),
+      })
+      recipients += room('pairing-wait:' + key)
+    }
   } else if (
     type.startsWith('agency:') ||
     type.startsWith('staff:') ||
@@ -587,4 +645,6 @@ module.exports = {
   setLocalRealtimeRelayContext,
   relayCloudRealtime,
   getLocalRealtimeStats,
+  // 0.6.101 — pre-pairing delivery rooms (join sanitation + tests)
+  pairingWaitRoomKeys,
 }

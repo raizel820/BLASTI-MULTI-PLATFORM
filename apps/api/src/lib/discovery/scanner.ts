@@ -30,7 +30,7 @@ import { Buffer } from 'node:buffer'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-export type DiscoverySource = 'arp' | 'ping' | 'tcp-sweep' | 'mdns' | 'ssdp' | 'ws-discovery' | 'http_probe' | 'usb' | 'local' | 'udp-beacon'
+export type DiscoverySource = 'arp' | 'ping' | 'tcp-sweep' | 'mdns' | 'ssdp' | 'ws-discovery' | 'http_probe' | 'usb' | 'local' | 'udp-beacon' | 'peripheral-report'
 export type DeviceCategory = 'BLASTI' | 'NETWORK' | 'UPNP' | 'LOCAL'
 export type DeviceType = 'TV' | 'KIOSK' | 'DISPLAY' | 'PRINTER' | 'APP' | 'PHONE' | 'ROUTER' | 'IOT' | 'PC' | 'UNKNOWN'
 
@@ -124,6 +124,12 @@ export interface DiscoveredDeviceRaw {
    *  without it the manager paired a DIFFERENT orphan row and the pairing
    *  request never reached the waiting kiosk. */
   fingerprint?: string
+  /** 0.6.101 — CASCADE PERIPHERALS: the BLASTI host this USB peripheral is
+   *  physically attached to (print jobs route through its LAN address). */
+  hostIp?: string
+  hostName?: string
+  hostFingerprint?: string
+  hostPort?: number
 }
 
 export type ScanPhase =
@@ -1717,6 +1723,10 @@ export interface BlastiIdentifyResult {
   mode: 'kiosk' | 'desktop'
   version?: string
   instanceId?: string
+  /** 0.6.101 — stable device fingerprint (uid/fingerprint/instanceId fallback). */
+  fingerprint?: string
+  /** 0.6.101 — USB peripherals (printers) attached to the probed host. */
+  peripherals?: Array<Record<string, unknown>>
   agencyId?: string
   master: boolean
   role?: string
@@ -1738,6 +1748,22 @@ export async function blastiIdentifyProbe(ip: string, port: number, timeoutMs = 
       mode: body.mode === 'kiosk' ? 'kiosk' : (String(body.role || '').toLowerCase() === 'kiosk' ? 'kiosk' : 'desktop'),
       version: (body.version as string) || undefined,
       instanceId: (body.instanceId as string) || undefined,
+      // 0.6.101 — stable fingerprint + attached peripherals ride the identity
+      // response; the fingerprint lets pairing-by-identity match the
+      // REGISTERED row, the peripherals cascade printer cards so a scan from
+      // ANY device discovers a printer plugged into a DIFFERENT branch PC.
+      fingerprint: (typeof body.uid === 'string' && body.uid.trim())
+        ? body.uid.trim().slice(0, 64)
+        : (typeof body.fingerprint === 'string' && body.fingerprint.trim())
+          ? body.fingerprint.trim().slice(0, 64)
+          : (typeof body.instanceId === 'string' && body.instanceId.trim())
+            ? body.instanceId.trim().slice(0, 64)
+            : undefined,
+      peripherals: Array.isArray(body.peripherals)
+        ? (body.peripherals as Array<Record<string, unknown>>).filter(
+            (p) => p && typeof p === 'object' && typeof (p as Record<string, unknown>).name === 'string' && String((p as Record<string, unknown>).name).trim(),
+          )
+        : undefined,
       agencyId: (body.agencyId as string) || undefined,
       master: !!body.master,
       role: (body.role as string) || undefined,
@@ -2632,7 +2658,12 @@ interface UsbDeviceInfo {
 
 async function queryUsbDevices(isAborted: () => boolean): Promise<UsbDeviceInfo[]> {
   if (isAborted()) return []
-  if (process.platform === 'win32') return []  // Windows uses different USB stack
+  // 0.6.101 — WINDOWS USB ENUMERATION: the old `return []` made every USB
+  // printer without an OS print queue invisible on Windows. `Get-PnpDevice`
+  // walks the PnP tree directly — a USB printer attached to the PC shows up
+  // even with no driver/queue, so the beacon / /api/discover report carries
+  // it and ANY branch device can discover it. (1:1 with the local scanner.)
+  if (process.platform === 'win32') return queryWindowsUsbPrinters(isAborted)
   // On Linux: `lsusb` (or `lsusb -v` for verbose)
   // On macOS: `system_profiler SPUSBDataType` (XML)
   if (process.platform === 'darwin') {
@@ -2645,6 +2676,63 @@ async function queryUsbDevices(isAborted: () => boolean): Promise<UsbDeviceInfo[
     child.stdout.on('data', (d) => { out += d.toString() })
     child.on('error', () => resolve([]))
     child.on('close', () => resolve(parseLsusb(out)))
+  })
+}
+
+/**
+ * 0.6.101 — Windows PnP enumeration (USB printers). Uses `Get-PnpDevice
+ * -PresentOnly` filtered to USB instance ids, keeping printer-ish entries
+ * (known vendor ids, USBPRINT, printer keywords). Shape matches parseLsusb.
+ */
+function queryWindowsUsbPrinters(isAborted: () => boolean): Promise<UsbDeviceInfo[]> {
+  return new Promise((resolve) => {
+    if (isAborted()) return resolve([])
+    const ps = [
+      '$ErrorActionPreference=\'SilentlyContinue\'',
+      'Get-PnpDevice -PresentOnly |',
+      'Where-Object { $_.InstanceId -like \'USB\\*\' } |',
+      'Select-Object -First 200 -Property FriendlyName,InstanceId |',
+      'ConvertTo-Json -Compress -Depth 2',
+    ].join('; ')
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 8000 })
+    let out = ''
+    let done = false
+    const finish = (val: UsbDeviceInfo[]) => { if (!done) { done = true; resolve(val) } }
+    child.stdout.on('data', (d) => { out += d.toString() })
+    child.on('error', () => finish([]))
+    child.on('close', () => {
+      if (isAborted()) return finish([])
+      const devices: UsbDeviceInfo[] = []
+      try {
+        const parsed: unknown = JSON.parse(out)
+        const entries: Array<Record<string, unknown>> = Array.isArray(parsed)
+          ? parsed as Array<Record<string, unknown>>
+          : (parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).FriendlyName ? [parsed as Record<string, unknown>] : [])
+        const knownPrinterVendors = ['03f0', '04b8', '04a9', '04f9', '0519', '0dd4', '154f']
+        for (const e of entries) {
+          if (!e || typeof e !== 'object') continue
+          const name = typeof e.FriendlyName === 'string' ? e.FriendlyName.trim() : ''
+          const instanceId = typeof e.InstanceId === 'string' ? e.InstanceId : ''
+          if (!name && !instanceId) continue
+          const vidMatch = instanceId.match(/VID_([0-9A-Fa-f]{4})/)
+          const pidMatch = instanceId.match(/PID_([0-9A-Fa-f]{4})/)
+          const vendorId = vidMatch ? vidMatch[1].toLowerCase() : undefined
+          const productId = pidMatch ? pidMatch[1].toLowerCase() : undefined
+          const isPrinter = (vendorId !== undefined && knownPrinterVendors.includes(vendorId)) ||
+            /USBPRINT|printer|print|laserjet|deskjet|inkjet|thermal|pos-?80|esc-?pos|receipt/i.test(name + ' ' + instanceId)
+          if (!isPrinter) continue
+          devices.push({
+            busDevice: instanceId.slice(0, 80),
+            vendorId: vendorId || '0000',
+            productId: productId || '0000',
+            manufacturer: undefined,
+            productName: name || instanceId,
+            isPrinter: true,
+          })
+        }
+      } catch { /* malformed JSON / PS unavailable — no devices */ }
+      finish(devices)
+    })
   })
 }
 
@@ -4025,6 +4113,11 @@ export async function runDiscoveryScan(
       if (!rec.ip) continue
       // Filter to our subnets
       if (!subnets.some((s) => rec.ip.startsWith(s + '.'))) continue
+      // 0.6.101 — NEVER list OUR OWN machine from the mDNS harvest: the app's
+      // `_blasti-*` responder answers our own queries from our own IP, which
+      // used to upsert a self-card (duplicate of our own registry row). 1:1
+      // with the local scanner port.
+      if (selfIps.has(rec.ip)) continue
       // Store the raw mDNS instance name in friendlyName (preserved across
       // merges for re-fingerprinting). Only set it as the display `name` if
       // it's NOT a virtual-printer queue name ("Adobe PDF", etc.) — those are
@@ -4387,14 +4480,53 @@ export async function runDiscoveryScan(
                   name: blasti.name,
                   appVersion: blasti.version,
                   blastiMode: blasti.mode,
+                  // 0.6.101 — pairing-by-identity needs the SAME stable
+                  // fingerprint the beacon carries (probe path now parses it).
+                  fingerprint: blasti.fingerprint,
                   blastiInfo: {
                     instanceId: blasti.instanceId,
+                    fingerprint: blasti.fingerprint,
                     master: blasti.master,
                     role: blasti.role,
                     agencyId: blasti.agencyId,
                   },
                   capabilities: ['BLASTI_API'],
                 })
+                // 0.6.101 — CASCADE the peripherals reported over the identity
+                // probe (1:1 with the local scanner): a USB printer attached
+                // to this host becomes its own PRINTER card, discoverable and
+                // registrable from ANY branch device.
+                if (Array.isArray(blasti.peripherals) && blasti.peripherals.length > 0) {
+                  blasti.peripherals.slice(0, 12).forEach((p, idx) => {
+                    if (!p || typeof p !== 'object') return
+                    const pname = typeof p.name === 'string' && p.name.trim() ? p.name.trim().slice(0, 100) : ''
+                    if (!pname) return
+                    upsertDevice(`${job.ip}-pp-${idx}`, {
+                      source: 'peripheral-report',
+                      category: 'LOCAL',
+                      type: 'PRINTER',
+                      connectionType: 'USB',
+                      ip: job.ip,
+                      port: 0,
+                      name: pname,
+                      manufacturer: typeof p.manufacturer === 'string' ? p.manufacturer : undefined,
+                      model: typeof p.model === 'string' ? p.model : undefined,
+                      cupsName: typeof p.cupsName === 'string' ? p.cupsName : undefined,
+                      cupsUri: typeof p.cupsUri === 'string' ? p.cupsUri : undefined,
+                      usbVendorId: typeof p.usbVendorId === 'string' ? p.usbVendorId : undefined,
+                      usbProductId: typeof p.usbProductId === 'string' ? p.usbProductId : undefined,
+                      hostIp: job.ip,
+                      hostName: blasti.name,
+                      hostFingerprint: blasti.fingerprint,
+                      hostPort: job.port,
+                      friendlyName: pname,
+                      status: 'ONLINE',
+                      confidence: 92,
+                      identitySource: 'host-reported',
+                      capabilities: ['USB_HOST', 'PERIPHERAL_REPORT', 'SHARED_PRINT'],
+                    })
+                  })
+                }
                 httpScanned++
                 if (httpScanned % 24 === 0) {
                   emitProgress('http', Math.floor((httpScanned / totalHttp) * totalIPs))

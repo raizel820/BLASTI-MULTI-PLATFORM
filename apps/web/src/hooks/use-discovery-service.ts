@@ -132,6 +132,12 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
           deviceTypeShared: d.deviceTypeShared ? String(d.deviceTypeShared) : undefined,
           platform: d.platform ? String(d.platform) : undefined,
           pairable: Boolean(d.pairable),
+          // 0.6.101 — CASCADE PERIPHERALS: the BLASTI host a USB printer is
+          // attached to (the card chip "USB · via <host>" needs these).
+          hostIp: d.hostIp ? String(d.hostIp) : undefined,
+          hostName: d.hostName ? String(d.hostName) : undefined,
+          hostFingerprint: d.hostFingerprint ? String(d.hostFingerprint) : undefined,
+          hostPort: typeof d.hostPort === 'number' ? d.hostPort : undefined,
         }));
         setDiscoveredDevices(devices);
       }

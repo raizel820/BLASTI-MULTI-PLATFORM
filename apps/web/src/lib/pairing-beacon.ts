@@ -40,6 +40,14 @@ export interface PairingBeaconIdentity {
   uid?: string;
   /** Why the phone is announcing — e.g. 'ready-for-pairing'. */
   status?: string;
+  /**
+   * 0.6.102 — WHICH BLASTI surface is announcing. The manager's result
+   * filters are strict (audit requirement): 'phone' → PHONE WITH BLASTI APP,
+   * 'kiosk' → PHONE/TABLET WITH BLASTI APP IN KIOSK MODE. Without this field
+   * the scanner classified every phone beacon as a generic PHONE card, so a
+   * kiosk-mode tablet was indistinguishable from a staff phone.
+   */
+  mode?: 'kiosk' | 'phone' | 'desktop';
 }
 
 function beaconPlugin():
@@ -73,6 +81,9 @@ export async function startPairingBeacon(identity: PairingBeaconIdentity = {}): 
       name: identity.name || 'BLASTI App',
       uid: identity.uid || '',
       status: identity.status || 'ready-for-pairing',
+      // 0.6.102 — the announcing surface travels with the signal so the
+      // manager renders the STRICT result-filter category.
+      mode: identity.mode || 'phone',
       appVersion: APP_VERSION || '',
     });
     return true;

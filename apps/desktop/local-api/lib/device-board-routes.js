@@ -653,7 +653,12 @@ function registerDeviceBoardRoutes(app, ctx) {
     if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
     try {
       const body = await c.req.json().catch(() => ({}))
-      const deviceType = ['KIOSK', 'TV', 'DISPLAY', 'PRINTER', 'APP'].includes(body.deviceType) ? body.deviceType : 'KIOSK'
+      // 0.6.102 — audit fix: PHONE joins the orphan whitelist so a phone
+      // running the BLASTI app (agency account opened) can register as a
+      // "PHONE WITH BLASTI APP" device waiting for approval — its pairing
+      // requests then reach it through the same device-status/pairing-wait
+      // channels the kiosk uses.
+      const deviceType = ['KIOSK', 'TV', 'DISPLAY', 'PRINTER', 'APP', 'PHONE'].includes(body.deviceType) ? body.deviceType : 'KIOSK'
       const connectionType = ['LAN', 'WIFI', 'CABLE', 'MANUAL'].includes(body.connectionType) ? body.connectionType : 'LAN'
       const deviceFingerprint = typeof body.deviceFingerprint === 'string' && body.deviceFingerprint ? body.deviceFingerprint.slice(0, 200) : null
       const effectiveName = typeof body.deviceName === 'string' && body.deviceName.trim()
@@ -704,9 +709,10 @@ function registerDeviceBoardRoutes(app, ctx) {
         },
       })
 
-      try {
-        broadcast('device:registered', { agencyId: 'discovery', deviceId: newDevice.id, deviceName: newDevice.name, deviceType: newDevice.type })
-      } catch { /* non-fatal */ }
+      // 0.6.101 — the historic `broadcast('device:registered', { agencyId:
+      // 'discovery' })` went to room agency:discovery, which NO client ever
+      // joins — dead air. Removed; the manager's unpaired strip refreshes on
+      // its 10s poll, and pairing requests now use the pairing-wait rooms.
 
       return c.json({
         success: true,
@@ -885,6 +891,27 @@ function registerDeviceBoardRoutes(app, ctx) {
           deviceName: device.name,
           commandId: command.id,
           agencyName,
+        })
+      } catch { /* non-fatal */ }
+
+      // 0.6.101 — INSTANT socket delivery: this store is the one the waiting
+      // device polls, so the pairing request rides the same machine's local
+      // realtime into the device's pre-pairing room. The 5s /device-status
+      // poll stays as the fallback — the socket makes it sub-second.
+      try {
+        broadcast('pairing-request', {
+          id: command.id,
+          agencyId: typeof body.agencyId === 'string' ? body.agencyId : undefined,
+          agencyName,
+          agencyNameAr: typeof body.agencyNameAr === 'string' ? body.agencyNameAr : undefined,
+          agencyNameFr: typeof body.agencyNameFr === 'string' ? body.agencyNameFr : undefined,
+          branchId: typeof body.branchId === 'string' ? body.branchId : undefined,
+          branchName: typeof body.branchName === 'string' ? body.branchName : undefined,
+          sentByName: typeof body.sentByName === 'string' ? body.sentByName : undefined,
+          deviceId: device.id,
+          fingerprint: device.deviceFingerprint || fingerprint || undefined,
+          deviceToken: managerToken || device.deviceToken || undefined,
+          sentAt: command.createdAt,
         })
       } catch { /* non-fatal */ }
 

@@ -911,12 +911,52 @@ const socketAgencyMap = new Map<string, Set<string>>() // socketId → Set of ag
 
 // ─── Event Broadcasting ────────────────────────────────────────────────────
 
+/**
+ * 0.6.101 — room keys for the pre-pairing delivery rooms (join:pairing-wait /
+ * leave:pairing-wait and the 'pairing-request' broadcast). Accepts an object
+ * { deviceId?, fingerprint? } or a bare string; keys are sanitized to safe
+ * room suffixes so a malicious payload can never craft a wildcard room.
+ */
+function pairingWaitRoomKeys(payload: unknown): string[] {
+  const keys: string[] = []
+  const push = (val: unknown) => {
+    if (typeof val !== 'string') return
+    const clean = val.trim().slice(0, 200).replace(/[^a-zA-Z0-9:_-]/g, '')
+    if (clean && !keys.includes(clean)) keys.push(clean)
+  }
+  if (typeof payload === 'string') {
+    push(payload)
+  } else if (payload && typeof payload === 'object') {
+    const obj = payload as Record<string, unknown>
+    push(obj.deviceId)
+    push(obj.fingerprint)
+  }
+  return keys
+}
+
 function broadcastEvent(event: Record<string, unknown>): number {
   const type = event.type as string
   const timestamp = Date.now()
   totalEventsEmitted++
 
   if (!type || !io) return 0
+
+  if (type === 'pairing-request') {
+    // 0.6.101 — INSTANT pairing delivery to the waiting device. Payload is the
+    // SAME shape the /device-status poll returns for pairingRequests, sent
+    // FLAT so the kiosk handles both channels with one code path.
+    const data = (event.data && typeof event.data === 'object' ? event.data : {}) as Record<string, unknown>
+    let recipients = 0
+    for (const key of pairingWaitRoomKeys({ deviceId: data.deviceId, fingerprint: data.fingerprint })) {
+      io.to(`pairing-wait:${key}`).emit('pairing-request', {
+        ...data,
+        sentAt: (typeof data.sentAt === 'string' && data.sentAt) || new Date().toISOString(),
+      })
+      const sockets = io.sockets.adapter.rooms.get(`pairing-wait:${key}`)
+      recipients += sockets ? sockets.size : 0
+    }
+    return recipients
+  }
 
   if (type.startsWith('queue:')) {
     const agencyId = event.agencyId as string
@@ -1507,6 +1547,24 @@ io.on('connection', async (socket) => {
 
   socket.on('leave:kiosk', (id: string) => {
     if (id) socket.leave(`kiosk:${id}`)
+  })
+
+  // ─── 0.6.101 — PRE-PAIRING DELIVERY ROOMS ────────────────────────────
+  // A waiting kiosk / phone / desktop shell has no agency room yet — its 5s
+  // /device-status poll was the only pairing-request delivery channel. These
+  // PUBLIC rooms are keyed by the device's own identity (id + fingerprint)
+  // and carry exactly one event type: 'pairing-request' (same payload the
+  // poll returns). Sanitized so a payload can never craft a wildcard room.
+  socket.on('join:pairing-wait', (payload: unknown) => {
+    for (const key of pairingWaitRoomKeys(payload)) {
+      socket.join(`pairing-wait:${key}`)
+    }
+  })
+
+  socket.on('leave:pairing-wait', (payload: unknown) => {
+    for (const key of pairingWaitRoomKeys(payload)) {
+      socket.leave(`pairing-wait:${key}`)
+    }
   })
 
   socket.on('join:device', async (token: string) => {

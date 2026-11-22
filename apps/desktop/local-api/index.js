@@ -2836,7 +2836,7 @@ function createApp() {
     })
   })
 
-  app.get('/api/discover', (c) => {
+  app.get('/api/discover', async (c) => {
     // Identity fields (hostname/displayName/platform) let the webapp's LAN
     // discovery show a real server label instead of "BLASTI Server (IP)".
     let hostname = ''
@@ -2864,12 +2864,24 @@ function createApp() {
     // this machine ride the identity response, so a scan launched from ANY
     // other branch device sees them (the host answered the BLASTI signal →
     // its peripherals inherit that trust) and can register + use them.
+    // 0.6.101 — FIX: getLocalPeripheralsCached is ASYNC — the old un-awaited
+    // call serialized the Promise to `{}` in JSON, so the probe transport
+    // never carried peripherals (only the UDP beacon did).
     let peripherals = []
     try {
       const scanner = require('./lib/discovery-scanner')
       if (typeof scanner.getLocalPeripheralsCached === 'function') {
-        peripherals = scanner.getLocalPeripheralsCached()
+        peripherals = await scanner.getLocalPeripheralsCached()
       }
+    } catch { /* non-fatal */ }
+    // 0.6.101 — STABLE IDENTITY: the beacon uid (same fingerprint the device
+    // registers with) so a scanner probing THIS endpoint can correlate the
+    // host with its registered row and pair by identity instead of IP.
+    let uid = null
+    try {
+      const scanner = require('./lib/discovery-scanner')
+      const identity = typeof scanner.getBlastiMdnsIdentity === 'function' ? scanner.getBlastiMdnsIdentity() : null
+      uid = identity && typeof identity.uid === 'string' ? identity.uid : null
     } catch { /* non-fatal */ }
     return c.json({
       service: 'blasti-local',
@@ -2886,6 +2898,7 @@ function createApp() {
       networkInterface: LAN_ENABLED ? primaryLanInterface(lanIp) : null,
       syncReady: true,
       ...(lanAuth || {}),
+      uid: uid || undefined,
       peripherals,
       capabilities: [
         'auth',

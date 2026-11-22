@@ -256,17 +256,41 @@ export function DeviceManager() {
   // ─── Derived ─────────────────────────────────────────────────────────────
   const onlineCount = devices.filter((d) => d.status === 'ONLINE').length;
   const needsAttention = devices.filter((d) => d.status === 'OFFLINE' || d.status === 'DISABLED').length;
+  // 0.6.101 — identity keys of the registry orphans already shown in the
+  // "Devices waiting for approval" strip. A discovered card whose fingerprint
+  // (or IP) matches is THE SAME DEVICE — rendering both was the reported
+  // duplicate ("device with an IP address" + "device waiting for pairing").
+  const unpairedKeys = useMemo(
+    () => new Set(
+      unpairedDevices
+        .flatMap((d) => [d.deviceFingerprint, d.ipAddress])
+        .filter((v: string | undefined | null): v is string => !!v)
+        .map((v: string) => v.toLowerCase()),
+    ),
+    [unpairedDevices],
+  );
   const visibleDiscovered = useMemo(
     // 0.6.99 — SIGNAL-BASED whitelist (user requirement): only devices that
     // ANSWERED a discovery signal render here — BLASTI apps (beacon/mDNS/
     // probe), TVs and printers. Generic phones/PCs/routers/IoT/unknown noise
     // never renders, even if a stale server build leaks them through.
+    // 0.6.101 — one card per device (fingerprint/IP dedupe vs the unpaired
+    // strip) + locally-attached printers (ip 127.0.0.1) are VISIBLE again:
+    // the old blanket `ip !== '127.0.0.1'` exclusion was exactly why the USB
+    // printer plugged into the PC never appeared in discovery. The only
+    // loopback cards still hidden are non-printers (the manager's own app).
     () => discoveredDevices.filter(
-      (d) => !dismissedIds.has(d.id)
-        && d.ip !== '127.0.0.1'
-        && isSignalBackedDevice(d),
+      (d) => {
+        if (dismissedIds.has(d.id)) return false;
+        if (d.ip === '127.0.0.1' && d.type !== 'PRINTER') return false;
+        if (!isSignalBackedDevice(d)) return false;
+        const fp = (d.fingerprint || d.blastiInfo?.fingerprint || d.blastiInfo?.instanceId || '').toLowerCase();
+        if (fp && unpairedKeys.has(fp)) return false;
+        if (d.ip && d.ip !== '127.0.0.1' && unpairedKeys.has(d.ip.toLowerCase())) return false;
+        return true;
+      },
     ),
-    [discoveredDevices, dismissedIds],
+    [discoveredDevices, dismissedIds, unpairedKeys],
   );
   const hasDiscoveryContent = scanState.scanning || visibleDiscovered.length > 0 || unpairedDevices.length > 0;
 
@@ -1552,6 +1576,9 @@ function DiscoveredCard({
   const isTv = device.type === 'TV';
   const isPrinter = device.type === 'PRINTER';
   const isPeripheralPrinter = isPrinter && device.source === 'peripheral-report';
+  // 0.6.101 — a printer card at 127.0.0.1 is attached to THIS PC (the scan's
+  // Phase-5 local enumeration). Show it like a peripheral, not a loopback IP.
+  const isLocalPrinter = isPrinter && device.ip === '127.0.0.1';
   const isConnectable = !!device.ip && (device.port ?? 0) > 0 && device.connectionType !== 'USB'
     // 0.6.92 — ROUTER removed: the gateway is never a connectable peer.
     // PORT > 0 required: a BLASTI phone announcing itself via the UDP pairing
@@ -1580,7 +1607,11 @@ function DiscoveredCard({
         </div>
         <div className="flex items-center gap-1 flex-wrap text-[11px] text-muted-foreground">
           <span className="truncate" dir="ltr">
-            {device.ip ? `${device.ip}${device.port ? `:${device.port}` : ''}` : (device.cupsName || 'USB')}
+            {isLocalPrinter
+              ? getLocalizedString('موصولة بهذا الحاسوب', 'Attaché à ce PC', 'Attached to this PC', lang)
+              : device.ip
+                ? `${device.ip}${device.port ? `:${device.port}` : ''}`
+                : (device.cupsName || 'USB')}
           </span>
           {/* 0.6.86 — ALWAYS surface a type chip (even UNKNOWN) so every scan
               result answers "is this a computer / phone / printer?". The
@@ -1596,14 +1627,25 @@ function DiscoveredCard({
               {device.manufacturer}{device.manufacturer && device.model ? ' · ' : ''}{device.model}
             </span>
           )}
+          {/* 0.6.102 — STRICT result-filter chips (audit requirement). The
+              manager's discovery results are exactly: PC WITH BLASTI DESKTOP
+              APP · PHONE WITH BLASTI APP · PHONE/TABLET WITH BLASTI APP IN
+              KIOSK MODE · printers/TVs. The announcing surface decides the
+              chip; a generic type chip alone could not separate a kiosk-mode
+              tablet from a staff phone (both arrive as 'blasti-phone'). */}
           {isBlasti && device.blastiMode === 'kiosk' && (
             <span className="rounded-full bg-teal-100 text-teal-700 dark:bg-teal-950/40 dark:text-teal-400 px-1.5 py-px text-[9px]">
-              {getLocalizedString('كيوسك', 'kiosque', 'kiosk', lang)}
+              {getLocalizedString('هاتف/لوحي — وضع الكيوسك', 'Téléphone/Tablette — Mode kiosque', 'Phone/Tablet — BLASTI Kiosk Mode', lang)}
             </span>
           )}
           {isBlasti && device.blastiMode === 'desktop' && (
             <span className="rounded-full bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-400 px-1.5 py-px text-[9px]">
-              {getLocalizedString('حاسوب', 'Bureau', 'Desktop', lang)}
+              {getLocalizedString('حاسوب — تطبيق بلاستي', 'PC — App BLASTI', 'PC — BLASTI Desktop App', lang)}
+            </span>
+          )}
+          {isBlasti && device.blastiMode === 'phone' && (
+            <span className="rounded-full bg-rose-100 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400 px-1.5 py-px text-[9px]">
+              {getLocalizedString('هاتف — تطبيق بلاستي', 'Téléphone — App BLASTI', 'Phone — BLASTI App', lang)}
             </span>
           )}
           {/* 0.6.96 — self-announced platform chip (the app SHARED this info) */}

@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { SimpleMobileDashboard } from './dashboard/SimpleMobileDashboard';
+import { PhonePairingAgent } from './phone-pairing-agent';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -921,7 +922,15 @@ export function AgencyDashboard() {
 
   // ─── Mobile: Show SimpleMobileDashboard (barber/mechanic mode) ────────
   if (isMobile) {
-    return <SimpleMobileDashboard agencyId={agencyId} />;
+    return (
+      <>
+        {/* 0.6.102 — phones take THIS branch, so the pairing agent MUST ride
+            it too: the phone is the primary pairing target ("PHONE WITH
+            BLASTI APP" filter) and announces its discovery signal here. */}
+        <PhonePairingAgent />
+        <SimpleMobileDashboard agencyId={agencyId} />
+      </>
+    );
   }
 
   if (loading) {
@@ -1006,6 +1015,16 @@ export function AgencyDashboard() {
         onReconnect={fetchData}
         t={t as any}
       />
+
+      {/* 0.6.102 — DISCOVERY AUDIT: the phone-side half of the pairing
+          protocol. When this agency account is opened on a PHONE (Capacitor),
+          this agent announces the device on the branch LAN (mode 'phone'),
+          receives pairing requests from the Device Manager, and the phone
+          operator must ACCEPT or REJECT them. On acceptance the phone is
+          registered for auto-connection onward (heartbeat + realtime device
+          room) with the purpose: manage the shared queue under the master
+          device. No-op on desktop browsers (they ARE the manager). */}
+      <PhonePairingAgent />
 
       {/* Subscription Inactive Banner */}
       {stats?.subscriptionStatus && stats.subscriptionStatus !== 'ACTIVE' && (

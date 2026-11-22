@@ -603,8 +603,12 @@ function startListener() {
               // Shared device info (user requirement 0.6.96): the BLASTI app
               // itself announces its type/name/platform/ip — the receiver
               // TRUSTS these fields instead of guessing.
+              // 0.6.102 — audit fix: a 'blasti-phone' beacon carrying
+              // mode:'kiosk' is a KIOSK surface, not a staff phone. The
+              // deviceType here feeds the manager's live cards + device tree.
               deviceType: typeof msg.deviceType === 'string' ? msg.deviceType.slice(0, 40)
-                : (svc === 'blasti-phone' ? 'phone' : (prev && prev.deviceType) || 'desktop'),
+                : String(msg.mode || '').toLowerCase() === 'kiosk' ? 'kiosk'
+                  : (svc === 'blasti-phone' ? 'phone' : (prev && prev.deviceType) || 'desktop'),
               platform: typeof msg.platform === 'string' ? msg.platform.slice(0, 20) : (svc === 'blasti-phone' ? 'android' : (prev && prev.platform) || undefined),
               appVersion: typeof msg.appVersion === 'string' ? msg.appVersion.slice(0, 32) : (prev && prev.appVersion) || undefined,
               uid: typeof msg.uid === 'string' ? msg.uid.slice(0, 64) : (prev && prev.uid) || undefined,
