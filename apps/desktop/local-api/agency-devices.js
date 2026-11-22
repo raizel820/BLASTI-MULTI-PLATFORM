@@ -861,6 +861,25 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const body = await c.req.json().catch(() => ({}))
     const ip = str(body.ip, 50)
     if (!ip) return c.json({ success: false, error: 'ip: required string' }, 400)
+    // 0.6.103 — a locally-attached USB printer has NO JetDirect listener on
+    // 127.0.0.1:9100, so the old TCP probe always failed ("الطابعة لا تستجيب").
+    // For loopback targets the honest reachability check is the OS printer
+    // list: the card is reachable when the named/any local printer exists.
+    if (ip === '127.0.0.1' || ip === 'localhost' || ip === '::1') {
+      try {
+        const peripherals = typeof scanner.getLocalPeripheralsCached === 'function' ? scanner.getLocalPeripheralsCached() : []
+        const wanted = typeof body.cupsName === 'string' ? body.cupsName : ''
+        const match = wanted
+          ? peripherals.find((p) => p && (p.cupsName === wanted || p.name === wanted))
+          : (peripherals.find((p) => p && p.cupsName) || peripherals[0] || null)
+        if (match) {
+          return c.json({ success: true, reachable: true, latencyMs: 1, ip, via: 'os-printer', printer: match.name || match.cupsName || null })
+        }
+        return c.json({ success: true, reachable: false, latencyMs: null, ip, error: 'No OS printer found on this machine' })
+      } catch (err) {
+        return c.json({ success: true, reachable: false, latencyMs: null, ip, error: (err && err.message) || 'OS printer enumeration failed' })
+      }
+    }
     const port = optInt(body.port, 1, 65535) || 9100
     const timeoutMs = Math.min(Math.max(Number(body.timeoutMs || body.timeout || 3000), 300), 8000)
     const startedAt = Date.now()
@@ -1233,18 +1252,61 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     }
 
     // No explicit target → the agency's saved default printer
+    let defaultPrinterRow = null
     if (!ip) {
       const agencyId = kioskDevice ? kioskDevice.agencyId : requireAgencyId(c)
       if (!agencyId) return c.json({ success: false, error: 'ip required (no default printer context)' }, 400)
       try {
         const def = await db.defaultPrinter.findUnique({ where: { agencyId } })
         if (def && def.ip) {
+          defaultPrinterRow = def
           ip = def.ip
           port = port || (def.port || 9100)
         }
       } catch { /* fall through */ }
     }
     if (!ip) return c.json({ success: false, error: 'No printer target — save a default printer or pass ip' }, 400)
+
+    // 0.6.103 — LOCALLY-ATTACHED (USB / loopback) printers: raw JetDirect TCP
+    // can never reach a printer plugged into THIS PC's USB port — the old code
+    // probed 127.0.0.1:9100 and always answered "connect ECONNREFUSED 127.0.0.1:9100"
+    // ("the printer does not respond"). Route these jobs through the OS print
+    // service (CUPS raw / Electron silent print) instead.
+    const isLoopbackTarget = ip === '127.0.0.1' || ip === 'localhost' || ip === '::1'
+      || (defaultPrinterRow && defaultPrinterRow.connectionType === 'USB')
+      || (!defaultPrinterRow && !port && typeof body.connectionType === 'string' && body.connectionType.toUpperCase() === 'USB')
+    if (isLoopbackTarget) {
+      const osPrint = require('./lib/os-print')
+      const isTest = !!body.test
+      const ticket = body.ticket && typeof body.ticket === 'object' ? body.ticket : {}
+      const printerName = (body.cupsName || (defaultPrinterRow && (defaultPrinterRow.cupsName || defaultPrinterRow.name)) || (isTest ? undefined : ticket.printerName) || '').trim()
+      const localTicket = isTest
+        ? {
+            agencyName: 'BLASTI',
+            branchName: 'Printer test page (OS print service)',
+            ticketNumber: 'T-001',
+            lines: [
+              { left: 'Date', right: new Date().toISOString().slice(0, 19).replace('T', ' ') },
+              { left: 'Printer', right: printerName || 'system default' },
+              { left: 'Path', right: 'USB / OS print service' },
+            ],
+            footer: 'If you can read this, the printer works.',
+          }
+        : ticket
+      const localRes = await osPrint.printLocalTicket({
+        printerName: printerName || undefined,
+        cupsName: (body.cupsName || (defaultPrinterRow && defaultPrinterRow.cupsName) || undefined),
+        ticket: localTicket,
+        escposBase64: typeof body.escposBase64 === 'string' ? body.escposBase64 : undefined,
+      })
+      try { deviceEvents.deviceEvent(localRes.ok ? 'print_job_done' : 'print_job_failed', localRes.ok
+        ? `Local USB print job completed on ${printerName || 'system default'}`
+        : `Local USB print failed: ${localRes.error}`, { deviceType: 'PRINTER', status: localRes.ok ? 'OK' : 'FAILED', source: 'usb-local' }) } catch { /* log only */ }
+      if (!localRes.ok) {
+        return c.json({ success: false, error: localRes.error || 'Local OS print failed', target: printerName || 'system default' }, 502)
+      }
+      return c.json({ success: true, via: localRes.via || 'os-print', target: printerName || 'system default' })
+    }
 
     // Ticket content: either a structured ticket, or a simple test page
     const isTest = !!body.test

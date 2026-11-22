@@ -1715,6 +1715,7 @@ const fr: Record<TranslationKeys, string> = {
   kioskAutoConnecting: "Connexion automatique à l'agence...",
   kioskPairingRequest: "Demande d'association",
   kioskAcceptPairing: 'Accepter',
+  kioskPairingProcessing: 'Connexion…',
   kioskRejectPairing: 'Refuser',
   kioskPairedSuccessfully: 'Connexion réussie !',
   kioskPairingRejected: "Demande d'association refusée",

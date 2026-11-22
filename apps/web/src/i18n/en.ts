@@ -1725,6 +1725,7 @@ const en: Record<TranslationKeys, string> = {
   kioskAutoConnecting: 'Auto-connecting to agency...',
   kioskPairingRequest: 'Pairing Request',
   kioskAcceptPairing: 'Accept',
+  kioskPairingProcessing: 'Connecting…',
   kioskRejectPairing: 'Reject',
   kioskPairedSuccessfully: 'Successfully connected!',
   kioskPairingRejected: 'Pairing request rejected',

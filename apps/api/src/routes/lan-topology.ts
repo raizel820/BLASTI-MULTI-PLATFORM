@@ -280,14 +280,33 @@ app.post('/report', async (c) => {
 })
 
 // GET /lan-topology?agencyId= — snapshot for the Owner Device Manager.
+// 0.6.103 — KIOSK DEVICE-TOKEN ACCESS: a pairing-standby kiosk has NO staff
+// session, so its topology-assisted discovery probe (lan-discovery.ts
+// probeTopologyServers) used to 401 here and fall back to the slow 4-subnet
+// sweep (6-18s, 1100+ daily "NO desktop box found" events). A kiosk device
+// token resolves its agency and may read the same snapshot (read-only, no
+// preference fields are sensitive) — the sweep collapses to ONE probe of the
+// exact desktop IP the desktop itself reported.
 app.get('/', async (c) => {
   try {
-    const user = await requireAuth(c)
-    const agencyId = c.req.query('agencyId') || user.agencyId || ''
-    if (!agencyId) return c.json({ success: false, error: 'agencyId is required' }, 400)
-    if (!(await canAccessAgency(user, agencyId))) {
-      return c.json({ success: false, error: 'FORBIDDEN_AGENCY' }, 403)
+    let agencyId = ''
+    try {
+      const user = await requireAuth(c)
+      agencyId = c.req.query('agencyId') || user.agencyId || ''
+      if (agencyId && !(await canAccessAgency(user, agencyId))) {
+        return c.json({ success: false, error: 'FORBIDDEN_AGENCY' }, 403)
+      }
+    } catch {
+      // Staff auth absent → try the DEVICE token (kiosk/TV waiting for pairing)
+      const deviceToken = c.req.header('X-Device-Token') || c.req.header('Authorization')?.replace(/^Bearer\s+/i, '') || ''
+      if (!deviceToken) throw new Error('Authentication required')
+      const device = await db.agencyDevice.findUnique({ where: { deviceToken }, select: { agencyId: true, status: true } })
+      if (!device || !device.agencyId) {
+        return c.json({ success: false, error: 'Authentication required' }, 401)
+      }
+      agencyId = device.agencyId
     }
+    if (!agencyId) return c.json({ success: false, error: 'agencyId is required' }, 400)
 
     // Occasional retention prune (cheap, indexed by agencyId+lastReportAt).
     // An owner-PINNED PC is never pruned — the manual master choice must

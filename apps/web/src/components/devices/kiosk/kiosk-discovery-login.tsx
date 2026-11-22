@@ -27,6 +27,8 @@ export type DiscoveryStatus = 'idle' | 'registering' | 'waiting' | 'discovered' 
 interface KioskDiscoveryLoginProps {
   status: DiscoveryStatus;
   pairingRequests: PairingRequest[];
+  /** 0.6.103 — id of the pairing request with an in-flight accept/reject (buttons disable + spinner). */
+  pairingActionId?: string | null;
   t: (key: string) => string;
   lang: string;
   kioskIp: string | null;
@@ -121,6 +123,7 @@ function KioskIpAddress({ ip }: { ip: string }) {
 export function KioskDiscoveryLogin({
   status,
   pairingRequests,
+  pairingActionId = null,
   t,
   lang,
   kioskIp,
@@ -338,20 +341,41 @@ export function KioskDiscoveryLogin({
                       </div>
                     </div>
                     <div className="flex gap-2">
+                      {/* 0.6.103 — in-flight feedback: disabled + spinner while
+                          THIS request's accept/reject runs (the old buttons
+                          gave NO feedback during the failover chain, so they
+                          "looked completely dead" and operators tapped them
+                          dozens of times). */}
                       <motion.button
-                        whileHover={{ scale: 1.02 }}
-                        whileTap={{ scale: 0.97 }}
+                        whileHover={pairingActionId === req.id ? {} : { scale: 1.02 }}
+                        whileTap={pairingActionId === req.id ? {} : { scale: 0.97 }}
                         onClick={() => onAcceptPairing(req)}
-                        className="flex-1 min-h-[48px] flex items-center justify-center gap-2 rounded-xl bg-emerald-600 text-white font-semibold text-sm hover:bg-emerald-700 active:bg-emerald-800 transition-colors shadow-sm shadow-emerald-200"
+                        disabled={!!pairingActionId}
+                        className={`flex-1 min-h-[48px] flex items-center justify-center gap-2 rounded-xl text-white font-semibold text-sm shadow-sm transition-colors ${
+                          pairingActionId === req.id
+                            ? 'bg-emerald-500 cursor-wait opacity-80'
+                            : pairingActionId
+                              ? 'bg-emerald-300 opacity-50 cursor-not-allowed'
+                              : 'bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 shadow-emerald-200'
+                        }`}
                       >
-                        <ShieldCheck className="h-4 w-4" />
-                        {t('kioskAcceptPairing')}
+                        {pairingActionId === req.id
+                          ? <Loader2 className="h-4 w-4 animate-spin" />
+                          : <ShieldCheck className="h-4 w-4" />}
+                        {pairingActionId === req.id
+                          ? (t('kioskPairingProcessing') || 'Connecting…')
+                          : t('kioskAcceptPairing')}
                       </motion.button>
                       <motion.button
-                        whileHover={{ scale: 1.02 }}
-                        whileTap={{ scale: 0.97 }}
+                        whileHover={pairingActionId ? {} : { scale: 1.02 }}
+                        whileTap={pairingActionId ? {} : { scale: 0.97 }}
                         onClick={() => onRejectPairing(req)}
-                        className="min-h-[48px] px-5 flex items-center justify-center gap-2 rounded-xl bg-white dark:bg-gray-900 text-gray-500 dark:text-gray-400 font-semibold text-sm hover:bg-gray-50 hover:text-gray-700 active:bg-gray-100 transition-colors border border-gray-200 dark:border-gray-700"
+                        disabled={!!pairingActionId}
+                        className={`min-h-[48px] px-5 flex items-center justify-center gap-2 rounded-xl font-semibold text-sm border transition-colors ${
+                          pairingActionId
+                            ? 'bg-gray-50 dark:bg-gray-800 text-gray-300 dark:text-gray-600 border-gray-100 dark:border-gray-800 cursor-not-allowed'
+                            : 'bg-white dark:bg-gray-900 text-gray-500 dark:text-gray-400 hover:bg-gray-50 hover:text-gray-700 active:bg-gray-100 border-gray-200 dark:border-gray-700'
+                        }`}
                       >
                         <ShieldX className="h-4 w-4" />
                         {t('kioskRejectPairing')}

@@ -13490,7 +13490,42 @@ async function startLocalApi(dbPath, port, options) {
             WHERE "status" = 'PENDING' AND "expiresAt" < ?`,
           nowIso
         ).catch(() => [])
+        // r24 holder-liveness gate (cloud parity — user ruling: "control must
+        // only be lost when the owner reassigns the staff, the app closes, or
+        // a takeover request is ACCEPTED"). A PENDING request past its 60s
+        // window must NOT yank control from a LIVE holder: the holder's app is
+        // open and heartbeating (60s beats, 3min lease) — the request expires
+        // with HOLDER_ACTIVE and the requester retries or an owner assigns.
+        // Auto-claim fires ONLY when the holder's lease itself went stale
+        // (app closed / crashed) or there is no holder at all.
+        const holderCutoffMs = Date.now() - 3 * 60 * 1000
         for (const request of expired || []) {
+          let holderAlive = false
+          try {
+            const lease = await db.$queryRawUnsafe(
+              `SELECT "controlledByUserId", "controlHeartbeatAt", "controlClaimedAt"
+                 FROM "Counter" WHERE "id" = ? LIMIT 1`,
+              request.counterId
+            )
+            const c = lease && lease[0]
+            if (c && c.controlledByUserId) {
+              // Raw reads may surface DATETIME as Date objects OR ISO strings
+              // depending on the client generation — normalize to epoch ms.
+              const beatMs = c.controlHeartbeatAt ? new Date(c.controlHeartbeatAt).getTime() : 0
+              const claimMs = c.controlClaimedAt ? new Date(c.controlClaimedAt).getTime() : 0
+              holderAlive = beatMs >= holderCutoffMs || (!c.controlHeartbeatAt && claimMs >= holderCutoffMs)
+            }
+          } catch (leaseErr) {
+            console.warn('[LocalAPI] counter sweeper lease check skipped:', leaseErr?.message || leaseErr)
+          }
+          if (holderAlive) {
+            await db.$executeRawUnsafe(
+              `UPDATE "CounterControlRequest" SET "status" = 'EXPIRED', "resolvedAt" = ? WHERE "id" = ?`,
+              nowIso, request.id
+            ).catch(() => null)
+            emitEvent('counter:request-expired', { agencyId: request.agencyId, counterId: request.counterId, requestId: request.id, reason: 'HOLDER_ACTIVE' })
+            continue
+          }
           let stillMember = false
           try {
             const member = await db.$queryRawUnsafe(
@@ -13635,6 +13670,71 @@ async function startLocalApi(dbPath, port, options) {
     // every local business mutation becomes a live UI event, OFFLINE included.
     onEvent((event, payload) => {
       try { localRealtime.broadcastLocalRealtime(event, payload) } catch { /* non-fatal */ }
+    })
+    // 0.6.103 — CLOUD-ACCEPT RECONCILE: when the kiosk accepts its pairing
+    // request against the CLOUD store (LAN sweep failed → the device polls
+    // the cloud), the local orphan row stayed PAIRING forever and the device
+    // never appeared in the registered paired-devices list. The cloud
+    // acceptance event now carries the stable fingerprint + the canonical
+    // token; this callback completes the pairing in the LOCAL registry too.
+    localRealtime.setCloudDeviceAcceptReconciler(async (event) => {
+      try {
+        if (!db || !event || typeof event !== 'object') return
+        const agencyId = typeof event.agencyId === 'string' ? event.agencyId : ''
+        if (!agencyId) return
+        const fingerprint = typeof event.deviceFingerprint === 'string' && event.deviceFingerprint ? event.deviceFingerprint : ''
+        const canonicalToken = typeof event.deviceToken === 'string' && event.deviceToken ? event.deviceToken : ''
+        let row = null
+        if (fingerprint) {
+          row = await db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } }).catch(() => null)
+        }
+        if (!row && canonicalToken) {
+          row = await db.agencyDevice.findFirst({ where: { deviceToken: canonicalToken } }).catch(() => null)
+        }
+        if (!row && event.deviceName && typeof event.deviceName === 'string') {
+          // Last resort — an unpaired orphan with the same display name.
+          row = await db.agencyDevice.findFirst({
+            where: { name: event.deviceName.slice(0, 100), status: 'PAIRING' },
+          }).catch(() => null)
+        }
+        if (!row) return
+        if (row.agencyId && row.agencyId !== agencyId) return // another agency's device
+        const alreadySettled = row.agencyId === agencyId && row.status === 'ONLINE'
+          && (!canonicalToken || row.deviceToken === canonicalToken)
+        if (alreadySettled) return
+        const data = {
+          agencyId: row.agencyId || agencyId,
+          status: 'ONLINE',
+          statusChangedAt: new Date(),
+          connectedAt: row.connectedAt || new Date(),
+          lastHeartbeatAt: new Date(),
+        }
+        if (canonicalToken && row.deviceToken !== canonicalToken) {
+          // Adopt the CLOUD-minted token as the CANONICAL device token: the
+          // device authenticated with it against the cloud store, so later
+          // cross-store commands (shared printing etc.) authorize locally too.
+          data.deviceToken = canonicalToken
+        }
+        await db.agencyDevice.update({ where: { id: row.id }, data }).catch(async () => {
+          // token uniqueness race — retry without the token adoption
+          delete data.deviceToken
+          await db.agencyDevice.update({ where: { id: row.id }, data }).catch(() => null)
+        })
+        try {
+          require('./lib/device-event').deviceEvent('pairing_reconciled',
+            `Cloud-accepted pairing reconciled into the local registry: ${row.name}`,
+            { deviceType: row.type, status: 'ONLINE', agencyId })
+        } catch { /* log only */ }
+        emitEvent('agency-device:connected', {
+          agencyId,
+          deviceId: row.id,
+          deviceName: row.name,
+          deviceType: row.type,
+          reconciled: true,
+        })
+      } catch (reconcileErr) {
+        console.warn('[LocalAPI] cloud device-accept reconcile failed (non-fatal):', reconcileErr && reconcileErr.message)
+      }
     })
   } catch (rtErr) {
     console.warn('[LocalAPI] Local realtime init failed (non-fatal — interval sync unaffected):', rtErr.message)

@@ -195,6 +195,14 @@ export function DeviceKiosk() {
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [pairingRequests, setPairingRequests] = useState<PairingRequest[]>([]);
   const discoveryPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 0.6.103 — IN-FLIGHT GUARD: accept/reject must be a single-flight action.
+  // During a connectivity flap every failed call just disappears into the
+  // apiFetch failover chain (no visual change on the card), so operators
+  // tapped Accept over and over — the logs show 10-12 accept-pairing POSTs
+  // per SECOND. One request at a time, buttons disabled + spinner while it
+  // runs: the button can no longer "look dead".
+  const [pairingActionId, setPairingActionId] = useState<string | null>(null);
+  const pairingActionRef = useRef(false);
 
   // ─── 0.6.101 — LIVE pairing-request delivery (socket rooms) ──────────────
   // The 5s /device-status poll stays as the fallback, but the request now
@@ -286,7 +294,14 @@ export function DeviceKiosk() {
     let mounted = true;
     async function discover() {
       try {
-        const server = await quickDiscover({ preferRemote: true, selfIps: kioskIp ? [kioskIp] : [] });
+        const server = await quickDiscover({
+          preferRemote: true,
+          selfIps: kioskIp ? [kioskIp] : [],
+          // 0.6.103 — the device token lets the cloud-topology probe answer for
+          // THIS kiosk (device-scope read) — the desktop's reported LAN IP is
+          // pinned in ONE probe instead of the 6-18s four-subnet sweep.
+          deviceToken: discoveryTokenRef.current || loadDeviceToken() || undefined,
+        });
         if (mounted && server) {
           setLanServer(server);
           // 0.6.86 — ROOT FIX (store mismatch): pin the device API base to the
@@ -1173,6 +1188,8 @@ export function DeviceKiosk() {
 
   // ─── Accept Pairing Request ───────────────────────────────
   const handleAcceptPairing = useCallback(async (request: PairingRequest) => {
+    // 0.6.103 — single-flight: ignore extra taps while one accept runs.
+    if (pairingActionRef.current) return;
     // Use ref to avoid stale closure — discoveryToken may not be in the React
     // state yet when the user clicks Accept (it was set by handleStartDiscovery
     // in a prior render cycle but the callback captures the old '' value).
@@ -1183,6 +1200,8 @@ export function DeviceKiosk() {
       setDiscoveryStatus('waiting');
       return;
     }
+    pairingActionRef.current = true;
+    setPairingActionId(request.id);
     setDiscoveryStatus('connecting');
     // Stop discovery polling immediately to avoid race conditions
     if (discoveryPollRef.current) { clearInterval(discoveryPollRef.current); discoveryPollRef.current = null; }
@@ -1191,6 +1210,7 @@ export function DeviceKiosk() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+        timeout: 8000,
       });
       const data = await res.json();
       if (data.success && data.agency) {
@@ -1245,23 +1265,34 @@ export function DeviceKiosk() {
     } catch {
       setDiscoveryStatus('waiting');
       toast.error('Network error during pairing');
+    } finally {
+      pairingActionRef.current = false;
+      setPairingActionId(null);
     }
   }, [discoveryToken, t, startDeviceHeartbeat]);
 
   // ─── Reject Pairing Request ───────────────────────────────
   const handleRejectPairing = useCallback(async (request: PairingRequest) => {
+    // 0.6.103 — single-flight guard (same rationale as Accept).
+    if (pairingActionRef.current) return;
     const token = discoveryTokenRef.current || discoveryToken;
     if (!token) return;
+    pairingActionRef.current = true;
+    setPairingActionId(request.id);
     try {
       await apiFetch('/api/agency-devices/device/reject-pairing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({ commandId: request.id }),
+        timeout: 8000,
       });
       setPairingRequests(prev => prev.filter(r => r.id !== request.id));
       toast.success(t('kioskPairingRejected') || 'Pairing request rejected');
     } catch {
       toast.error('Failed to reject pairing');
+    } finally {
+      pairingActionRef.current = false;
+      setPairingActionId(null);
     }
   }, [discoveryToken, t]);
 
@@ -1656,6 +1687,7 @@ export function DeviceKiosk() {
             <KioskDiscoveryLogin
               status={discoveryStatus}
               pairingRequests={pairingRequests}
+              pairingActionId={pairingActionId}
               t={t}
               lang={lang}
               kioskIp={displayKioskIp}

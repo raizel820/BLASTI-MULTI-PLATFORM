@@ -1749,10 +1749,36 @@ app.post('/device/accept-pairing', async (c) => {
       orderBy: { updatedAt: 'desc' },
     })
 
+    // 0.6.103 — the emit now carries the STABLE FINGERPRINT and the CANONICAL
+    // DEVICE TOKEN. A kiosk that polls the CLOUD and accepts HERE updates the
+    // cloud row only — the branch desktop's LOCAL mirror kept its PAIRING
+    // orphan forever ("the paired device never appears in the registered
+    // devices list"). With the fingerprint + token in the event, the desktop's
+    // cloud-realtime relay reconciles the local row (same device, single
+    // canonical token) the moment the acceptance lands.
+    let acceptFingerprint: string | null = device.deviceFingerprint ?? null
+    let acceptCanonicalToken: string | undefined
+    if (!acceptFingerprint || !updatedDevice.deviceToken) {
+      try {
+        const full = await db.agencyDevice.findUnique({
+          where: { id: device.id },
+          select: { deviceFingerprint: true, deviceToken: true },
+        })
+        if (full) {
+          acceptFingerprint = acceptFingerprint || full.deviceFingerprint
+          acceptCanonicalToken = full.deviceToken || undefined
+        }
+      } catch { /* best-effort — reconcile falls back to name matching */ }
+    } else {
+      acceptCanonicalToken = updatedDevice.deviceToken || undefined
+    }
     emitAgencyDeviceEvent('agency-device:connected', agencyId, {
       deviceId: device.id,
       deviceName: device.name,
       deviceType: device.type,
+      deviceFingerprint: acceptFingerprint || undefined,
+      deviceToken: acceptCanonicalToken,
+      acceptedVia: 'accept-pairing',
     })
 
     // 0.6.88 — device event stream: kiosk approved the agency pairing request.
@@ -4127,6 +4153,17 @@ app.post('/discovery/print', printAuth, async (c) => {
     let ip = printBody.ip
     let port = printBody.port
 
+    // 0.6.103 — an explicit loopback target means a USB printer card reached
+    // the CLOUD API: the printer hangs off a branch PC's USB port, the cloud
+    // can never raw-TCP it. Answer with the actionable LAN-mode error.
+    if (ip === '127.0.0.1' || ip === 'localhost' || ip === '::1') {
+      return c.json({
+        success: false,
+        error: 'USB_PRINTER_NEEDS_LAN — this printer is attached to a branch PC; print via the branch desktop (LAN mode) so the OS print service receives the job',
+        target: `${ip}:${port || 9100}`,
+      }, 409)
+    }
+
     // 0.6.100 — USB-attached printers (cascade peripherals) cannot be raw-TCP
     // printed from the CLOUD: the printer hangs off a branch PC's USB port.
     // The print must go through the branch PC's local API (LAN mode) — give a
@@ -4161,6 +4198,18 @@ app.post('/discovery/print', printAuth, async (c) => {
       try {
         const def = await db.defaultPrinter.findUnique({ where: { agencyId } })
         if (def && def.ip) {
+          // 0.6.103 — a USB-attached default printer (loopback ip, OS queue)
+          // can never be raw-TCP printed FROM THE CLOUD: the printer hangs off
+          // a branch PC. Answer with the actionable error instead of the
+          // cryptic 502 "connect ECONNREFUSED 127.0.0.1:9100".
+          const isUsbDefault = def.connectionType === 'USB' || def.ip === '127.0.0.1' || def.ip === 'localhost'
+          if (isUsbDefault) {
+            return c.json({
+              success: false,
+              error: 'USB_PRINTER_NEEDS_LAN — the default printer is attached to a branch PC; print via the branch desktop (LAN mode) so the OS print service receives the job',
+              target: `${def.ip}:${def.port || 9100}`,
+            }, 409)
+          }
           ip = def.ip
           port = port || (def.port || 9100)
         }

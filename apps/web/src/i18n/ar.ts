@@ -1727,6 +1727,7 @@ const ar = {
   kioskAutoConnecting: 'جاري الاتصال التلقائي بالوكالة...',
   kioskPairingRequest: 'طلب الربط',
   kioskAcceptPairing: 'قبول',
+  kioskPairingProcessing: 'جارٍ الاتصال…',
   kioskRejectPairing: 'رفض',
   kioskPairedSuccessfully: 'تم الاتصال بنجاح!',
   kioskPairingRejected: 'تم رفض طلب الربط',

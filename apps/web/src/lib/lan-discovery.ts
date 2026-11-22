@@ -311,10 +311,15 @@ async function deriveCandidateSubnets(): Promise<string[]> {
  * subnet guessing, no mDNS obfuscation impact. Best-effort on every failure
  * (no session, offline, old local API without the route → empty list).
  */
-async function probeTopologyServers(): Promise<DiscoveredServer | null> {
+async function probeTopologyServers(opts?: { deviceToken?: string | null }): Promise<DiscoveredServer | null> {
   try {
     const { apiFetch } = await import('./api-fetch');
-    const res = await apiFetch('/api/lan-topology', { headers: { Accept: 'application/json' } });
+    // 0.6.103 — kiosks/TVs authenticate with their DEVICE token (no staff
+    // session): the header flips the cloud route into device-scope so the
+    // kiosk gets the desktop's reported LAN IP instead of a 401 → sweep.
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (opts?.deviceToken) headers['X-Device-Token'] = opts.deviceToken;
+    const res = await apiFetch('/api/lan-topology', { headers });
     if (!res.ok) return null;
     const data = await res.json().catch(() => null);
     const nodes: Array<{ ipAddress?: string | null; lanPort?: number | null; online?: boolean; role?: string | null; name?: string | null }> =
@@ -357,7 +362,7 @@ function isLoopbackServer(s: DiscoveredServer | null): boolean {
  * `selfIps` are this machine's own LAN IPs (WebRTC-detected) — candidates on
  * them are ignored so a kiosk PC never pins itself as "remote".
  */
-export async function quickDiscover(opts?: { preferRemote?: boolean; selfIps?: string[] }): Promise<DiscoveredServer | null> {
+export async function quickDiscover(opts?: { preferRemote?: boolean; selfIps?: string[]; deviceToken?: string | null }): Promise<DiscoveredServer | null> {
   const preferRemote = opts?.preferRemote === true;
   const selfIps = new Set((opts?.selfIps || []).filter(Boolean));
   // M27: Check isScanning mutex
@@ -398,8 +403,9 @@ export async function quickDiscover(opts?: { preferRemote?: boolean; selfIps?: s
     const gatewayTask = checkGatewayServers(derived);
     // 0.6.95 — the topology probe joins the SAME parallel stage 1: when the
     // desktop reported its LAN IP to the cloud, this finds it in one probe
-    // instead of waiting for the full sweep.
-    const topologyTask = probeTopologyServers();
+    // instead of waiting for the full sweep. 0.6.103 — the probe carries the
+    // device token when the caller is a kiosk/TV (device-scope cloud read).
+    const topologyTask = probeTopologyServers({ deviceToken: opts?.deviceToken || null });
 
     const [cachedAlive, localhost, gateway, topologyHit] = await Promise.all([
       cacheTask,

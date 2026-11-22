@@ -770,6 +770,27 @@ export function DeviceManager() {
   const handleTestPrinter = async (device: RealDiscoveredDevice) => {
     setBusyDeviceId(device.id);
     try {
+      // 0.6.103 — a locally-attached USB printer (loopback card) has NO raw
+      // JetDirect listener on 127.0.0.1:9100 — the TCP probe always answered
+      // "printer unreachable" even though the printer was fine. For USB cards
+      // the honest test is the OS print service: print a real test page
+      // through the host's spooler (CUPS raw / Electron silent print).
+      const isUsbLocal = device.ip === '127.0.0.1' || device.connectionType === 'USB' || (!device.ip && !!device.cupsName);
+      if (isUsbLocal) {
+        const res = await apiFetch(deviceApi('/discovery/print'), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ip: device.ip || '127.0.0.1',
+            cupsName: device.cupsName || undefined,
+            connectionType: 'USB',
+            test: true,
+          }),
+        });
+        const data = await res.json();
+        if (data.success) toast.success(getLocalizedString('تمت الطباعة عبر خدمة الطباعة', 'Imprimée via le service d’impression', 'Test page sent to the OS print service', lang));
+        else toast.error(data.error || getLocalizedString('الطابعة لا تستجيب', 'Imprimante injoignable', 'Printer unreachable', lang));
+        return;
+      }
       const res = await apiFetch(`${API_BASE}/discovery/probe`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ip: device.ip, port: device.port, timeout: 3000 }),
@@ -821,13 +842,22 @@ export function DeviceManager() {
 
   // Raw ESC/POS test page over the network — proves the printer connection
   // end-to-end without any OS driver.
+  // 0.6.103 — for a locally-attached USB printer the network path does not
+  // exist: the loopback target now routes to the host OS print service inside
+  // the local API (raw JetDirect on 127.0.0.1 always ECONNREFUSED).
   const handlePrintTestPage = async (device: RealDiscoveredDevice) => {
-    if (!device.ip) return;
+    const isUsbLocal = device.ip === '127.0.0.1' || device.connectionType === 'USB' || (!device.ip && !!device.cupsName);
     setPrintingTestId(device.id);
     try {
       const res = await apiFetch(deviceApi('/discovery/print'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ip: device.ip, port: device.port || 9100, test: true }),
+        body: JSON.stringify({
+          ip: device.ip || '127.0.0.1',
+          port: device.port || 9100,
+          cupsName: device.cupsName || undefined,
+          connectionType: isUsbLocal ? 'USB' : undefined,
+          test: true,
+        }),
       });
       const data = await res.json();
       if (data.success) {
@@ -1680,8 +1710,13 @@ function DiscoveredCard({
         {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
         {/* 0.6.96 — PAIRING REQUEST BUTTON on discovery results: every active
             BLASTI app card (desktop / kiosk / phone beacon) gets a one-click
-            pairing request — no more "visible but unpairable" beacon cards. */}
-        {isBlasti && device.type !== 'TV' && (
+            pairing request — no more "visible but unpairable" beacon cards.
+            0.6.103 — PRINTERS are excluded: a printer does not run the BLASTI
+            app and can never accept a pairing request; linking a printer means
+            saving it as the branch default or registering it as a shared
+            peripheral, NOT pairing. The old Pair button on printer cards sent
+            requests no printer could answer ("الطابعة لا يمكن ربطها"). */}
+        {isBlasti && device.type !== 'TV' && device.type !== 'PRINTER' && (
           <Button
             variant="outline"
             size="sm"
@@ -1737,8 +1772,8 @@ function DiscoveredCard({
                 {getLocalizedString('اختبار', 'Tester', 'Test', lang)}
               </Button>
             )}
-            {!isPeripheralPrinter && device.ip && (
-              <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={onPrintTest} disabled={printingTest} title="ESC/POS">
+            {!isPeripheralPrinter && (device.ip || device.cupsName) && (
+              <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={onPrintTest} disabled={printingTest} title={isLocalPrinter ? 'OS print service' : 'ESC/POS'}>
                 {printingTest ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
                 {getLocalizedString('صفحة اختبار', 'page test', 'test page', lang)}
               </Button>

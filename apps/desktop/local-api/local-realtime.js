@@ -588,6 +588,13 @@ function setLocalRealtimeRelayContext(agencyId) {
   _relayAgencyId = agencyId || null
 }
 
+// 0.6.103 — local-db reconcile callback for cloud-accepted pairing (registered
+// from index.js where the Prisma client lives; see relayCloudRealtime).
+let _reconcileCloudDeviceAccept = null
+function setCloudDeviceAcceptReconciler(fn) {
+  _reconcileCloudDeviceAccept = typeof fn === 'function' ? fn : null
+}
+
 /**
  * Relay one event received on the SYNC ENGINE's cloud socket into the local
  * rooms. The cloud already routed the event to the agency room the engine
@@ -603,6 +610,20 @@ function relayCloudRealtime(eventName, args) {
     payload && typeof payload === 'object'
       ? Object.assign({}, payload, { agencyId: payload.agencyId || _relayAgencyId })
       : { data: payload, agencyId: _relayAgencyId }
+
+  // 0.6.103 — CLOUD-ACCEPT RECONCILE. A device that polls the CLOUD accepts
+  // its pairing request THERE: the cloud AgencyDevice row flips ONLINE, but
+  // the desktop's LOCAL mirror (created when the manager sent the pairing
+  // request) stayed PAIRING forever — the device never appeared in the
+  // registered/saved paired-devices list. The cloud acceptance event now
+  // carries the stable fingerprint + the canonical token; match the local
+  // orphan and complete its pairing in THIS store too.
+  if (eventName === 'agency-device:connected' && typeof _reconcileCloudDeviceAccept === 'function') {
+    try { _reconcileCloudDeviceAccept(event) } catch (reconcileErr) {
+      warn('cloud device-accept reconcile failed:', reconcileErr && reconcileErr.message)
+    }
+  }
+
   _io.to('agency:' + _relayAgencyId).emit(eventName, event)
   _stats.eventsRelayedFromCloud++
   return 1
@@ -643,6 +664,7 @@ module.exports = {
   closeLocalRealtime,
   broadcastLocalRealtime,
   setLocalRealtimeRelayContext,
+  setCloudDeviceAcceptReconciler,
   relayCloudRealtime,
   getLocalRealtimeStats,
   // 0.6.101 — pre-pairing delivery rooms (join sanitation + tests)

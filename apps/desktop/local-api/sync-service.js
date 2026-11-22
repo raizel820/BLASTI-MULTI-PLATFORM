@@ -107,13 +107,19 @@ const DATE_FIELDS = new Set([
 ]);
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
-const MAX_BACKOFF_MS = 60_000;
-const DEFAULT_SYNC_INTERVAL_MS = 15_000;          // incremental pull cycle
+// 0.6.103 — latency round (user: "reservation → desktop full-screen appears
+// too late to be practical"). The production logs show the cloud realtime
+// socket dropping repeatedly (transport close / staleness reconnects), so the
+// worst-case visibility latency is bounded by the INTERVAL pull, not the
+// socket path. 15s → 8s and backoff 60s → 30s halves that bound; the cursor-
+// paged delta pull stays cheap (a no-change pull is one tiny query).
+const MAX_BACKOFF_MS = 30_000;
+const DEFAULT_SYNC_INTERVAL_MS = 8_000;           // incremental pull cycle
 // Field report: "it takes almost a minute before the customer shows in the
 // desktop app". The 30s default (plus jitter and probe overhead) pushed the
 // worst case to ~35-60s whenever the cloud→local realtime trigger was
-// unavailable. 15s keeps the incremental pull cheap (cursor-paged delta,
-// tiny payloads) while halving the worst-case visibility latency.
+// unavailable. 15s halved it; 8s + faster staleness recovery keeps the
+// no-socket worst case under ~10s.
 const SYNC_INTERVAL_JITTER_MS = 2_000;            // ±2s jitter
 const FULL_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 const PULL_PAGE_LIMIT = 500;
@@ -130,8 +136,8 @@ const QUEUED_REPLAY_DELAY_MS = 100; // was 500 — replay again right after the 
 // A live cloud socket IS reachability (same origin serves HTTP + socket), and
 // a fresh /api/health verdict stays valid for this long in the hot paths.
 const FAST_ONLINE_TTL_MS = 15_000;
-const SOCKET_STALENESS_WATCHDOG_MS = 60_000;
-const SOCKET_STALENESS_THRESHOLD_MS = 90_000;
+const SOCKET_STALENESS_WATCHDOG_MS = 45_000;
+const SOCKET_STALENESS_THRESHOLD_MS = 60_000;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -2622,7 +2628,7 @@ function _scheduleSocketPull(debounceMs, opts) {
 
 /**
  * Staleness watchdog: if the socket claims to be connected but we have seen
- * no ping/pong (or any pull/event activity) within 90s, force a reconnect.
+ * no ping/pong (or any pull/event activity) within 60s, force a reconnect.
  * socket.io has its own ping/pong (25s/20s) — this catches stuck states.
  */
 function _startWatchdog() {
@@ -2632,7 +2638,7 @@ function _startWatchdog() {
       if (!_socket || !_socket.connected) return;
       var lastAlive = Math.max(_lastPingAt || 0, _lastEventAt || 0, _lastPullAt ? _lastPullAt.getTime() : 0);
       if (Date.now() - lastAlive > SOCKET_STALENESS_THRESHOLD_MS) {
-        console.warn('[SyncService] Realtime socket stale (>90s without ping/pong) — forcing reconnect');
+        console.warn('[SyncService] Realtime socket stale (>60s without ping/pong) — forcing reconnect');
         _lastPingAt = Date.now(); // avoid re-triggering before reconnect completes
         _setupSocket();
       }
