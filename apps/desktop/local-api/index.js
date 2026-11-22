@@ -2623,7 +2623,7 @@ function createApp() {
         return null
       },
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowHeaders: ['Content-Type', 'Authorization', 'X-Local-Token', 'x-blasti-client', 'x-blasti-attest'],
+      allowHeaders: ['Content-Type', 'Authorization', 'X-Local-Token', 'X-Device-Token', 'x-blasti-client', 'x-blasti-attest'],
       // Task 41/67: the grace-window accept signals the stale renderer to
       // catch up — the custom header must be readable cross-origin.
       exposeHeaders: ['X-Blasti-Session-Rotated'],
@@ -13145,6 +13145,11 @@ function createApp() {
     // the local session used to authenticate the cloud call.
     cloudFetch: (path, init, opts) => cloudFetchWithRetry(path, init, opts),
     getSessionToken: () => sessionToken,
+    // 0.6.106 — DEVICE-TO-DEVICE pairing delivery: the pairing routes embed
+    // this desktop's LAN address + local API port in every offer so the
+    // discovered device can accept DIRECTLY over the LAN (no cloud hop).
+    getLanIp: () => (LAN_ENABLED ? bestLanIp() : null),
+    getHttpPort: () => port,
     // 0.6.104 — kiosk public routes (local-first): the module's new
     // /public/join-queue issues tickets with the SAME queue-issuance plumbing
     // the staff walk-in route above uses — branch queue write lock, outbox

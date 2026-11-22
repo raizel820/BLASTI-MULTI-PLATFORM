@@ -47,6 +47,9 @@ const crypto = require('crypto')
 const net = require('net')
 const scanner = require('./lib/discovery-scanner')
 const castService = require('./lib/cast-service')
+// 0.6.106 — device-to-device pairing delivery: unicast the offer to the
+// discovered phone/tablet's own UDP pairing listener (:3082).
+const { sendPairingOfferUdp } = require('./lib/pairing-offer-udp')
 // 0.6.96 — live BLASTI beacon registry (lan-authority listener): ACTIVE apps
 // between scans + the auto-connect-on-detection hook.
 const lanAuthority = require('./lib/lan-authority')
@@ -1151,75 +1154,105 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
 
       deviceEvents.deviceEvent('pairing_requested', `Pairing request (scan-result) sent to ${device.name} by ${user.fullName || user.username}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type || deviceType, agencyId: agency.id, sessionId: command.id })
 
-      // ── 0.6.99 — CROSS-STORE DELIVERY FALLBACKS ───────────────────────────
+      // ── 0.6.99 → 0.6.106 — CROSS-STORE DELIVERY, NOW FULLY PARALLEL ──────
       // The command above lives in THIS store. The waiting device may poll a
       // DIFFERENT store (a kiosk shell polls its own local API; a tablet that
       // missed the LAN sweep polls the cloud) — then the request never
       // arrives ("pairing request is not reaching to the kiosk device").
-      // Two best-effort relays close the gap:
-      //   (1) LAN DIRECT — the discovered device runs its own BLASTI local
-      //       API: POST the offer straight to it, landing the command in the
-      //       store the kiosk actually polls.
-      //   (2) CLOUD RELAY — 0.6.101: attempted for EVERY orphan, not just
-      //       freshly-created ones. The old `if (created)` gate silently
-      //       dropped the relay whenever the device had ALREADY registered
-      //       here — but that says nothing about which store the DEVICE
-      //       polls; a kiosk registered locally yet polling the cloud never
-      //       saw its request.
-      const delivery = { lanOffer: false, cloudRelay: false, needsApproval: false }
-      if (ip && port && port > 0) {
-        try {
-          const offerCtl = new AbortController()
-          const offerTimer = setTimeout(() => offerCtl.abort(), 2500)
-          const offerRes = await fetch(`http://${ip}:${port}/api/agency-devices/public/pairing-offer`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fingerprint: device.deviceFingerprint || fingerprint || undefined,
-              deviceName: device.name || undefined,
-              // 0.6.100 — shared identity + acceptance fields: the target PC
-              // uses deviceType to pop its Accept/Reject dialog, and adopts
-              // deviceToken on accept (single canonical token across stores).
-              deviceType: deviceType === 'APP' ? 'desktop' : deviceType.toLowerCase(),
-              deviceToken: device.deviceToken || undefined,
-              managerIp: ctx.getManagerIp ? ctx.getManagerIp() : undefined,
-              agencyId: agency.id,
-              agencyName: agency.name,
-              agencyNameAr: agency.nameAr || undefined,
-              agencyNameFr: agency.nameFr || undefined,
-              customCode: agency.customCode || undefined,
-              sentByName: user.fullName || user.username,
-            }),
-            signal: offerCtl.signal,
-          })
-          clearTimeout(offerTimer)
-          const offerData = await offerRes.json().catch(() => null)
-          delivery.lanOffer = !!(offerData && offerData.success)
-          delivery.needsApproval = !!(offerData && offerData.needsApproval)
-        } catch { /* offline / firewall — the local command + cloud relay remain */ }
+      // THREE delivery channels now race IN PARALLEL (the 0.6.105- code ran
+      // them SEQUENTIALLY: a 2.5s LAN-offer stall before the cloud relay
+      // even started — measured up to ~8.5s per manager click):
+      //   (1) UDP DIRECT (0.6.106, NEW) — unicast the offer to the device's
+      //       own pairing listener (:3082, lives in the Android plugin while
+      //       its beacon runs). True device-to-device over Wi-Fi/LAN, ACKed,
+      //       NO cloud round-trip — this is the channel that kills the
+      //       "pairing is extremely slow" class for phones/tablets.
+      //   (2) LAN HTTP DIRECT — for targets that run a BLASTI local API
+      //       (another PC): POST the offer straight to it.
+      //   (3) CLOUD RELAY — land the command in the cloud store the device
+      //       polls; the fallback for AP-isolated networks.
+      const managerIp = typeof ctx.getLanIp === 'function' ? ctx.getLanIp() : null
+      const managerPort = (typeof ctx.getHttpPort === 'function' && ctx.getHttpPort()) || 3080
+      const offerPayload = {
+        fingerprint: device.deviceFingerprint || fingerprint || undefined,
+        deviceName: device.name || undefined,
+        // 0.6.100 — shared identity + acceptance fields: the target PC
+        // uses deviceType to pop its Accept/Reject dialog, and adopts
+        // deviceToken on accept (single canonical token across stores).
+        deviceType: deviceType === 'APP' ? 'desktop' : deviceType.toLowerCase(),
+        deviceToken: device.deviceToken || undefined,
+        managerIp: managerIp || undefined,
+        // 0.6.106 — the port rides with the address so the device can accept
+        // DIRECTLY against this desktop over the LAN (accept-pairing).
+        managerPort,
+        commandId: command.id,
+        agencyId: agency.id,
+        agencyName: agency.name,
+        agencyNameAr: agency.nameAr || undefined,
+        agencyNameFr: agency.nameFr || undefined,
+        customCode: agency.customCode || undefined,
+        sentByName: user.fullName || user.username,
+        sentAt: command.createdAt,
       }
-      // 0.6.101 — ALWAYS relay (not only when `created`): which store the
-      // DEVICE polls is unknowable from here, so a session token + cloud
-      // session means the relay is cheap insurance against the store mismatch.
+      const udpTask = ip
+        ? sendPairingOfferUdp(ip, offerPayload).catch(() => false)
+        : Promise.resolve(false)
+      const lanTask = (ip && port && port > 0)
+        ? (async () => {
+            try {
+              const offerCtl = new AbortController()
+              const offerTimer = setTimeout(() => offerCtl.abort(), 1500)
+              const offerRes = await fetch(`http://${ip}:${port}/api/agency-devices/public/pairing-offer`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(offerPayload),
+                signal: offerCtl.signal,
+              })
+              clearTimeout(offerTimer)
+              const offerData = await offerRes.json().catch(() => null)
+              return !!(offerData && offerData.success)
+            } catch { return false }
+          })()
+        : Promise.resolve(false)
+      // 0.6.101 → 0.6.107 — STRICT DEVICE-TO-DEVICE DELIVERY. The user
+      // mandate: "PAIRING AND CONNECTION AND ALL RELATED OPERATION SHOULD BE
+      // ABLE TO WORK FINE IN OFFLINE MODE, IN FACT KIOSK, PRINTER SHOULD ONLY
+      // WORK DEVICE TO DEVICE AND NEVER GO THROUGH CLOUD CAUSE THEY OPERATE
+      // LOCALLY ONLY".
+      //   - Device with a discovered LAN address (ip) → UDP + LAN HTTP ONLY.
+      //     The cloud relay is NEVER fired for it, even as a racer: a cloud
+      //     landing would put the request in a DIFFERENT store than the one
+      //     this manager watches (the historic store-split bug class) and
+      //     makes pairing depend on internet reachability it must not have.
+      //   - Device with NO LAN address (genuinely remote / cloud-only
+      //     registration) → cloud relay is the only possible channel.
       const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
-      if (token && typeof ctx.cloudFetch === 'function') {
-        try {
-          const cloudRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-            body: JSON.stringify({
-              fingerprint: fingerprint || undefined,
-              name: rawName || device.name || undefined,
-              ip: ip || undefined,
-              port: port || undefined,
-              deviceType: deviceType,
-            }),
-          }, { timeoutMs: 6000, attempts: 1 })
-          const cloudData = await cloudRes.json().catch(() => null)
-          delivery.cloudRelay = !!(cloudData && cloudData.success)
-        } catch (relayErr) {
-          if (diagLog) diagLog('AGENCY-DEVICE pairing cloud relay skipped: ' + (relayErr && relayErr.message))
-        }
+      const cloudTask = (!ip && token && typeof ctx.cloudFetch === 'function')
+        ? (async () => {
+            try {
+              const cloudRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+                body: JSON.stringify({
+                  fingerprint: fingerprint || undefined,
+                  name: rawName || device.name || undefined,
+                  ip: ip || undefined,
+                  port: port || undefined,
+                  deviceType: deviceType,
+                }),
+              }, { timeoutMs: 5000, attempts: 1 })
+              const cloudData = await cloudRes.json().catch(() => null)
+              return !!(cloudData && cloudData.success)
+            } catch (relayErr) {
+              if (diagLog) diagLog('AGENCY-DEVICE pairing cloud relay skipped: ' + (relayErr && relayErr.message))
+              return false
+            }
+          })()
+        : Promise.resolve(false)
+      const [udpOffer, lanOffer, cloudRelay] = await Promise.all([udpTask, lanTask, cloudTask])
+      const delivery = { udpOffer, lanOffer, cloudRelay, needsApproval: true }
+      if (udpOffer) {
+        deviceEvents.deviceEvent('pairing_delivered_lan', `Pairing offer delivered DEVICE-TO-DEVICE over the LAN (UDP ack) to ${device.name} @ ${ip}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type || deviceType, status: 'DELIVERED' })
       }
 
       return c.json({
@@ -2737,7 +2770,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         where: { id: deviceId },
         // 0.6.101 — deviceFingerprint selected: the socket push and the cloud
         // relay both key the delivery on the device's stable identity.
-        select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true, deviceFingerprint: true, deviceToken: true },
+        select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true, deviceFingerprint: true, deviceToken: true, ipAddress: true, connectionType: true },
       })
       if (!device) {
         return c.json({ success: false, error: 'Device not found' }, 404)
@@ -2799,24 +2832,27 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         deviceToken: device.deviceToken || undefined,
         sentAt: command.createdAt,
       })
-      // 0.6.101 — cross-store relay: the device may poll the CLOUD store even
-      // though its orphan row lives here (discovered locally, registered in
-      // the cloud earlier). Relay the same request so it lands wherever the
-      // device actually listens. Best-effort — never blocks the response.
-      try {
-        const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
-        if (token && device.deviceFingerprint && typeof ctx.cloudFetch === 'function') {
-          await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-            body: JSON.stringify({
-              fingerprint: device.deviceFingerprint,
-              name: device.name || undefined,
-              deviceType: device.type === 'TV' ? 'TV' : device.type === 'KIOSK' ? 'KIOSK' : 'APP',
-            }),
-          }, { timeoutMs: 6000, attempts: 1 })
-        }
-      } catch { /* relay is best-effort */ }
+      // 0.6.101 → 0.6.107 — cross-store relay ONLY for genuinely remote
+      // devices. A LAN-discovered orphan (ipAddress set) must receive its
+      // pairing request DEVICE-TO-DEVICE (it lives on this network, works
+      // offline, and a cloud landing would split the request across stores).
+      // The relay fires exclusively when the device has no LAN address.
+      if (!device.ipAddress) {
+        try {
+          const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
+          if (token && device.deviceFingerprint && typeof ctx.cloudFetch === 'function') {
+            await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+              body: JSON.stringify({
+                fingerprint: device.deviceFingerprint,
+                name: device.name || undefined,
+                deviceType: device.type === 'TV' ? 'TV' : device.type === 'KIOSK' ? 'KIOSK' : 'APP',
+              }),
+            }, { timeoutMs: 6000, attempts: 1 })
+          }
+        } catch { /* relay is best-effort */ }
+      }
       // 0.6.88 — device event stream: agency sent a pairing request to a kiosk.
       deviceEvents.deviceEvent('pairing_requested', `Pairing request sent to ${device.name} by ${user.fullName || user.username}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId: agency.id, sessionId: command.id })
       return c.json({

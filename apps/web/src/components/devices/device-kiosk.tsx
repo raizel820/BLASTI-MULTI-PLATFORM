@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useLanguage } from '@/hooks/use-language';
-import { useRealtime } from '@/hooks/use-realtime';
+import { useRealtime, repointRealtimeToLanBase } from '@/hooks/use-realtime';
 import { useOnlineStatus } from '@/hooks/use-online-status';
 import { isRTL } from '@/i18n';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -20,7 +20,9 @@ import { APP_VERSION } from '@/lib/version';
 // 0.6.92 — the phone ANNOUNCES itself over the LAN while in the pairing-ready
 // state (user request: the desktop Device Manager scan must see the active
 // BLASTI app on phones linked to the same network). Native UDP beacon.
-import { startPairingBeacon, stopPairingBeacon } from '@/lib/pairing-beacon';
+// 0.6.106 — the same beacon lifecycle now also RECEIVES device-to-device
+// pairing offers (desktop → this device, UDP :3082, no cloud hop).
+import { startPairingBeacon, stopPairingBeacon, onLanPairingOffer, type LanPairingOffer } from '@/lib/pairing-beacon';
 import { getLocalIp } from '@/lib/get-local-ip';
 import { flushLogsNow, logDevice, logQueue } from '@/lib/remote-logger';
 import type { ApiFetchResponse } from '@/lib/api-fetch';
@@ -244,14 +246,17 @@ export function DeviceKiosk() {
   const pairingActionRef = useRef(false);
 
   // ─── 0.6.101 — LIVE pairing-request delivery (socket rooms) ──────────────
-  // The 5s /device-status poll stays as the fallback, but the request now
-  // ALSO arrives instantly: while the kiosk is waiting for pairing it joins
-  // the public `pairing-wait` rooms (keyed by its device id + stable
-  // fingerprint) and the manager's pairing request is pushed into those
-  // rooms by both the local API and the cloud. socket.io-client buffers the
-  // join while disconnected and flushes it on connect; the effect re-runs
-  // whenever `connected` flips, so a reconnect (which creates a fresh
-  // server-side connection with NO rooms) re-joins automatically.
+  // The fallback poll is 2s (0.6.106 — the 5s poll made a request that missed
+  // the socket channels feel "extremely slow"), but requests normally arrive
+  // INSTANTLY through one of three channels: the LAN UDP offer (device-to-
+  // device, below), the pairing-wait socket rooms (local + cloud), and the
+  // poll. While the kiosk is waiting for pairing it joins the public
+  // `pairing-wait` rooms (keyed by its device id + stable fingerprint) and
+  // the manager's pairing request is pushed into those rooms by both the
+  // local API and the cloud. socket.io-client buffers the join while
+  // disconnected and flushes it on connect; the effect re-runs whenever
+  // `connected` flips, so a reconnect (which creates a fresh server-side
+  // connection with NO rooms) re-joins automatically.
   const pairingWaitActive =
     discoveryStatus === 'waiting' || step === 'discovery' || step === 'pairing-approval';
   useEffect(() => {
@@ -282,7 +287,7 @@ export function DeviceKiosk() {
         deviceToken: payload.deviceToken || undefined,
         sentAt: payload.sentAt || new Date().toISOString(),
       };
-      // Dedupe: the same request may also arrive through the 5s poll.
+      // Dedupe: the same request may also arrive through the LAN offer or the poll.
       setPairingRequests((prev) => {
         if (prev.some((r) => r.id === request.id)) return prev;
         return [...prev, request];
@@ -290,6 +295,51 @@ export function DeviceKiosk() {
     };
     return realtime.on('pairing-request', handler);
   }, [pairingWaitActive, realtime]);
+
+  // ─── 0.6.106 → 0.6.107 — DEVICE-TO-DEVICE pairing offers (UDP :3082, LAN) ─
+  // The manager's desktop unicasts the pairing offer STRAIGHT to this device
+  // while the beacon announces — no cloud round-trip. The native plugin
+  // bridges the datagram here as 'blastiPairingOffer'; we map it to the same
+  // PairingRequest shape the socket/poll channels use. When the offer carries
+  // the manager's LAN address, the ACCEPT posts directly to THAT desktop.
+  // 0.6.107 — the offer ALSO pins the manager as this kiosk's LAN base and
+  // repoints the realtime socket at it: from that moment every device
+  // operation (heartbeat, services, join-queue, print, queue calls) runs
+  // device-to-device over the Wi-Fi/LAN and NEVER through the cloud — even
+  // with the internet completely down.
+  useEffect(() => {
+    if (!pairingWaitActive) return;
+    return onLanPairingOffer((offer: LanPairingOffer) => {
+      const commandId = typeof offer.commandId === 'string' ? offer.commandId : (typeof offer.id === 'string' ? offer.id : '');
+      const agencyId = typeof offer.agencyId === 'string' ? offer.agencyId : '';
+      if (!commandId || !agencyId) return;
+      const offerManagerIp = typeof offer.managerIp === 'string' ? offer.managerIp : undefined;
+      const offerManagerPort = typeof offer.managerPort === 'number' ? offer.managerPort : undefined;
+      if (offerManagerIp) {
+        try {
+          const base = `http://${offerManagerIp}:${offerManagerPort || 3080}`;
+          if (getKioskLanBase() !== base) {
+            setKioskLanBase(base);
+            repointRealtimeToLanBase(base);
+          }
+        } catch { /* pin is best-effort — the accept still goes LAN-direct */ }
+      }
+      const request: PairingRequest = {
+        id: commandId,
+        agencyId,
+        agencyName: typeof offer.agencyName === 'string' ? offer.agencyName : '',
+        agencyNameAr: typeof offer.agencyNameAr === 'string' ? offer.agencyNameAr : undefined,
+        agencyNameFr: typeof offer.agencyNameFr === 'string' ? offer.agencyNameFr : undefined,
+        sentByName: typeof offer.sentByName === 'string' ? offer.sentByName : undefined,
+        deviceToken: typeof offer.deviceToken === 'string' ? offer.deviceToken : undefined,
+        sentAt: typeof offer.sentAt === 'string' ? offer.sentAt : new Date().toISOString(),
+        managerIp: offerManagerIp,
+        managerPort: offerManagerPort,
+      };
+      try { logDevice('pairing_offer_lan', 'Pairing offer received DEVICE-TO-DEVICE over the LAN (UDP)', { deviceType: 'KIOSK', status: 'PENDING' }); } catch { /* never block */ }
+      setPairingRequests((prev) => (prev.some((r) => r.id === request.id) ? prev : [...prev, request]));
+    });
+  }, [pairingWaitActive]);
 
   // Offline mode
   const [isOfflineMode, setIsOfflineMode] = useState(false);
@@ -324,6 +374,23 @@ export function DeviceKiosk() {
 
 
 
+  // ─── 0.6.107 — AUTO-CONNECT INFRASTRUCTURE (declared early) ───────────────
+  // A paired kiosk must rejoin its agency on launch EVEN OFFLINE, from the
+  // pinned desktop's local store. The first boot attempt can fire before the
+  // LAN sweep has pinned a desktop (the call would have gone to the
+  // unreachable cloud), so the discovery effect below retries the moment a
+  // desktop is pinned. `userChoseStep` keeps any manual choice authoritative.
+  const userChoseStep = useRef(false);
+  const autoConnectBusyRef = useRef(false);
+  const autoConnectDoneRef = useRef(false);
+  const tryAutoConnectRef = useRef<() => Promise<void>>(async () => {});
+  const retryAutoConnectAfterDiscovery = useCallback(() => {
+    if (!loadDeviceToken()) return;
+    if (autoConnectDoneRef.current || userChoseStep.current) return;
+    if (autoConnectBusyRef.current) return;
+    void tryAutoConnectRef.current();
+  }, []);
+
   // ─── LAN Auto-Discovery ────────────────────────────────────
   // 0.6.99 — device surfaces prefer a REMOTE branch desktop: a kiosk/TV PC is
   // a terminal of the branch store (which holds the agency data and the
@@ -351,8 +418,18 @@ export function DeviceKiosk() {
           // store the desktop Device Manager polls. Without this, production
           // kiosks kept the baked cloud base and paired against the CLOUD
           // while the manager watched the LOCAL db — both sides waited forever.
-          setKioskLanBase(`http://${server.ip}:${server.apiPort || server.port || 3080}`);
+          // 0.6.107 — also repoint the realtime socket: all device ops now
+          // run device-to-device over the LAN (offline-capable).
+          const pinnedBase = `http://${server.ip}:${server.apiPort || server.port || 3080}`;
+          if (getKioskLanBase() !== pinnedBase) {
+            setKioskLanBase(pinnedBase);
+            repointRealtimeToLanBase(pinnedBase);
+          }
           console.log(`[Kiosk] Auto-connected to LAN server: ${server.hostname} (${server.ip})`);
+          // 0.6.107 — the sweep may finish AFTER the boot auto-connect attempt
+          // ran against a stale/absent pin. Retry auto-connect now that a
+          // desktop is pinned (paired device must rejoin its agency offline).
+          retryAutoConnectAfterDiscovery();
         }
       } catch (err) {
         console.warn('[Kiosk] LAN discovery failed, using cloud:', err);
@@ -362,7 +439,9 @@ export function DeviceKiosk() {
     }
     discover();
     return () => { mounted = false; };
-  }, [kioskIp]);
+    // retryAutoConnectAfterDiscovery is a stable callback (no deps) — it
+    // re-runs boot auto-connect once the sweep pins a LAN desktop.
+  }, [kioskIp, retryAutoConnectAfterDiscovery]);
 
   // ─── Detect Kiosk's Own IP ──────────────────────────────────
   useEffect(() => {
@@ -641,6 +720,22 @@ export function DeviceKiosk() {
       }
     } catch {
       setError('Network error');
+      // 0.6.107 — OFFLINE-FIRST BOOT: when the agency fetch fails (desktop
+      // rebooting, AP isolation, internet completely down) but this kiosk has
+      // a saved cache for the SAME agency, adopt it immediately — services
+      // stay selectable and tickets keep issuing offline. The retry/backoff
+      // + contact-admin ladder only applies when there is nothing cached.
+      const cached = agencyCache;
+      if (cached && (cached.agency.customCode || '') === code.trim()) {
+        setAgency(cached.agency);
+        setServices(cached.services || []);
+        setRetryCount(0);
+        setShowContactAdmin(false);
+        if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
+        if (cached.agency.isQueueOpen !== false) setStep('services');
+        try { logDevice('kiosk_offline_cache', 'Agency fetch failed — serving the saved agency cache (offline device-to-device mode)', { deviceType: 'KIOSK', status: 'OFFLINE' }); } catch { /* never block */ }
+        return;
+      }
       setRetryCount((prev) => {
         const next = prev + 1;
         if (next >= MAX_RETRIES) {
@@ -656,7 +751,7 @@ export function DeviceKiosk() {
     } finally {
       setLoading(false);
     }
-  }, [deviceToken, lanServer, startDeviceHeartbeat]);
+  }, [deviceToken, lanServer, startDeviceHeartbeat, agencyCache]);
 
   useEffect(() => { fetchAgencyRef.current = fetchAgency; }, [fetchAgency]);
 
@@ -976,7 +1071,13 @@ export function DeviceKiosk() {
     } catch {
       // Queue event log — kiosk join network failure.
       try { logQueue('ticket_created_kiosk', 'Kiosk join failed — network error', { agencyId: agency?.id, serviceId: selectedService || undefined, source: 'kiosk' }, 'error'); } catch { /* never block */ }
-      setError('Network error');
+      // 0.6.107 — OFFLINE-FIRST GUARANTEE: a network failure must NEVER block
+      // ticket issuance. Whether the pinned desktop is rebooting, the AP
+      // isolated this device, or the internet is gone, the kiosk issues the
+      // ticket LOCALLY from the saved cache (numbering cursor included) and
+      // syncs it automatically once the desktop answers again.
+      setError(null);
+      handleOfflineJoinQueue();
     }
     finally { setLoading(false); joiningRef.current = false; }
   };
@@ -1230,7 +1331,9 @@ export function DeviceKiosk() {
         setDiscoveryStatus('waiting');
         setStep('discovery');
         startDeviceHeartbeat(data.deviceToken);
-        // Poll device-status for pairing requests
+        // Poll device-status for pairing requests (0.6.106 — 2s fallback:
+        // the LAN UDP offer + the socket rooms deliver instantly; this poll
+        // is only for the rare case where both channels missed).
         if (discoveryPollRef.current) clearInterval(discoveryPollRef.current);
         discoveryPollRef.current = setInterval(async () => {
           try {
@@ -1266,7 +1369,7 @@ export function DeviceKiosk() {
               }
             }
           } catch { /* polling continues */ }
-        }, 5000);
+        }, 2000);
       } else {
         setDiscoveryStatus('idle');
         setDiscoveryError(data.error || 'Discovery registration failed');
@@ -1283,8 +1386,14 @@ export function DeviceKiosk() {
       setDiscoveryLoading(false);
     }
   }, [discoverRegisterOnce, startDeviceHeartbeat]);
-
   // ─── Accept Pairing Request ───────────────────────────────
+  // 0.6.106 — DEVICE-TO-DEVICE accept: when the request arrived as a LAN UDP
+  // offer it carries the MANAGER DESKTOP's address (managerIp:managerPort).
+  // The accept then posts DIRECTLY to that desktop over the Wi-Fi/LAN — the
+  // pairing completes against the store the manager is actually watching,
+  // in one round-trip, with no cloud hop and no store-split reconcile wait.
+  // Falls back to the pinned-store accept (apiFetch) when the direct POST
+  // fails (AP isolation, firewall, desktop gone).
   const handleAcceptPairing = useCallback(async (request: PairingRequest) => {
     // 0.6.103 — single-flight: ignore extra taps while one accept runs.
     if (pairingActionRef.current) return;
@@ -1303,7 +1412,87 @@ export function DeviceKiosk() {
     setDiscoveryStatus('connecting');
     // Stop discovery polling immediately to avoid race conditions
     if (discoveryPollRef.current) { clearInterval(discoveryPollRef.current); discoveryPollRef.current = null; }
+    const adoptAndFinish = (data: { success?: boolean; error?: string; agency?: any; services?: any[] }) => {
+      if (!(data && data.success && data.agency)) return false;
+      // 0.6.100 — ADOPT the manager-issued device token when the pairing
+      // request carries one: from now on the manager store and THIS device
+      // share ONE canonical token (this is what authorizes shared-printer
+      // jobs and other cross-store commands).
+      const adoptedToken = request.deviceToken;
+      if (adoptedToken && adoptedToken !== token) {
+        try {
+          saveDeviceToken(adoptedToken);
+          discoveryTokenRef.current = adoptedToken;
+          setDiscoveryToken(adoptedToken);
+          setDeviceToken(adoptedToken);
+          logDevice('kiosk_token_adopted', 'Adopted the manager-issued device token after pairing', { deviceType: 'KIOSK', status: 'ONLINE' });
+        } catch { /* keep the old token — pairing still works */ }
+      }
+      // Use agency + services directly from the accept-pairing response
+      setAgency({
+        id: data.agency.id,
+        name: data.agency.name,
+        nameAr: data.agency.nameAr || '',
+        nameFr: data.agency.nameFr || '',
+        category: data.agency.category || '',
+        workingHoursStart: data.agency.workingHoursStart || '08:00',
+        workingHoursEnd: data.agency.workingHoursEnd || '18:00',
+        isQueueOpen: data.agency.isQueueOpen !== false,
+        isPaused: data.agency.isPaused || false,
+        logoUrl: data.agency.logoUrl || '',
+        customCode: data.agency.customCode || '',
+      });
+      setServices((data.services || []).map((s: any) => ({
+        id: s.id,
+        name: s.name,
+        nameAr: s.nameAr || '',
+        nameFr: s.nameFr || '',
+        prefix: s.prefix || '',
+        avgTime: s.avgTime || s.averageServiceTime || 0,
+      })));
+      if (data.agency.customCode) setAgencyCode(data.agency.customCode);
+      setIsDeviceRegistered(true);
+      setPairingRequests([]);
+      // Restart heartbeat to ensure it uses the correct token post-pairing
+      // (0.6.100 — the ADOPTED manager-issued token when one was carried).
+      startDeviceHeartbeat(discoveryTokenRef.current || token);
+      setStep('services');
+      toast.success(t('kioskPairedSuccessfully') || 'Successfully connected!');
+      return true;
+    };
     try {
+      // ── 0.6.106 → 0.6.107 — LAN-DIRECT accept against the offering desktop ──
+      const offerToken = request.deviceToken || token;
+      if (request.managerIp && typeof request.managerIp === 'string') {
+        try {
+          const base = `http://${request.managerIp}:${request.managerPort || 3080}`;
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 6000);
+          const directRes = await fetch(`${base}/api/agency-devices/device/accept-pairing`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${offerToken}` },
+            body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+            signal: ctl.signal,
+          });
+          clearTimeout(timer);
+          const directData = await directRes.json().catch(() => null);
+          if (directData && directData.success && directData.agency) {
+            // 0.6.107 — the accepting desktop becomes this kiosk's permanent
+            // device-to-device base: heartbeat/services/tickets/printing and
+            // the realtime queue channel all run against it, offline-first.
+            try {
+              if (getKioskLanBase() !== base) {
+                setKioskLanBase(base);
+                repointRealtimeToLanBase(base);
+              }
+            } catch { /* pin best-effort */ }
+            try { logDevice('kiosk_accept_lan', 'Pairing accepted DIRECTLY against the manager desktop over the LAN', { deviceType: 'KIOSK', agencyId: request.agencyId, status: 'ONLINE' }); } catch { /* never block */ }
+            if (adoptAndFinish(directData)) return;
+          }
+          // Direct failed (401/404/409/network) — fall through to the
+          // pinned-store accept below.
+        } catch { /* LAN unreachable — pinned-store accept still runs */ }
+      }
       const res = await apiFetch('/api/agency-devices/device/accept-pairing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
@@ -1312,50 +1501,7 @@ export function DeviceKiosk() {
       });
       const data = await res.json();
       if (data.success && data.agency) {
-        // 0.6.100 — ADOPT the manager-issued device token when the pairing
-        // request carries one: from now on the manager store and THIS device
-        // share ONE canonical token (this is what authorizes shared-printer
-        // jobs and other cross-store commands).
-        const adoptedToken = request.deviceToken;
-        if (adoptedToken && adoptedToken !== token) {
-          try {
-            saveDeviceToken(adoptedToken);
-            discoveryTokenRef.current = adoptedToken;
-            setDiscoveryToken(adoptedToken);
-            setDeviceToken(adoptedToken);
-            logDevice('kiosk_token_adopted', 'Adopted the manager-issued device token after pairing', { deviceType: 'KIOSK', status: 'ONLINE' });
-          } catch { /* keep the old token — pairing still works */ }
-        }
-        // Use agency + services directly from the accept-pairing response
-        setAgency({
-          id: data.agency.id,
-          name: data.agency.name,
-          nameAr: data.agency.nameAr || '',
-          nameFr: data.agency.nameFr || '',
-          category: data.agency.category || '',
-          workingHoursStart: data.agency.workingHoursStart || '08:00',
-          workingHoursEnd: data.agency.workingHoursEnd || '18:00',
-          isQueueOpen: data.agency.isQueueOpen !== false,
-          isPaused: data.agency.isPaused || false,
-          logoUrl: data.agency.logoUrl || '',
-          customCode: data.agency.customCode || '',
-        });
-        setServices((data.services || []).map((s: any) => ({
-          id: s.id,
-          name: s.name,
-          nameAr: s.nameAr || '',
-          nameFr: s.nameFr || '',
-          prefix: s.prefix || '',
-          avgTime: s.avgTime || s.averageServiceTime || 0,
-        })));
-        if (data.agency.customCode) setAgencyCode(data.agency.customCode);
-        setIsDeviceRegistered(true);
-        setPairingRequests([]);
-        // Restart heartbeat to ensure it uses the correct token post-pairing
-        // (0.6.100 — the ADOPTED manager-issued token when one was carried).
-        startDeviceHeartbeat(discoveryTokenRef.current || token);
-        setStep('services');
-        toast.success(t('kioskPairedSuccessfully') || 'Successfully connected!');
+        adoptAndFinish(data);
       } else {
         setDiscoveryStatus('waiting');
         toast.error(data.error || 'Pairing failed');
@@ -1413,17 +1559,20 @@ export function DeviceKiosk() {
   // ─── Auto-Connect for Already-Paired Devices ───────────────
   // If a deviceToken is saved in localStorage, verify it and auto-connect.
   // Guard: skip auto-connect if user has already manually chosen a step.
-  const userChoseStep = useRef(false);
+  // 0.6.107 — the callable body lives in tryAutoConnectRef so the LAN
+  // discovery effect can RETRY it the moment a desktop is pinned: a paired
+  // kiosk booting OFFLINE must rejoin its agency from the pinned desktop's
+  // local store (heartbeat + device-status are device-to-device there).
   useEffect(() => {
     const token = loadDeviceToken();
     if (!token) return;
 
     let cancelled = false;
     async function tryAutoConnect() {
+      if (cancelled || autoConnectBusyRef.current || autoConnectDoneRef.current) return;
+      if (userChoseStep.current) return;
+      autoConnectBusyRef.current = true;
       try {
-        // Don't override if user already chose a step (e.g., clicked "Wait for Discovery")
-        if (cancelled || userChoseStep.current) return;
-
         // Send a heartbeat first to bring the device back to ONLINE
         await apiFetch('/api/agency-devices/device/heartbeat', {
           method: 'POST',
@@ -1443,6 +1592,7 @@ export function DeviceKiosk() {
 
         // If device has an agency → auto-connect
         if (data.agency) {
+          autoConnectDoneRef.current = true;
           setDeviceToken(token);
           setAgency({
             id: data.agency.id,
@@ -1470,9 +1620,12 @@ export function DeviceKiosk() {
         }
       } catch {
         // Silent — will show method-select screen
+      } finally {
+        autoConnectBusyRef.current = false;
       }
     }
 
+    tryAutoConnectRef.current = tryAutoConnect;
     // Wait briefly for LAN discovery to complete first
     const timer = setTimeout(tryAutoConnect, 2000);
     return () => { cancelled = true; clearTimeout(timer); };

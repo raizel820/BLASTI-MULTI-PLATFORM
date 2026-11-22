@@ -30,6 +30,8 @@ import { shouldShowAlert, enterSleepMode, clearSleep, subscribe as subscribeSlee
 import { markReservationConfirmed, stopNotificationSound } from '@/lib/sounds'
 import { wasTurnAlertDismissedNatively } from '@/lib/notification-channel'
 import { getNativeCloudUrl, ensureNativeCloudUrl, onNativeCloudStateChange } from '@/lib/native-cloud-resolver'
+// 0.6.107 — the pinned branch desktop (device-to-device realtime for kiosks).
+import { getKioskLanBase } from '@/lib/kiosk-lan-base'
 import { handleRealtimeCacheEvent } from '@/lib/realtime-cache-invalidation'
 // 0.6.91 — device event stream: realtime connect/disconnect is now visible
 // in the Logs Manager "Devices" tab for web AND mobile (this hook runs in the
@@ -115,12 +117,15 @@ function resolveSocketUrl(): string {
   if (isElectronPlatform()) {
     return 'http://127.0.0.1:3080'
   }
-  // Other native platforms (Capacitor): connect directly to the cloud API's
-  // realtime server. The runtime-resolved LAN address wins (physical devices —
-  // the build-time default 10.0.2.2 is the EMULATOR's alias for the host
-  // machine and no real phone can reach it), then NEXT_PUBLIC_API_URL baked in
-  // at build time (apps/web/.env.production), then the 10.0.2.2 fallback.
+  // Other native platforms (Capacitor): 0.6.107 — DEVICE-TO-DEVICE MANDATE.
+  // A kiosk/tablet paired with a branch desktop runs its realtime against
+  // THAT desktop's local Socket.IO (:3080) over Wi-Fi/LAN — queue calls,
+  // pairing pushes and kiosk updates are local operations and must work with
+  // the internet down. The cloud URL is only the fallback when no desktop is
+  // pinned (genuinely remote / cloud-paired device).
   if (isNativePlatform()) {
+    const lanBase = getKioskLanBase()
+    if (lanBase) return lanBase
     return getNativeCloudUrl()
       || process.env.NEXT_PUBLIC_API_URL
       || (typeof process !== 'undefined' && (process as any).env?.BLASTI_CLOUD_URL)
@@ -242,6 +247,21 @@ function repointGlobalSocket(newUrl: string): void {
     globalSocket.disconnect()
     globalSocket.connect()
   } catch { /* ignore */ }
+}
+
+/**
+ * 0.6.107 — DEVICE-TO-DEVICE repoint, callable from pairing surfaces.
+ * When the kiosk pins (or re-pins) its branch desktop (UDP pairing offer,
+ * LAN sweep, direct-IP entry, LAN-direct accept), the already-allocated
+ * socket singleton must follow — queue calls and pairing pushes then ride
+ * the desktop's local Socket.IO with zero cloud involvement. Same object,
+ * same listeners; socket.io-client re-reads the manager URI on reconnect.
+ */
+export function repointRealtimeToLanBase(url: string): void {
+  try {
+    if (typeof window === 'undefined') return
+    repointGlobalSocket(url)
+  } catch { /* never break the caller */ }
 }
 
 function releaseSocket(): void {

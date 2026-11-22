@@ -50,15 +50,27 @@ export interface PairingBeaconIdentity {
   mode?: 'kiosk' | 'phone' | 'desktop';
 }
 
+/** 0.6.106 — the plugin listener handle shape Capacitor's addListener returns. */
+interface BlastiListenerHandle {
+  remove?: (...args: unknown[]) => unknown;
+}
+
 function beaconPlugin():
-  | { startPairingBeacon?: (opts: Record<string, unknown>) => Promise<unknown> |
-      unknown; stopPairingBeacon?: () => Promise<unknown> | unknown }
+  | {
+      startPairingBeacon?: (opts: Record<string, unknown>) => Promise<unknown> |
+          unknown; stopPairingBeacon?: () => Promise<unknown> | unknown;
+      /** 0.6.106 — the device-to-device pairing-offer receiver event. */
+      addListener?: (evt: string, cb: (...args: unknown[]) => void) =>
+          BlastiListenerHandle | ((...args: unknown[]) => void) | unknown;
+    }
   | null {
   const p = getNativePlugin('BlastiNativeStatus');
   if (!p) return null;
   return p as unknown as {
     startPairingBeacon?: (opts: Record<string, unknown>) => Promise<unknown> | unknown;
     stopPairingBeacon?: () => Promise<unknown> | unknown;
+    addListener?: (evt: string, cb: (...args: unknown[]) => void) =>
+        BlastiListenerHandle | ((...args: unknown[]) => void) | unknown;
   };
 }
 
@@ -102,5 +114,75 @@ export async function stopPairingBeacon(): Promise<void> {
     await p.stopPairingBeacon();
   } catch {
     /* the loop dies with the app process anyway */
+  }
+}
+
+// ─── 0.6.106 — DEVICE-TO-DEVICE PAIRING OFFER RECEIVER (the LAN half) ────────
+//
+// Through 0.6.105 a phone/tablet kiosk had NO receiver a desktop could push
+// a pairing request to (the beacon is send-only UDP), so every request for a
+// discovered kiosk rode the CLOUD relay + a 5s /device-status poll — on a
+// slow internet link the whole handshake felt "extremely slow" (user report:
+// "does pairing go device to device through wifi/lan or cloud api server?").
+//
+// 0.6.106 — the Android plugin now binds UDP :3082 while the beacon runs and
+// notifies 'blastiPairingOffer' here when the desktop unicasts an offer
+// directly. This bridge exposes that event to the pairing surfaces
+// (device-kiosk, phone-pairing-agent) with a Capacitor-style unsubscribe.
+// No-op outside a native shell (the offer card then relies on the cloud
+// socket push + poll as before).
+
+export type UnsubscribeFn = () => void;
+
+/** Subset of the desktop's pairing-offer payload the UI acts on. */
+export interface LanPairingOffer {
+  commandId?: string;
+  id?: string;
+  fingerprint?: string;
+  deviceId?: string;
+  deviceToken?: string;
+  agencyId?: string;
+  agencyName?: string;
+  agencyNameAr?: string;
+  agencyNameFr?: string;
+  customCode?: string;
+  sentByName?: string;
+  /** The sending desktop's LAN address — the LAN-direct accept target. */
+  managerIp?: string;
+  managerPort?: number;
+  [key: string]: unknown;
+}
+
+/** True when this build can receive LAN pairing offers (Android + new plugin). */
+export function isLanPairingOfferSupported(): boolean {
+  const p = beaconPlugin();
+  return !!(p && typeof p.addListener === 'function');
+}
+
+export function onLanPairingOffer(handler: (offer: LanPairingOffer) => void): UnsubscribeFn {
+  const noop: UnsubscribeFn = () => { /* not native — nothing to detach */ };
+  const p = beaconPlugin();
+  if (!p || typeof p.addListener !== 'function') return noop;
+  try {
+    const remove = p.addListener('blastiPairingOffer', (...args: unknown[]) => {
+      try {
+        const evt = args[0] as { json?: string } | undefined;
+        const raw = typeof evt?.json === 'string' ? evt.json : '';
+        if (!raw) return;
+        const offer = JSON.parse(raw) as LanPairingOffer;
+        if (!offer || typeof offer !== 'object') return;
+        if (offer.type !== undefined && offer.type !== 'blasti-pairing-offer') return;
+        handler(offer);
+      } catch { /* a malformed datagram must never crash the WebView */ }
+    }) as unknown;
+    // Capacitor's addListener returns a PluginListenerHandle { remove() } —
+    // accept both that shape and a bare function.
+    if (remove && typeof remove === 'object' && typeof (remove as { remove?: unknown }).remove === 'function') {
+      return () => { try { (remove as { remove: () => void }).remove(); } catch { /* already detached */ } };
+    }
+    if (typeof remove === 'function') return remove as UnsubscribeFn;
+    return noop;
+  } catch {
+    return noop;
   }
 }

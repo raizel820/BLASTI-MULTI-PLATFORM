@@ -37,7 +37,7 @@ import { useRealtime } from '@/hooks/use-realtime';
 import { useLanguage } from '@/hooks/use-language';
 import { apiFetch } from '@/lib/api-fetch';
 import { getCloudApiBaseUrl } from '@/lib/api-client';
-import { startPairingBeacon, stopPairingBeacon } from '@/lib/pairing-beacon';
+import { startPairingBeacon, stopPairingBeacon, onLanPairingOffer, type LanPairingOffer } from '@/lib/pairing-beacon';
 import { getStableDeviceFingerprint } from '@/components/devices/kiosk/kiosk-types';
 import { getLocalizedString } from '@/components/agency/devices/types';
 import { Button } from '@/components/ui/button';
@@ -80,6 +80,11 @@ interface PhonePairingRequest {
   sentByName?: string;
   deviceToken?: string;
   sentAt?: string;
+  // ── 0.6.106 — device-to-device LAN delivery: set when the request arrived
+  // as a unicast UDP offer from the manager's desktop. The accept then posts
+  // DIRECTLY to that desktop (no cloud hop, no store-split wait).
+  managerIp?: string;
+  managerPort?: number;
 }
 
 /** device-status / accept-pairing calls must try BOTH stores: the request
@@ -220,7 +225,11 @@ export function PhonePairingAgent() {
     return () => { void stopPairingBeacon(); };
   }, [active, paired]);
 
-  // ─── Pairing-request delivery: instant socket + 5s poll fallback ──────────
+  // ─── Pairing-request delivery: instant socket + 3s poll fallback ────────
+  // 0.6.106 — THREE channels now: (1) the LAN UDP offer — the manager's
+  // desktop unicasts the offer straight to THIS phone while the beacon
+  // announces (device-to-device, no cloud, no poll wait); (2) the
+  // pairing-wait socket rooms; (3) the device-status poll (3s, was 5s).
   useEffect(() => {
     if (!active || paired) return;
     const fingerprint = fingerprintRef.current || getStableDeviceFingerprint();
@@ -235,7 +244,27 @@ export function PhonePairingAgent() {
       setRequests((prev) => (prev.some((r) => r.id === payload.id) ? prev : [...prev, payload as PhonePairingRequest]));
     });
 
-    // 5s poll fallback (same contract the kiosk uses).
+    // 0.6.106 — the device-to-device offer (UDP :3082 → native event).
+    const offLanOffer = onLanPairingOffer((offer: LanPairingOffer) => {
+      const commandId = typeof offer.commandId === 'string' ? offer.commandId : (typeof offer.id === 'string' ? offer.id : '');
+      const agencyId = typeof offer.agencyId === 'string' ? offer.agencyId : '';
+      if (!commandId || !agencyId) return;
+      const request: PhonePairingRequest = {
+        id: commandId,
+        agencyId,
+        agencyName: typeof offer.agencyName === 'string' ? offer.agencyName : '',
+        agencyNameAr: typeof offer.agencyNameAr === 'string' ? offer.agencyNameAr : undefined,
+        agencyNameFr: typeof offer.agencyNameFr === 'string' ? offer.agencyNameFr : undefined,
+        sentByName: typeof offer.sentByName === 'string' ? offer.sentByName : undefined,
+        deviceToken: typeof offer.deviceToken === 'string' ? offer.deviceToken : undefined,
+        sentAt: typeof offer.sentAt === 'string' ? offer.sentAt : new Date().toISOString(),
+        managerIp: typeof offer.managerIp === 'string' ? offer.managerIp : undefined,
+        managerPort: typeof offer.managerPort === 'number' ? offer.managerPort : undefined,
+      };
+      setRequests((prev) => (prev.some((r) => r.id === request.id) ? prev : [...prev, request]));
+    });
+
+    // 3s poll fallback (0.6.106 — was 5s; same contract the kiosk uses).
     const poll = async () => {
       const token = storedTokenRef.current || stored?.token;
       if (!token) return;
@@ -259,10 +288,11 @@ export function PhonePairingAgent() {
       } catch { /* polling continues */ }
     };
     void poll();
-    pollRef.current = setInterval(poll, 5000);
+    pollRef.current = setInterval(poll, 3000);
 
     return () => {
       offRequest?.();
+      offLanOffer();
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       realtime.emit('leave:pairing-wait', { deviceId: stored?.id, fingerprint });
     };
@@ -285,18 +315,47 @@ export function PhonePairingAgent() {
   }, [stopHeartbeat]);
 
   // ─── Accept / Reject (rule 2: the DEVICE decides) ─────────────────────────
+  // 0.6.106 — when the request arrived as a LAN UDP offer it carries the
+  // MANAGER DESKTOP's address: the accept posts DIRECTLY to that desktop
+  // over the Wi-Fi/LAN first (one round-trip, settles the store the manager
+  // watches) and falls back to the across-stores accept on any failure.
   const handleAccept = useCallback(async (request: PhonePairingRequest) => {
     setPairBusy('accept');
     const stored = loadStoredDevice();
     const token = request.deviceToken || stored?.token || storedTokenRef.current;
     try {
-      const res = await deviceApiAcrossStores('/api/agency-devices/device/accept-pairing', {
-        method: 'POST',
-        token,
-        body: { commandId: request.id, agencyId: request.agencyId },
-      });
-      const data = res.data as { success?: boolean; error?: string } | null;
-      if (res.ok && data?.success) {
+      let settled = false;
+      if (request.managerIp && typeof request.managerIp === 'string') {
+        try {
+          const base = `http://${request.managerIp}:${request.managerPort || 3080}`;
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 6000);
+          const directRes = await fetch(`${base}/api/agency-devices/device/accept-pairing`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+            signal: ctl.signal,
+          });
+          clearTimeout(timer);
+          const directData = await directRes.json().catch(() => null);
+          if (directRes.ok && directData && directData.success) settled = true;
+        } catch { /* LAN unreachable — across-stores accept still runs */ }
+      }
+      if (!settled) {
+        const res = await deviceApiAcrossStores('/api/agency-devices/device/accept-pairing', {
+          method: 'POST',
+          token,
+          body: { commandId: request.id, agencyId: request.agencyId },
+        });
+        const data = res.data as { success?: boolean; error?: string } | null;
+        settled = !!(res.ok && data?.success);
+        if (!settled && data?.error) {
+          toast.error(data.error || getLocalizedString('فشل قبول الربط', "Échec de l'acceptation", 'Pairing acceptance failed', lang));
+          setPairBusy(null);
+          return;
+        }
+      }
+      if (settled) {
         if (request.deviceToken) saveStoredDevice(stored?.id || '', request.deviceToken);
         storedTokenRef.current = request.deviceToken || stored?.token || '';
         setPaired(true);
@@ -310,7 +369,7 @@ export function PhonePairingAgent() {
           lang,
         ));
       } else {
-        toast.error(data?.error || getLocalizedString('فشل قبول الربط', "Échec de l'acceptation", 'Pairing acceptance failed', lang));
+        toast.error(getLocalizedString('فشل قبول الربط', "Échec de l'acceptation", 'Pairing acceptance failed', lang));
       }
     } catch {
       toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));

@@ -1687,6 +1687,9 @@ public class BlastiNativeStatus extends Plugin {
         t.setDaemon(true);
         beaconThread = t;
         t.start();
+        // 0.6.106 — the device-to-device receiver rides the SAME lifecycle:
+        // announcing devices are reachable for a unicast pairing offer on :3082.
+        startPairingOfferListener();
 
         JSObject res = new JSObject();
         res.put("ok", true);
@@ -1698,6 +1701,8 @@ public class BlastiNativeStatus extends Plugin {
     @PluginMethod
     public void stopPairingBeacon(PluginCall call) {
         boolean wasRunning = stopBeaconLoop();
+        // 0.6.106 — stop the unicast pairing-offer receiver with the beacon.
+        stopPairingOfferListener();
         JSObject res = new JSObject();
         res.put("ok", true);
         res.put("wasRunning", wasRunning);
@@ -1819,5 +1824,130 @@ public class BlastiNativeStatus extends Plugin {
             }
         } catch (Throwable ignored) { /* name lookup cannot fail for a literal */ }
         return targets;
+    }
+
+    // ── 0.6.106 — DEVICE-TO-DEVICE PAIRING DELIVERY (the LAN half) ──────────
+    //
+    // USER QUESTION (0.6.106 report): "does pairing go device to device
+    // through wifi/lan or cloud api server?" — the honest audit answer was:
+    // DISCOVERY was LAN (UDP beacon + sweeps), but the pairing REQUEST for a
+    // phone/tablet rode the CLOUD relay exclusively, because the phone ran
+    // NO receiver a desktop could push to (the beacon above is send-only and
+    // binds an ephemeral socket each tick). On a slow internet link that
+    // relay + the 5s /device-status poll fallback made pairing feel
+    // "extremely slow".
+    //
+    // THE FIX — the missing LAN half: while the beacon announces, this plugin
+    // ALSO binds a persistent UDP listener on 3082 and waits for a UNICAST
+    // datagram from the desktop:
+    //
+    //   {"type":"blasti-pairing-offer", "commandId":…, "fingerprint":…,
+    //    "deviceToken":…, "agencyId":…, "agencyName":…, "managerIp":…,
+    //    "managerPort":3080, "sentByName":…, …}
+    //
+    // On receipt the plugin (a) ACKs the sender with
+    // {"type":"blasti-pairing-offer-ack","uid":…} so the desktop knows the
+    // LAN delivery landed, and (b) notifies the WebView:
+    //
+    //   notifyListeners("blastiPairingOffer", { …offer fields… })
+    //
+    // The web layer (pairing-beacon.ts → device-kiosk / phone-pairing-agent)
+    // then renders the Accept/Reject card INSTANTLY — no cloud round-trip —
+    // and accepts DIRECTLY against http://<managerIp>:<managerPort>/…/accept-pairing.
+    // The cloud relay stays as the fallback for networks with AP isolation.
+
+    /** UDP port this device listens on for unicast pairing offers. */
+    private static final int PAIRING_OFFER_UDP_PORT = 3082;
+
+    private volatile Thread offerListenerThread;
+    private final AtomicBoolean offerListenerRunning = new AtomicBoolean(false);
+
+    /**
+     * Start the unicast pairing-offer listener (idempotent — one listener at
+     * a time). Runs while the pairing beacon runs: both share the same
+     * lifecycle because a device that stops announcing has no reason to
+     * accept pairings.
+     */
+    private void startPairingOfferListener() {
+        if (offerListenerRunning.getAndSet(true)) return;
+        Thread t = new Thread(this::pairingOfferListenerLoop, "BLASTI-PairingOfferListener");
+        t.setDaemon(true);
+        offerListenerThread = t;
+        t.start();
+    }
+
+    /** True when the listener thread was actually running. */
+    private boolean stopPairingOfferListener() {
+        offerListenerRunning.set(false);
+        Thread t = offerListenerThread;
+        offerListenerThread = null;
+        if (t != null) {
+            t.interrupt();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Bind UDP :3082 and dispatch unicast pairing offers to the WebView.
+     * Rebinds with a short backoff when the port is busy or the radio is
+     * cycling (same resilience contract as the beacon loop). Every failure
+     * is swallowed — the cloud relay fallback covers delivery.
+     */
+    private void pairingOfferListenerLoop() {
+        while (offerListenerRunning.get() && !Thread.currentThread().isInterrupted()) {
+            DatagramSocket socket = null;
+            try {
+                socket = new DatagramSocket(PAIRING_OFFER_UDP_PORT);
+                socket.setBroadcast(false);
+                byte[] buf = new byte[4096];
+                while (offerListenerRunning.get() && !Thread.currentThread().isInterrupted()) {
+                    DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+                    // receive() blocks until a datagram or the interrupt closes the socket.
+                    socket.receive(pkt);
+                    String json;
+                    try {
+                        json = new String(pkt.getData(), pkt.getOffset(), pkt.getLength(), "UTF-8").trim();
+                    } catch (Throwable parseErr) { continue; }
+                    if (json.isEmpty() || json.length() > 4096) continue;
+                    JSONObject offer;
+                    try { offer = new JSONObject(json); } catch (Throwable bad) { continue; }
+                    if (!"blasti-pairing-offer".equals(offer.optString("type", ""))) continue;
+                    // ACK the sender FIRST (best-effort) — the desktop's
+                    // sendPairingOfferUdp resolves "delivered" on this ack.
+                    try {
+                        JSONObject ack = new JSONObject();
+                        ack.put("type", "blasti-pairing-offer-ack");
+                        ack.put("uid", offer.optString("fingerprint", ""));
+                        byte[] ackData = ack.toString().getBytes("UTF-8");
+                        DatagramPacket ackPkt = new DatagramPacket(
+                                ackData, ackData.length, pkt.getAddress(), pkt.getPort());
+                        socket.send(ackPkt);
+                    } catch (Throwable ackErr) { /* ack is best-effort */ }
+                    // Bridge the offer into the WebView (event name consumed
+                    // by pairing-beacon.ts onLanPairingOffer).
+                    try {
+                        JSObject evt = new JSObject();
+                        evt.put("json", json);
+                        notifyListeners("blastiPairingOffer", evt);
+                    } catch (Throwable evtErr) { /* webview may be gone */ }
+                }
+            } catch (Throwable loopErr) {
+                // Bind failure (port busy / airplane mode) — back off and retry
+                // while the pairing-ready state keeps this listener alive.
+            } finally {
+                if (socket != null && !socket.isClosed()) {
+                    try { socket.close(); } catch (Throwable ignored) { }
+                }
+            }
+            if (!offerListenerRunning.get() || Thread.currentThread().isInterrupted()) break;
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        offerListenerRunning.set(false);
     }
 }

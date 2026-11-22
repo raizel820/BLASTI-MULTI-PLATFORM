@@ -1502,10 +1502,21 @@ export class ApiClient {
     // unreachable build-time default (10.0.2.2) forever on physical phones.
     // 0.6.23: the LAN authority override (joined offline master) wins first —
     // it must repoint ALL traffic, including this per-request path.
+    // 0.6.107 — DEVICE-TO-DEVICE MANDATE: kiosk/printer operations
+    // (/api/agency-devices/* — pairing, heartbeat, device-status, join-queue,
+    // services fetch, receipt printing) are LOCAL operations. When a desktop
+    // is pinned (blasti_kiosk_lan_base), they go to THAT desktop's local API
+    // over Wi-Fi/LAN and NEVER to the cloud — they must work with the
+    // internet completely down. Only genuinely remote flows (no LAN desktop
+    // reachable) fall through to the cloud URL.
+    const isDeviceOpPath = /^\/api\/agency-devices(\/|$)/.test(path)
+    const kioskLanBase = isDeviceOpPath ? getKioskLanBase() : null
     const requestBaseUrl = getLanAuthorityOverride()?.baseUrl
-      ?? (isCapacitorRuntime() && getNativeCloudUrl()
-        ? getNativeCloudUrl() as string
-        : this.config.baseUrl);
+      ?? (kioskLanBase
+        ? kioskLanBase
+        : (isCapacitorRuntime() && getNativeCloudUrl()
+          ? getNativeCloudUrl() as string
+          : this.config.baseUrl));
     const url = buildUrl(requestBaseUrl, path, options?.params);
 
     // ── Electron: pre-discover local API (inert under local-first) ──────────────────

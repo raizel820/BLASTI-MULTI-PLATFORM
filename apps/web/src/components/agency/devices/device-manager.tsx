@@ -727,17 +727,21 @@ export function DeviceManager() {
             lang,
           ));
         } else {
-          // 0.6.99 — surface the delivery channels: the request lands in this
-          // store, and may ALSO be relayed straight to the device's own API
-          // (lanOffer) or to the cloud store the device polls (cloudRelay) —
-          // cross-store delivery is what previously left kiosks waiting.
+          // 0.6.99 → 0.6.106 — surface the delivery channels: the request
+          // lands in this store, and is ALSO pushed through every channel
+          // the device can receive: the device-to-device UDP offer (udpOffer,
+          // ACKed by the device — instant, no cloud), the LAN HTTP offer to
+          // targets that run a local API (lanOffer), and the cloud store the
+          // device polls (cloudRelay).
+          const viaUdp = Boolean(data.delivery?.udpOffer);
           const viaLan = Boolean(data.delivery?.lanOffer);
           const viaCloud = Boolean(data.delivery?.cloudRelay);
-          const channel = viaLan && viaCloud ? ' + LAN + cloud' : viaLan ? ' + LAN' : viaCloud ? ' + cloud' : '';
+          const parts = [viaUdp ? 'device-to-device' : null, viaLan ? 'LAN' : null, viaCloud ? 'cloud' : null].filter(Boolean);
+          const channel = parts.length > 0 ? ` (${parts.join(' + ')})` : '';
           toast.success(getLocalizedString(
-            `تم إرسال طلب الربط${channel ? ` (${channel})` : ''} — انتظر موافقة الجهاز`,
-            `Demande de jumelage envoyée${channel ? ` (${channel})` : ''} — en attente de l'appareil`,
-            `Pairing request sent${channel ? ` (${channel})` : ''} — waiting for the device to accept`,
+            `تم إرسال طلب الربط${channel ? ` ${channel}` : ''} — انتظر موافقة الجهاز`,
+            `Demande de jumelage envoyée${channel ? ` ${channel}` : ''} — en attente de l'appareil`,
+            `Pairing request sent${channel ? ` ${channel}` : ''} — waiting for the device to accept`,
             lang,
           ));
         }

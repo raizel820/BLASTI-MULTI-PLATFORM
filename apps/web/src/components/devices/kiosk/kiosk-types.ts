@@ -24,6 +24,13 @@ export interface PairingRequest {
   /** 0.6.100 — the manager-issued token this device ADOPTS on accept. */
   deviceToken?: string;
   sentAt: string;
+  // ── 0.6.106 — DEVICE-TO-DEVICE LAN delivery metadata ────────────────────
+  // Set when the request arrived as a unicast UDP offer from the manager's
+  // desktop (no cloud hop). When present, the ACCEPT posts DIRECTLY to
+  // http://<managerIp>:<managerPort>/api/agency-devices/device/accept-pairing
+  // and only falls back to the pinned-store route on failure.
+  managerIp?: string;
+  managerPort?: number;
 }
 
 export interface OfflineTicket {
