@@ -1047,11 +1047,23 @@ function broadcastEvent(event: Record<string, unknown>): number {
 
   if (type.startsWith('agency-device:')) {
     const agencyId = event.agencyId as string
-    const data = event.data as Record<string, unknown>
+    const data = (event.data && typeof event.data === 'object' ? event.data : {}) as Record<string, unknown>
     if (agencyId) {
       const room = `agency:${agencyId}`
-      io.to(room).emit('realtime-event', { type, data })
-      return 1
+      const sockets = io.sockets.adapter.rooms.get(room)
+      // 0.6.105 — PAIRED-DEVICE SAVE FIX: the historic emit wrapped every
+      // agency-device event as the literal name 'realtime-event' { type, data }
+      // — an event name NO client ever subscribed to and NO relay ever
+      // matched. The web Device Manager subscribes to the RAW names
+      // ('agency-device:connected' …), and the desktop's cloud→local relay
+      // reconciles the local PAIRING orphan by matching
+      // eventName === 'agency-device:connected' — both saw dead air, so a
+      // kiosk that accepted its pairing against the cloud NEVER showed up in
+      // the registered paired-devices list ("الأجهزة المقترنة غير محفوظة").
+      // Emit the RAW event name with a FLAT payload (data fields merged on
+      // top of the envelope) — same shape every other room event uses.
+      io.to(room).emit(type, { ...event, ...data, timestamp })
+      return sockets ? sockets.size : 0
     }
   }
 

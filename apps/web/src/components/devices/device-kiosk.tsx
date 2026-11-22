@@ -23,6 +23,7 @@ import { APP_VERSION } from '@/lib/version';
 import { startPairingBeacon, stopPairingBeacon } from '@/lib/pairing-beacon';
 import { getLocalIp } from '@/lib/get-local-ip';
 import { flushLogsNow, logDevice, logQueue } from '@/lib/remote-logger';
+import type { ApiFetchResponse } from '@/lib/api-fetch';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -1151,6 +1152,22 @@ export function DeviceKiosk() {
   };
 
   // ─── Discovery Login ───────────────────────────────────────
+  // 0.6.105 — PAIRING SPEED: field logs showed discover-register failing with
+  // a 15s caller abort ("Request was cancelled") whenever the store was busy
+  // or the client's failover chain retried — the kiosk then sat on an error
+  // and the whole pairing flow felt "very slow". The register call now gets
+  // a 30s window (the ApiClient failover chain can legitimately take ~20s on
+  // a bad LAN pin) and ONE automatic retry, so a single hiccup no longer
+  // bounces the customer back to the idle screen.
+  const discoverRegisterOnce = useCallback(async (signal: AbortSignal) => {
+    return apiFetch('/api/agency-devices/public/discover-register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({ deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
+    });
+  }, [lanServer]);
+
   const handleStartDiscovery = useCallback(async () => {
     userChoseStep.current = true;
     setDiscoveryLoading(true);
@@ -1158,17 +1175,29 @@ export function DeviceKiosk() {
     setDiscoveryStatus('registering');
     setPairingRequests([]);
     try {
-      // Use AbortController with 15s timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15_000);
+      // 30s window + ONE automatic retry (0.6.105 — was a bare 15s abort).
+      const attemptRegister = async (): Promise<ApiFetchResponse> => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 30_000);
+          try {
+            return await discoverRegisterOnce(controller.signal);
+          } catch (err) {
+            const aborted = err instanceof DOMException && err.name === 'AbortError';
+            if (attempt === 0) {
+              try { logDevice('scan_retry', `discover-register attempt 1 failed (${aborted ? 'timeout' : 'network'}) — retrying once`, undefined, 'warn'); } catch { /* never block */ }
+              await new Promise((r) => setTimeout(r, 1500));
+              continue;
+            }
+            throw err;
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        }
+        throw new Error('unreachable');
+      };
 
-      const res = await apiFetch('/api/agency-devices/public/discover-register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({ deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
-      });
-      clearTimeout(timeoutId);
+      const res = await attemptRegister();
 
       if (!res.ok) {
         // Surface the actual API error body instead of a useless "500".
@@ -1253,7 +1282,7 @@ export function DeviceKiosk() {
     } finally {
       setDiscoveryLoading(false);
     }
-  }, [lanServer, startDeviceHeartbeat]);
+  }, [discoverRegisterOnce, startDeviceHeartbeat]);
 
   // ─── Accept Pairing Request ───────────────────────────────
   const handleAcceptPairing = useCallback(async (request: PairingRequest) => {

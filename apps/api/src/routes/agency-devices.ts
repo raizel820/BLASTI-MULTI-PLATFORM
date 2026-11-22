@@ -67,6 +67,7 @@ interface AgencyDevicesEnv {
   Variables: {
     printDevice?: {
       id: string
+      name: string
       type: string
       agencyId: string | null
       printerConfig: string | null
@@ -3894,6 +3895,57 @@ app.post('/discovery/pairing-request-by-identity', async (c) => {
   }
 })
 
+// ─── POST /discovery/pairing-state — fingerprint → paired-state lookup ──────
+// 0.6.105 — PAIRED-DEVICE BACKSTOP. The desktop reconciles a cloud-accepted
+// pairing via the realtime 'agency-device:connected' event, but an event can
+// be missed (engine socket down at accept time, relay not joined yet) — and
+// then the local PAIRING orphan never settles ("الأجهزة المقترنة غير محفوظة").
+// The desktop now ALSO polls this endpoint (throttled) with the fingerprints
+// of its local orphans and settles every row the cloud reports as paired.
+const pairingStateSchema = z.object({
+  fingerprints: z.array(z.string().min(1).max(200)).max(50),
+})
+
+app.post('/discovery/pairing-state', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) {
+      return c.json({ success: false, error: 'No agency assigned' }, 403)
+    }
+    const rawBody = await c.req.json().catch(() => ({}))
+    const validation = validateBody(pairingStateSchema, rawBody)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+    const fingerprints = [...new Set(validation.data.fingerprints)].slice(0, 50)
+    if (fingerprints.length === 0) {
+      return c.json({ success: true, states: {} })
+    }
+    // Only rows PAIRED WITH THIS agency are reported — a fingerprint that
+    // belongs to another agency (or is still an orphan everywhere) stays
+    // absent from the map, so the local orphan keeps waiting normally.
+    const rows = await db.agencyDevice.findMany({
+      where: { deviceFingerprint: { in: fingerprints }, agencyId: user.agencyId },
+      select: { id: true, deviceFingerprint: true, deviceToken: true, status: true, name: true, type: true },
+    })
+    const states: Record<string, { paired: boolean; deviceToken?: string; status: string; name?: string; type?: string }> = {}
+    for (const row of rows) {
+      if (!row.deviceFingerprint) continue
+      states[row.deviceFingerprint] = {
+        paired: row.status === 'ONLINE',
+        deviceToken: row.deviceToken || undefined,
+        status: row.status,
+        name: row.name,
+        type: row.type,
+      }
+    }
+    return c.json({ success: true, states })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ── 0.6.100 — CASCADE PERIPHERAL REGISTRATION (cloud) ───────────────────────
 // A discovered USB printer attached to ANOTHER branch PC (source
 // 'peripheral-report') is registered here as a PRINTER AgencyDevice. The
@@ -4149,6 +4201,59 @@ const discoveryPrintSchema = z.object({
   }).optional(),
 })
 
+// 0.6.105 — REALTIME PRINT-JOB RELAY. A kiosk registered against the CLOUD
+// prints its receipt through THIS route. A printer attached to a branch PC's
+// USB port can never be raw-TCP'd or HTTP-forwarded from the cloud box (the
+// host IP is a private LAN address) — the historic answer was a 409
+// "USB_PRINTER_NEEDS_LAN", so the kiosk fell back to the browser popup and
+// the receipt never reached the thermal printer. The job now travels the
+// agency's realtime room ('agency-device:print-job'): every branch PC running
+// the active BLASTI desktop app receives it, and the machine that is the
+// printer's HOST (instance id / LAN IP match, or the named OS queue exists)
+// silently prints it in the background through the OS print service.
+/** Staff-session agency id without throwing (kiosk-token callers have none). */
+async function safeAuthAgencyId(c: Context): Promise<string | null> {
+  try {
+    const user = await requireAuth(c)
+    return user.agencyId || null
+  } catch {
+    return null
+  }
+}
+
+function relayPrintJobToAgencyRoom(
+  agencyId: string,
+  job: {
+    printerDeviceId?: string
+    printerName?: string
+    cupsName?: string
+    hostInstanceId?: string
+    hostIp?: string
+    hostMatch?: 'host-identity' | 'printer-name'
+    ticket?: Record<string, unknown>
+    test?: boolean
+    kioskDeviceId?: string
+    kioskDeviceName?: string
+  },
+): string {
+  const jobId = crypto.randomBytes(12).toString('hex')
+  void emitAgencyDeviceEvent('agency-device:print-job', agencyId, {
+    jobId,
+    ...job,
+    agencyId,
+    relayedAt: new Date().toISOString(),
+  })
+  appendDeviceEvent({
+    event: 'print_job_relayed',
+    message: `Receipt print job relayed to the branch desktop app over realtime (${job.printerName || job.cupsName || 'printer'})`,
+    deviceId: job.printerDeviceId,
+    deviceType: 'PRINTER',
+    agencyId,
+    data: { jobId, source: 'cloud-print-relay', kioskDeviceId: job.kioskDeviceId },
+  })
+  return jobId
+}
+
 // POST /discovery/print — Raw ESC/POS ticket print (kiosk token OR staff)
 app.post('/discovery/print', printAuth, async (c) => {
   try {
@@ -4176,8 +4281,9 @@ app.post('/discovery/print', printAuth, async (c) => {
 
     // 0.6.100 — USB-attached printers (cascade peripherals) cannot be raw-TCP
     // printed from the CLOUD: the printer hangs off a branch PC's USB port.
-    // The print must go through the branch PC's local API (LAN mode) — give a
-    // clear error instead of a mysterious 502.
+    // 0.6.105 — instead of failing with USB_PRINTER_NEEDS_LAN, the job is now
+    // RELAYED over the agency realtime room to the active BLASTI desktop app
+    // on the printer-host machine, which prints it in the background.
     if (printBody.printerDeviceId) {
       try {
         const printerRow = await db.agencyDevice.findUnique({ where: { id: printBody.printerDeviceId } })
@@ -4186,10 +4292,28 @@ app.post('/discovery/print', printAuth, async (c) => {
             ? JSON.parse(printerRow.printerConfig || '{}')
             : (printerRow.printerConfig || {}) as Record<string, unknown>
           if (cfg && cfg.attachment === 'USB') {
-            return c.json({
-              success: false,
-              error: 'USB_PRINTER_NEEDS_LAN — this printer is attached to a branch PC; print via the branch desktop (LAN mode) so the job reaches the host',
-            }, 409)
+            const relayAgencyId = kioskDevice?.agencyId || (await safeAuthAgencyId(c))
+            if (!relayAgencyId) {
+              return c.json({ success: false, error: 'No agency context for the print relay' }, 403)
+            }
+            const hostInstanceId = typeof cfg.hostInstanceId === 'string' ? cfg.hostInstanceId
+              : (typeof cfg.hostFingerprint === 'string' ? cfg.hostFingerprint : undefined)
+            const hostIp = typeof cfg.hostIp === 'string' ? cfg.hostIp : undefined
+            const relayJobId = relayPrintJobToAgencyRoom(relayAgencyId, {
+              printerDeviceId: printerRow.id,
+              printerName: (typeof cfg.cupsName === 'string' && cfg.cupsName)
+                || (typeof cfg.osPrinterName === 'string' && cfg.osPrinterName)
+                || printerRow.name,
+              cupsName: typeof cfg.cupsName === 'string' ? cfg.cupsName : undefined,
+              hostInstanceId,
+              hostIp,
+              hostMatch: (hostInstanceId || hostIp) ? 'host-identity' : 'printer-name',
+              ticket: (printBody.ticket || undefined) as Record<string, unknown> | undefined,
+              test: printBody.test || undefined,
+              kioskDeviceId: kioskDevice?.id,
+              kioskDeviceName: kioskDevice?.name,
+            })
+            return c.json({ success: true, via: 'realtime-relay', jobId: relayJobId })
           }
         }
       } catch { /* fall through to the normal path */ }
@@ -4207,14 +4331,20 @@ app.post('/discovery/print', printAuth, async (c) => {
     //     row's adopted deviceToken (mirror of the local route's host-forward).
     //   • Network printer (row ipAddress / printerConfig.ip) → raw ESC/POS
     //     target, port from printerConfig.port || 9100 (shared code below).
-    //   • Loopback / USB-local printer → 409: the cloud box can never reach
-    //     another PC's USB port; pair the host PC so jobs can be forwarded.
+    //   • Loopback / USB-local printer → realtime relay to the host PC app
+    //     (0.6.105 — was a 409; the receipt now prints in the background).
     // No assignment (or a missing/deleted/unusable printer row) → fall back to
     // the agency DefaultPrinter logic below; the success response then carries
     // a `note` so the kiosk UI can surface the degraded path.
     let printNote: string | undefined
     const hasExplicitTarget = !!(ip || port || printBody.printerDeviceId)
+    // 0.6.105 — a printing kiosk must be paired (the relay targets its agency
+    // room; an unpaired kiosk has no room to receive anything anyway).
+    if (kioskDevice && !kioskDevice.agencyId) {
+      return c.json({ success: false, error: 'Kiosk is not paired with an agency — pair it first' }, 403)
+    }
     if (!hasExplicitTarget && kioskDevice && kioskDevice.type === 'KIOSK') {
+      const kioskAgencyId = kioskDevice.agencyId as string
       const kioskCfg = parseJSON(kioskDevice.printerConfig) as Record<string, unknown>
       const assignedId = typeof kioskCfg.defaultPrinterDeviceId === 'string' ? kioskCfg.defaultPrinterDeviceId : ''
       if (assignedId) {
@@ -4224,12 +4354,37 @@ app.post('/discovery/print', printAuth, async (c) => {
           if (printerRow && printerRow.type === 'PRINTER') {
             const pcfg = parseJSON(printerRow.printerConfig) as Record<string, unknown>
             const hostIp = typeof pcfg.hostIp === 'string' ? pcfg.hostIp : ''
+            const hostInstanceId = typeof pcfg.hostInstanceId === 'string' ? pcfg.hostInstanceId
+              : (typeof pcfg.hostFingerprint === 'string' ? pcfg.hostFingerprint : undefined)
+            const relayJob = (extraNote?: string) => {
+              const relayJobId = relayPrintJobToAgencyRoom(kioskAgencyId, {
+                printerDeviceId: printerRow.id,
+                printerName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName)
+                  || (typeof pcfg.osPrinterName === 'string' && pcfg.osPrinterName)
+                  || printerRow.name,
+                cupsName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName) || undefined,
+                hostInstanceId,
+                hostIp: hostIp || undefined,
+                hostMatch: (hostInstanceId || hostIp) ? 'host-identity' : 'printer-name',
+                ticket: (printBody.ticket || undefined) as Record<string, unknown> | undefined,
+                test: printBody.test || undefined,
+                kioskDeviceId: kioskDevice.id,
+                kioskDeviceName: kioskDevice.name,
+              })
+              return c.json({ success: true, via: 'realtime-relay', jobId: relayJobId, ...(extraNote ? { note: extraNote } : {}) })
+            }
             if (pcfg.attachment === 'USB' && hostIp) {
-              // USB-attached — forward to the branch host PC's local API.
+              // USB-attached — first try the DIRECT LAN forward to the host
+              // PC's local API (works when the host is LAN-reachable from the
+              // requester's store); on failure fall back to the realtime
+              // relay (0.6.105) instead of a 502 — the active desktop app on
+              // the host still prints the receipt in the background.
               const hostPort = Number(pcfg.hostPort) > 0 ? Number(pcfg.hostPort) : 3080
               const hostToken = printerRow.deviceToken || ''
               if (!hostToken) {
-                return c.json({ success: false, error: 'HOST_NOT_PAIRED — pair the host PC first so print jobs can be authenticated' }, 409)
+                // Not paired → the direct path cannot authenticate, but the
+                // relay path authenticates via the agency room membership.
+                return relayJob('host not paired — job relayed over realtime')
               }
               const ctl = new AbortController()
               const timer = setTimeout(() => ctl.abort(), 20_000)
@@ -4262,7 +4417,10 @@ app.post('/discovery/print', printAuth, async (c) => {
                   } catch { /* log only */ }
                   return c.json({ success: true, via: 'host-forward', host: `${hostIp}:${hostPort}` })
                 }
-                return c.json({ success: false, error: (fwdData && fwdData.error) || `Host print failed (${fwd.status})`, host: `${hostIp}:${hostPort}` }, 502)
+                // 0.6.105 — direct forward failed (host offline / LAN split) →
+                // realtime relay fallback; the job still reaches the active
+                // desktop app through the cloud socket.
+                return relayJob('direct host forward failed — job relayed over realtime')
               } finally {
                 clearTimeout(timer)
               }
@@ -4279,10 +4437,9 @@ app.post('/discovery/print', printAuth, async (c) => {
               || rawIp === 'localhost'
               || rawIp === '::1'
             if (isUsbLocal) {
-              return c.json({
-                success: false,
-                error: 'USB printer is attached to a branch PC — pair the host PC so jobs can be forwarded',
-              }, 409)
+              // 0.6.105 — USB printer on a branch PC → realtime relay to the
+              // active desktop app on the host (background OS print).
+              return relayJob()
             }
             if (rawIp) {
               ip = rawIp
@@ -4316,11 +4473,21 @@ app.post('/discovery/print', printAuth, async (c) => {
           // cryptic 502 "connect ECONNREFUSED 127.0.0.1:9100".
           const isUsbDefault = def.connectionType === 'USB' || def.ip === '127.0.0.1' || def.ip === 'localhost'
           if (isUsbDefault) {
-            return c.json({
-              success: false,
-              error: 'USB_PRINTER_NEEDS_LAN — the default printer is attached to a branch PC; print via the branch desktop (LAN mode) so the OS print service receives the job',
-              target: `${def.ip}:${def.port || 9100}`,
-            }, 409)
+            // 0.6.105 — USB default printer → realtime relay to the branch
+            // desktop apps (was USB_PRINTER_NEEDS_LAN 409). No host identity
+            // is pinned on the DefaultPrinter row, so the relay asks for a
+            // printer-NAME match: the PC whose OS print service owns that
+            // queue prints the receipt in the background.
+            const relayJobId = relayPrintJobToAgencyRoom(agencyId, {
+              printerName: def.cupsName || def.name,
+              cupsName: def.cupsName || undefined,
+              hostMatch: 'printer-name',
+              ticket: (printBody.ticket || undefined) as Record<string, unknown> | undefined,
+              test: printBody.test || undefined,
+              kioskDeviceId: kioskDevice?.id,
+              kioskDeviceName: kioskDevice?.name,
+            })
+            return c.json({ success: true, via: 'realtime-relay', jobId: relayJobId })
           }
           ip = def.ip
           port = port || (def.port || 9100)

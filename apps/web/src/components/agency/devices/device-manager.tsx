@@ -229,10 +229,11 @@ export function DeviceManager() {
     fetchSavedMeta();
   }, [fetchDevices, fetchBranches, fetchUnpaired, fetchSavedMeta]);
 
-  // Unpaired polling (10s)
+  // Unpaired polling (0.6.105 — 5s: the approval strip must surface a newly
+  // registered kiosk fast; the 10s poll made pairing feel "very slow").
   useEffect(() => {
     if (!agencyId) return;
-    const interval = setInterval(fetchUnpaired, 10_000);
+    const interval = setInterval(fetchUnpaired, 5_000);
     return () => clearInterval(interval);
   }, [agencyId, fetchUnpaired]);
 
@@ -778,6 +779,88 @@ export function DeviceManager() {
     } finally { setBusyDeviceId(null); }
   };
 
+  // 0.6.105 — SAVE PRINTER AS A CONNECTED DEVICE. The historic printer card
+  // actions could only "Set agency default printer" (a DefaultPrinter meta
+  // row — NOT a device) or "Register" a peripheral-report card. There was NO
+  // button that saved the printer as a real AgencyDevice PRINTER row — so the
+  // agency's registered-printer list stayed empty and the per-kiosk "Default
+  // printer" selector had nothing to assign ("لا يوجد زر لحفظ الطابعة كجهاز
+  // متصل ولا زر لتعيينها كطابعة افتراضية للكشك"). This handler creates the
+  // PRINTER device row; the kiosk cards' selector becomes usable immediately.
+  const savedPrinterKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const dev of devices) {
+      if (dev.type !== 'PRINTER') continue;
+      if (dev.ipAddress) keys.add(`ip:${dev.ipAddress.toLowerCase()}|name:${dev.name}`);
+      if (dev.deviceFingerprint) keys.add(`fp:${dev.deviceFingerprint.toLowerCase()}`);
+      const cfg = typeof dev.printerConfig === 'string'
+        ? (() => { try { return JSON.parse(dev.printerConfig || '{}') as Record<string, unknown>; } catch { return {}; } })()
+        : ((dev.printerConfig || {}) as Record<string, unknown>);
+      if (cfg && typeof cfg.cupsName === 'string' && cfg.cupsName) keys.add(`cups:${cfg.cupsName.toLowerCase()}`);
+    }
+    return keys;
+  }, [devices]);
+
+  const printerDeviceKey = (d: RealDiscoveredDevice): string | null => {
+    if (d.fingerprint) return `fp:${d.fingerprint.toLowerCase()}`;
+    if (d.cupsName) return `cups:${d.cupsName.toLowerCase()}`;
+    if (d.ip) return `ip:${d.ip.toLowerCase()}|name:${d.name}`;
+    return null;
+  };
+
+  const handleSavePrinterAsDevice = async (device: RealDiscoveredDevice) => {
+    setBusyDeviceId(device.id);
+    try {
+      const isUsb = device.connectionType === 'USB' || !device.ip;
+      const hostIp = device.hostIp || (device.ip === '127.0.0.1' ? null : undefined);
+      const res = await apiFetch(API_BASE, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: device.name,
+          nameAr: device.nameAr || undefined,
+          nameFr: device.nameFr || undefined,
+          type: 'PRINTER',
+          // CONNECTION_TYPES has no USB value on either store — the physical
+          // attachment rides in printerConfig (attachment/hostIp/cupsName…).
+          connectionType: isUsb ? 'MANUAL' : device.connectionType === 'WIFI' ? 'WIFI' : 'LAN',
+          ipAddress: !isUsb && device.ip && device.ip !== '127.0.0.1' ? device.ip : undefined,
+          port: !isUsb && device.port && device.port > 0 ? device.port : undefined,
+          autoDiscovery: true,
+          screenLayout: 'TICKET_PRINTER',
+          printerConfig: {
+            ...(isUsb ? { attachment: 'USB' } : {}),
+            ...(hostIp ? { hostIp } : {}),
+            ...(device.hostPort ? { hostPort: device.hostPort } : {}),
+            ...(device.hostInstanceId || device.hostFingerprint ? { hostInstanceId: device.hostInstanceId || device.hostFingerprint } : {}),
+            ...(device.hostName ? { hostName: device.hostName } : {}),
+            ...(device.cupsName ? { cupsName: device.cupsName } : {}),
+            ...(device.cupsUri ? { cupsUri: device.cupsUri } : {}),
+            ...(device.usbVendorId ? { usbVendorId: device.usbVendorId } : {}),
+            ...(device.usbProductId ? { usbProductId: device.usbProductId } : {}),
+            ...(device.port && device.port > 0 && !isUsb ? { port: device.port } : {}),
+            manufacturer: device.manufacturer || device.macVendor || undefined,
+            model: device.model || undefined,
+            source: device.source,
+          },
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(getLocalizedString(
+          `تم حفظ الطابعة "${device.name}" كجهاز متصل`,
+          `Imprimante "${device.name}" enregistrée comme appareil`,
+          `Printer "${device.name}" saved as a connected device`,
+          lang,
+        ));
+        fetchDevices(true);
+      } else {
+        toast.error(data.error || getLocalizedString('فشل حفظ الطابعة', "Échec de l'enregistrement", 'Failed to save printer', lang));
+      }
+    } catch {
+      toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));
+    } finally { setBusyDeviceId(null); }
+  };
+
   // 0.6.100 — CASCADE PERIPHERAL REGISTRATION: a discovered printer that is
   // physically attached to ANOTHER branch PC (source 'peripheral-report') is
   // registered as a shared PRINTER device — usable by every branch device
@@ -1279,11 +1362,13 @@ export function DeviceManager() {
                         connectVerified={connectResults[d.id]}
                         printingTest={printingTestId === d.id}
                         registeredPeripheral={registeredPeripheralKeys.has(d.id)}
+                        savedAsDevice={(() => { const k = printerDeviceKey(d); return !!k && savedPrinterKeys.has(k); })()}
                         onSaveTv={() => handleSaveTv(d)}
                         onCast={() => handleCastTv(d)}
                         onPair={() => handlePairByIdentity(d)}
                         pairRequested={pairRequestedIds.has(d.id)}
                         onSavePrinter={() => handleSavePrinter(d)}
+                        onSavePrinterAsDevice={() => handleSavePrinterAsDevice(d)}
                         onRegisterPeripheral={() => handleRegisterPeripheral(d)}
                         onTestPrinter={() => handleTestPrinter(d)}
                         onPrintTest={() => handlePrintTestPage(d)}
@@ -1706,8 +1791,8 @@ function DiscoveredTypeIcon({ device }: { device: RealDiscoveredDevice }) {
 function DiscoveredCard({
   device, lang, busy, tvSaved, isDefaultPrinter,
   connecting, connectVerified, printingTest, pairRequested,
-  registeredPeripheral,
-  onSaveTv, onCast, onPair, onSavePrinter, onRegisterPeripheral, onTestPrinter, onPrintTest, onConnect, onDismiss,
+  registeredPeripheral, savedAsDevice,
+  onSaveTv, onCast, onPair, onSavePrinter, onSavePrinterAsDevice, onRegisterPeripheral, onTestPrinter, onPrintTest, onConnect, onDismiss,
 }: {
   device: RealDiscoveredDevice;
   lang: string;
@@ -1721,11 +1806,15 @@ function DiscoveredCard({
   pairRequested?: boolean;
   /** 0.6.100 — this USB peripheral printer is already registered. */
   registeredPeripheral?: boolean;
+  /** 0.6.105 — this printer already exists as a registered PRINTER device. */
+  savedAsDevice?: boolean;
   onSaveTv: () => void;
   onCast: () => void;
   /** 0.6.96 — request pairing from a discovered BLASTI card. */
   onPair: () => void;
   onSavePrinter: () => void;
+  /** 0.6.105 — save the printer as a real connected PRINTER device row. */
+  onSavePrinterAsDevice: () => void;
   /** 0.6.100 — register a host-attached USB printer as a shared branch printer. */
   onRegisterPeripheral: () => void;
   onTestPrinter: () => void;
@@ -1890,6 +1979,28 @@ function DiscoveredCard({
             {registeredPeripheral && (
               <span className="rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 px-1.5 py-px text-[9px]">
                 {getLocalizedString('مسجّلة ✓', 'Enregistrée ✓', 'Registered ✓', lang)}
+              </span>
+            )}
+            {/* 0.6.105 — SAVE AS CONNECTED DEVICE: every printer card (local
+                USB, network or peripheral-report) can now be saved as a real
+                PRINTER device row. This is what feeds the agency's registered
+                printer list — and therefore the per-kiosk "Default printer"
+                selector on the kiosk cards below. */}
+            {!isPeripheralPrinter && !savedAsDevice && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1 text-xs border-amber-300/60 text-amber-700 hover:bg-amber-50 dark:border-amber-900/50 dark:text-amber-400 dark:hover:bg-amber-950/30"
+                disabled={busy}
+                onClick={onSavePrinterAsDevice}
+              >
+                <Printer className="h-3 w-3" />
+                {getLocalizedString('حفظ كجهاز', 'Enregistrer l\'appareil', 'Save as device', lang)}
+              </Button>
+            )}
+            {savedAsDevice && !isPeripheralPrinter && (
+              <span className="rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 px-1.5 py-px text-[9px]">
+                {getLocalizedString('محفوظة كجهاز ✓', 'Appareil ✓', 'Saved as device ✓', lang)}
               </span>
             )}
             {!isPeripheralPrinter && !isDefaultPrinter && (

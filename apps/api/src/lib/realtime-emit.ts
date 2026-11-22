@@ -126,6 +126,10 @@ export type DeviceEventType =
   | 'agency-device:connected'
   | 'agency-device:disconnected'
   | 'agency-device:updated'
+  // 0.6.105 — background receipt printing: a cloud-registered kiosk relays
+  // its print job through the agency room to the active BLASTI desktop app
+  // on the printer-host machine.
+  | 'agency-device:print-job'
 
 export type AdminEventType =
   | 'admin:stats-updated'

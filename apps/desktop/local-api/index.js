@@ -13798,6 +13798,65 @@ async function startLocalApi(dbPath, port, options) {
         console.warn('[LocalAPI] cloud walk-in mirror failed (non-fatal):', mirrorErr && mirrorErr.message)
       }
     })
+
+    // 0.6.105 — CLOUD PRINT-JOB RELAY (background receipt printing). A kiosk
+    // registered against the CLOUD prints through the cloud /discovery/print
+    // route. When its assigned printer hangs off a branch PC's USB port the
+    // cloud cannot reach the LAN — it now relays the job into the agency's
+    // realtime room instead, and THIS handler executes it here when the local
+    // machine is the printer's host. Match rule:
+    //   1. job.hostInstanceId === the local BLASTI instance uid, OR
+    //   2. job.hostIp === this machine's LAN IP, OR
+    //   3. job.hostMatch === 'printer-name' → the OS print service owns the
+    //      named queue (printLocalTicket answers "not found" harmlessly on
+    //      every other PC, so exactly the host prints).
+    localRealtime.setCloudPrintJobHandler(async (event) => {
+      try {
+        if (!event || typeof event !== 'object') return
+        const job = (event.data && typeof event.data === 'object') ? event.data : event
+        const hostInstanceId = typeof job.hostInstanceId === 'string' ? job.hostInstanceId : ''
+        const hostIp = typeof job.hostIp === 'string' ? job.hostIp : ''
+        const hostMatch = typeof job.hostMatch === 'string' ? job.hostMatch : 'host-identity'
+        let myUid = null
+        try {
+          const scanner = require('./lib/discovery-scanner')
+          const identity = typeof scanner.getBlastiMdnsIdentity === 'function' ? scanner.getBlastiMdnsIdentity() : null
+          myUid = identity && typeof identity.uid === 'string' ? identity.uid : null
+        } catch { /* identity optional */ }
+        const isHost = (hostInstanceId && myUid && hostInstanceId === myUid)
+          || (!!hostIp && bestLanIp() === hostIp)
+          || (hostMatch === 'printer-name' && !hostInstanceId && !hostIp)
+        if (!isHost) return // another branch PC is the printer host
+        const osPrint = require('./lib/os-print')
+        const result = await osPrint.printLocalTicket({
+          printerName: typeof job.printerName === 'string' ? job.printerName : undefined,
+          cupsName: typeof job.cupsName === 'string' ? job.cupsName : undefined,
+          ticket: (job.ticket && typeof job.ticket === 'object') ? job.ticket : {},
+        })
+        if (result && result.ok === false) {
+          // This PC does not own the named OS queue (printer-name fan-out) or
+          // the spooler refused the job — log it and keep the relay harmless.
+          try {
+            require('./lib/device-event').deviceEvent('print_job_skipped',
+              'Relayed cloud receipt not printed on this PC: ' + (result.error || 'spooler refused'),
+              { deviceType: 'PRINTER', status: 'SKIPPED', source: 'cloud-print-relay', level: 'warn' })
+          } catch { /* log only */ }
+          return
+        }
+        try {
+          require('./lib/device-event').deviceEvent('print_job_done',
+            `Relayed cloud receipt printed on the local OS print service (${result && result.via ? result.via : 'os-print'})`,
+            { deviceType: 'PRINTER', status: 'OK', source: 'cloud-print-relay' })
+        } catch { /* log only */ }
+      } catch (relayPrintErr) {
+        console.warn('[LocalAPI] cloud print-job relay failed (non-fatal):', relayPrintErr && relayPrintErr.message)
+        try {
+          require('./lib/device-event').deviceEvent('print_job_failed',
+            'Relayed cloud receipt print failed: ' + (relayPrintErr && relayPrintErr.message),
+            { deviceType: 'PRINTER', status: 'FAILED', source: 'cloud-print-relay', level: 'warn' })
+        } catch { /* log only */ }
+      }
+    })
   } catch (rtErr) {
     console.warn('[LocalAPI] Local realtime init failed (non-fatal — interval sync unaffected):', rtErr.message)
   }

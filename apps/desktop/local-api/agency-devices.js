@@ -102,6 +102,10 @@ const CONNECTION_TYPES = ['LAN', 'WIFI', 'CABLE', 'MANUAL']
 const SCREEN_LAYOUTS = ['QUEUE_BOARD', 'TICKET_PRINTER', 'SERVICE_SELECTOR', 'CUSTOM', 'TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL']
 const DEVICE_STATUSES = ['ONLINE', 'OFFLINE', 'PAIRING', 'DISABLED', 'UPDATING']
 
+// 0.6.105 — throttle for the /unpaired route's pairing-state backstop (the
+// cloud orphan-reconcile poll runs at most once every 15s across all callers).
+let _lastPairingStateCheckAt = 0
+
 // Hand-rolled validators (zod is not available in the local API). They accept
 // exactly the same values as the cloud zod schemas and return
 // { ok: true, data } or { ok: false, issues }.
@@ -2118,6 +2122,61 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         orderBy: { lastHeartbeatAt: 'desc' },
         take: 50,
       })
+
+      // 0.6.105 — PAIRED-DEVICE BACKSTOP (cloud-accept reconcile, poll path).
+      // The realtime relay settles a cloud-accepted pairing instantly, but an
+      // event can be missed (engine socket down at accept time) — the local
+      // orphan then stayed PAIRING forever and the paired device never showed
+      // up in the registered list. Throttled (max once / 15s) ask the CLOUD
+      // which of our orphan fingerprints is now paired with THIS agency and
+      // settle those rows locally (adopt the canonical token, flip ONLINE).
+      try {
+        const orphansWithFp = devices.filter((d) => d.deviceFingerprint)
+        const token0 = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
+        if (orphansWithFp.length > 0 && token0 && typeof ctx.cloudFetch === 'function'
+            && Date.now() - _lastPairingStateCheckAt > 15000) {
+          _lastPairingStateCheckAt = Date.now()
+          const stateRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-state', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token0 },
+            body: JSON.stringify({ fingerprints: orphansWithFp.map((d) => d.deviceFingerprint).slice(0, 50) }),
+          }, { timeoutMs: 6000, attempts: 1 })
+          const stateData = await stateRes.json().catch(() => null)
+          if (stateRes.ok && stateData && stateData.success && stateData.states) {
+            for (const orphan of orphansWithFp) {
+              const st = stateData.states[orphan.deviceFingerprint]
+              if (!st || st.paired !== true) continue
+              const nowR = new Date()
+              const settleData = {
+                agencyId: requireAgencyId(c),
+                status: 'ONLINE',
+                statusChangedAt: nowR,
+                connectedAt: orphan.createdAt || nowR,
+                lastHeartbeatAt: nowR,
+              }
+              if (st.deviceToken) settleData.deviceToken = st.deviceToken
+              await db.agencyDevice.update({ where: { id: orphan.id }, data: settleData }).catch(async () => {
+                delete settleData.deviceToken
+                await db.agencyDevice.update({ where: { id: orphan.id }, data: settleData }).catch(() => null)
+              })
+              broadcastSafe('agency-device:connected', {
+                agencyId: requireAgencyId(c),
+                deviceId: orphan.id,
+                deviceName: orphan.name,
+                deviceType: orphan.type,
+                reconciled: true,
+                via: 'pairing-state-poll',
+              })
+              deviceEvents.deviceEvent('pairing_reconciled',
+                'Cloud-accepted pairing reconciled from the pairing-state poll: ' + (orphan.name || orphan.id),
+                { deviceId: orphan.id, deviceName: orphan.name, deviceType: orphan.type, status: 'ONLINE' })
+            }
+          }
+        }
+      } catch (backstopErr) {
+        if (diagLog) diagLog('AGENCY-DEVICE pairing-state backstop skipped: ' + (backstopErr && backstopErr.message))
+      }
+
       // Cloud merge (best-effort — an offline desktop just sees local orphans).
       let cloudDevices = []
       try {

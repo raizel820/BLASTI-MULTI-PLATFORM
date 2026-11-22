@@ -530,7 +530,14 @@ function broadcastLocalRealtime(type, payload) {
     }
   } else if (type.startsWith('agency-device:')) {
     if (agencyId) {
-      _io.to('agency:' + agencyId).emit('realtime-event', { type, data })
+      // 0.6.105 — PAIRED-DEVICE SAVE FIX: the historic local emit wrapped the
+      // payload as the literal event name 'realtime-event' { type, data } —
+      // a name NO client subscribes to. The Device Manager listens for the
+      // RAW names ('agency-device:connected', 'agency-device:pairing-request'
+      // …), so local pairing acceptances never refreshed the paired-devices
+      // list in realtime. Emit the RAW event name with a FLAT payload, same
+      // as the cloud relay now does.
+      _io.to('agency:' + agencyId).emit(type, { ...data, agencyId, timestamp: Date.now() })
       recipients += room('agency:' + agencyId)
     }
   } else if (type === 'pairing-request') {
@@ -608,6 +615,19 @@ function setCloudWalkInMirror(fn) {
   _mirrorCloudWalkIn = typeof fn === 'function' ? fn : null
 }
 
+// 0.6.105 — CLOUD PRINT-JOB RELAY. A kiosk that prints its receipt against
+// the CLOUD store targets a printer that hangs off a branch PC's USB port —
+// the cloud box can never raw-TCP or HTTP-forward to a LAN address it cannot
+// reach. The job therefore travels over the agency's realtime room (event
+// 'agency-device:print-job'), the engine socket receives it here, and the
+// handler registered from index.js prints it through the OS print service
+// when THIS machine is the printer's host (instance id / LAN IP match) —
+// all in the background, no kiosk round-trip.
+let _cloudPrintJobHandler = null
+function setCloudPrintJobHandler(fn) {
+  _cloudPrintJobHandler = typeof fn === 'function' ? fn : null
+}
+
 /**
  * Relay one event received on the SYNC ENGINE's cloud socket into the local
  * rooms. The cloud already routed the event to the agency room the engine
@@ -642,6 +662,14 @@ function relayCloudRealtime(eventName, args) {
   if (eventName === 'queue:walk-in' && typeof _mirrorCloudWalkIn === 'function') {
     try { _mirrorCloudWalkIn(event) } catch (mirrorErr) {
       warn('cloud walk-in mirror failed:', mirrorErr && mirrorErr.message)
+    }
+  }
+
+  // 0.6.105 — CLOUD PRINT-JOB RELAY (before the relay: the print happens on
+  // THIS machine; the UI relay of the same event stays informational).
+  if (eventName === 'agency-device:print-job' && typeof _cloudPrintJobHandler === 'function') {
+    try { _cloudPrintJobHandler(event) } catch (printErr) {
+      warn('cloud print-job relay failed:', printErr && printErr.message)
     }
   }
 
@@ -687,6 +715,8 @@ module.exports = {
   setLocalRealtimeRelayContext,
   setCloudDeviceAcceptReconciler,
   setCloudWalkInMirror,
+  // 0.6.105 — background receipt printing on the printer-host PC
+  setCloudPrintJobHandler,
   relayCloudRealtime,
   getLocalRealtimeStats,
   // 0.6.101 — pre-pairing delivery rooms (join sanitation + tests)
