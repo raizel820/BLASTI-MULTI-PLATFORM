@@ -1764,6 +1764,10 @@ const en: Record<TranslationKeys, string> = {
   kioskModeEnabled: 'Kiosk Mode Enabled',
   kioskModeDesc: 'Allow customers to take tickets from public touch terminals',
 
+  // 0.6.104 — kiosk ticket action row (receipt choice + auto-return flow)
+  kioskPrintReceipt: 'Print receipt',
+  kioskNextCustomer: 'Done — next customer',
+
   // ─── Kiosk Login ──────
   kioskLoginTitle: 'Kiosk Device Login',
   kioskLoginDesc: 'Enter the pairing code and device token provided by your agency admin',
@@ -2962,6 +2966,17 @@ const en: Record<TranslationKeys, string> = {
   dmCastStart: "Start casting",
   dmCastStop: "Stop casting",
   // ── END TASK 5-b BLOCK ────────────────────────────────────────────────
+
+  // ── 0.6.104 — per-kiosk default printer (Fault: the kiosk must print on
+  //    the printer registered/attached to its branch; assignable per-kiosk
+  //    from the Device Manager). Keys prefixed dmKioskPrinter* to stay
+  //    conflict-free with parallel tasks. ──
+  dmKioskPrinterDefault: "Default printer",
+  dmKioskPrinterAgencyDefault: "Agency default",
+  dmKioskPrinterNoRegistered: "No registered printers found",
+  dmKioskPrinterTag: "Printer",
+  dmKioskPrinterSaved: "Default printer saved for this kiosk",
+  dmKioskPrinterSaveFailed: "Failed to save the default printer",
 
   // --- Status translations ---
   statusPending: 'Pending',

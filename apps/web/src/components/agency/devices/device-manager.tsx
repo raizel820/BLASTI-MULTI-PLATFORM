@@ -32,6 +32,10 @@ import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
   DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
+// 0.6.104 — per-kiosk default printer selector (compact select control)
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { motion } from 'framer-motion';
 import {
@@ -95,7 +99,35 @@ const EMPTY_FORM: DeviceFormState = {
   autoDiscovery: true, screenLayout: 'TV_CLASSIC',
   branchId: '', serviceFilter: '',
   status: 'OFFLINE', displaySettings: {},
+  defaultPrinterDeviceId: '',
 };
+
+// ─── printerConfig helpers (0.6.104 — kiosk default printer) ───────────────
+
+/** printerConfig arrives as a JSON string (local API) or object (cloud M7). */
+function parseDevicePrinterConfig(device: AgencyDevice | null): Record<string, unknown> {
+  if (!device?.printerConfig) return {};
+  if (typeof device.printerConfig === 'object') return device.printerConfig as Record<string, unknown>;
+  try { return JSON.parse(device.printerConfig) as Record<string, unknown>; } catch { return {}; }
+}
+
+/** The printer AgencyDevice id assigned to a kiosk via its printerConfig. */
+function kioskAssignedPrinterId(device: AgencyDevice | null): string {
+  const cfg = parseDevicePrinterConfig(device);
+  return typeof cfg.defaultPrinterDeviceId === 'string' ? cfg.defaultPrinterDeviceId : '';
+}
+
+/**
+ * Merge the kiosk default-printer assignment into a device's printerConfig —
+ * an empty printerId removes the key so the kiosk falls back to the
+ * agency-level DefaultPrinter.
+ */
+function kioskPrinterConfigWithAssignment(device: AgencyDevice | null, printerId: string): Record<string, unknown> {
+  const nextCfg: Record<string, unknown> = { ...parseDevicePrinterConfig(device) };
+  if (printerId) nextCfg.defaultPrinterDeviceId = printerId;
+  else delete nextCfg.defaultPrinterDeviceId;
+  return nextCfg;
+}
 
 export function DeviceManager() {
   const { user } = useAppStore();
@@ -254,6 +286,10 @@ export function DeviceManager() {
   const [tvQrOpen, setTvQrOpen] = useState(false);
 
   // ─── Derived ─────────────────────────────────────────────────────────────
+  // 0.6.104 — registered printers of the agency: the source list for the
+  // per-kiosk "Default printer" selector (same GET the manager already runs,
+  // filtered client-side by type like the KIOSK/PRINTER filter chips).
+  const registeredPrinters = useMemo(() => devices.filter((d) => d.type === 'PRINTER'), [devices]);
   const onlineCount = devices.filter((d) => d.status === 'ONLINE').length;
   const needsAttention = devices.filter((d) => d.status === 'OFFLINE' || d.status === 'DISABLED').length;
   // 0.6.101 — identity keys of the registry orphans already shown in the
@@ -346,6 +382,8 @@ export function DeviceManager() {
       autoDiscovery: device.autoDiscovery, screenLayout: device.screenLayout,
       branchId: device.branchId || '', serviceFilter: device.serviceFilter || '',
       status: device.status, displaySettings: ds as DisplaySettings,
+      // 0.6.104 — preselect the kiosk's assigned default printer
+      defaultPrinterDeviceId: device.type === 'KIOSK' ? kioskAssignedPrinterId(device) : '',
     });
     setFormOpen(true);
   };
@@ -367,6 +405,12 @@ export function DeviceManager() {
         serviceFilter: form.serviceFilter.trim() || undefined,
         displaySettings: form.displaySettings,
       };
+      // 0.6.104 — kiosk default printer: persist the assignment on the KIOSK
+      // row's printerConfig JSON (defaultPrinterDeviceId). Both the local and
+      // cloud PATCH/POST device routes already accept printerConfig.
+      if (form.type === 'KIOSK') {
+        body.printerConfig = kioskPrinterConfigWithAssignment(editingDevice, form.defaultPrinterDeviceId);
+      }
       const res = editingDevice
         ? await apiFetch(`${API_BASE}/${editingDevice.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
         : await apiFetch(API_BASE, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -497,6 +541,33 @@ export function DeviceManager() {
         fetchDevices(true);
       }
     } catch { /* silent */ }
+  };
+
+  // 0.6.104 — kiosk-assigned default printer (Fault: the kiosk must print on
+  // the printer registered/attached to its branch, assignable per-kiosk from
+  // the device manager). Saves the chosen printer AgencyDevice id on the
+  // KIOSK row's printerConfig JSON (key `defaultPrinterDeviceId`); an empty
+  // printerId clears the key so the kiosk falls back to the agency-level
+  // DefaultPrinter. Uses the manager's own PATCH /api/agency-devices/:id
+  // mechanism (apiFetch), which works against BOTH the local and cloud APIs.
+  const handleSetKioskDefaultPrinter = async (device: AgencyDevice, printerId: string) => {
+    setBusyDeviceId(device.id);
+    try {
+      const res = await apiFetch(`${API_BASE}/${device.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ printerConfig: kioskPrinterConfigWithAssignment(device, printerId) }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(t('dmKioskPrinterSaved'));
+        fetchDevices(true);
+      } else {
+        toast.error(data.error || t('dmKioskPrinterSaveFailed'));
+      }
+    } catch {
+      toast.error(t('dmKioskPrinterSaveFailed'));
+    } finally { setBusyDeviceId(null); }
   };
 
   // ─── Handlers: kiosk credentials ─────────────────────────────────────────
@@ -1125,7 +1196,13 @@ export function DeviceManager() {
         <LanMasterCard agencyId={agencyId} lang={lang} />
 
         {/* ── 0.6.100 — Branch DEVICE TREE (roles + status + pending pairings) ── */}
-        <DeviceTreeCard agencyId={agencyId} lang={lang} devices={devices} />
+        <DeviceTreeCard
+          agencyId={agencyId}
+          lang={lang}
+          devices={devices}
+          printers={registeredPrinters}
+          onDeviceUpdated={() => fetchDevices(true)}
+        />
 
         {/* ── Discovery strip ── */}
         {hasDiscoveryContent && (
@@ -1286,6 +1363,8 @@ export function DeviceManager() {
                 device={device}
                 lang={lang}
                 busy={busyDeviceId === device.id}
+                printers={registeredPrinters}
+                onSetDefaultPrinter={(printerId) => handleSetKioskDefaultPrinter(device, printerId)}
                 onQuickRefresh={() => sendCommand(device, 'REFRESH')}
                 onPreview={() => setTvPreviewDevice(device)}
                 onCast={() => handleCastRegistered(device)}
@@ -1305,6 +1384,7 @@ export function DeviceManager() {
         <EditDeviceDialog
           open={formOpen} lang={lang} rtl={rtl} t={t} submitting={formSubmitting}
           editing={editingDevice} form={form} branches={branches}
+          printers={registeredPrinters}
           onFormChange={(patch) => setForm((prev) => ({ ...prev, ...patch }))}
           onOpenChange={(o) => { setFormOpen(o); if (!o) setEditingDevice(null); }}
           onSubmit={submitForm}
@@ -1390,13 +1470,17 @@ export function DeviceManager() {
 // ─── Connected device card ──────────────────────────────────────────────────
 
 function ManagerDeviceCard({
-  device, lang, busy,
+  device, lang, busy, printers, onSetDefaultPrinter,
   onQuickRefresh, onPreview, onCast, onCredentials, onEdit, onPair, onUnpair, onCommand,
   onToggleEnable, onDelete,
 }: {
   device: AgencyDevice;
   lang: string;
   busy: boolean;
+  /** 0.6.104 — agency's registered printers (per-kiosk default selector). */
+  printers: AgencyDevice[];
+  /** 0.6.104 — persist the kiosk default-printer assignment ('' = agency default). */
+  onSetDefaultPrinter: (printerId: string) => void;
   onQuickRefresh: () => void;
   onPreview: () => void;
   /** 0.6.96 — direct board cast to a registered TV (CAST_URL command). */
@@ -1409,12 +1493,20 @@ function ManagerDeviceCard({
   onToggleEnable: () => void;
   onDelete: () => void;
 }) {
+  const { t } = useLanguage();
   const typeCfg = DEVICE_TYPE_CONFIG[device.type] ?? DEVICE_TYPE_CONFIG.APP;
   const statusCfg = STATUS_CONFIG[device.status];
   const Icon = typeCfg.icon;
   const isTvLike = device.type === 'TV' || device.type === 'DISPLAY';
   const isKiosk = device.type === 'KIOSK';
   const layoutCfg = SCREEN_LAYOUT_CONFIG[device.screenLayout];
+  // 0.6.104 — kiosk default-printer assignment: current printer row (null
+  // when unassigned → the kiosk uses the agency-level DefaultPrinter).
+  const assignedPrinterId = isKiosk ? kioskAssignedPrinterId(device) : '';
+  const assignedPrinter = assignedPrinterId ? printers.find((p) => p.id === assignedPrinterId) ?? null : null;
+  const printerTag = `${t('dmKioskPrinterTag')}: ${
+    assignedPrinter ? getLocalizedName(assignedPrinter, lang) : t('dmKioskPrinterAgencyDefault')
+  }`;
 
   return (
     <motion.div layout initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}>
@@ -1505,7 +1597,45 @@ function ManagerDeviceCard({
                 {getLocalizedLabel(layoutCfg, lang)}
               </span>
             )}
+            {/* 0.6.104 — current default-printer assignment on kiosk cards */}
+            {isKiosk && (
+              <span className="inline-flex items-center gap-1 rounded-md bg-sky-100 px-1.5 py-0.5 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400 max-w-full">
+                <Printer className="h-3 w-3 shrink-0" />
+                <span className="truncate">{printerTag}</span>
+              </span>
+            )}
           </div>
+
+          {/* 0.6.104 — per-kiosk default printer (Fault: the kiosk must print
+              on the printer registered/attached to its branch). Compact
+              select over the agency's registered printers; "Agency default"
+              clears the assignment so the agency-level DefaultPrinter wins. */}
+          {isKiosk && (
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-muted-foreground shrink-0">{t('dmKioskPrinterDefault')}</span>
+              {printers.length === 0 ? (
+                <span className="text-[11px] text-amber-600 dark:text-amber-400 truncate">{t('dmKioskPrinterNoRegistered')}</span>
+              ) : (
+                <Select
+                  value={assignedPrinterId || 'agency-default'}
+                  onValueChange={(v) => onSetDefaultPrinter(v === 'agency-default' ? '' : v)}
+                  disabled={busy}
+                >
+                  <SelectTrigger className="h-7 flex-1 min-w-0 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="agency-default">{t('dmKioskPrinterAgencyDefault')}</SelectItem>
+                    {printers.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {getLocalizedName(p, lang)} · {p.connectionType}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            </div>
+          )}
 
           <p className="text-[11px] text-muted-foreground mt-auto">
             {device.lastHeartbeatAt

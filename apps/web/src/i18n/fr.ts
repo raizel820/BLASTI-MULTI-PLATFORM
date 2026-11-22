@@ -1754,6 +1754,10 @@ const fr: Record<TranslationKeys, string> = {
   kioskModeEnabled: 'Mode borne activé',
   kioskModeDesc: 'Permettre aux clients de prendre des tickets depuis les bornes tactiles',
 
+  // 0.6.104 — kiosk ticket action row (receipt choice + auto-return flow)
+  kioskPrintReceipt: 'Imprimer le reçu',
+  kioskNextCustomer: 'Terminé — client suivant',
+
   // ─── Kiosk Login ──────
   kioskLoginTitle: 'Connexion de la borne',
   kioskLoginDesc: 'Entrez le code d\'association et le jeton d\'appareil fournis par votre administrateur',
@@ -2962,6 +2966,17 @@ const fr: Record<TranslationKeys, string> = {
   dmCastStart: "Démarrer la diffusion",
   dmCastStop: "Arrêter la diffusion",
   // ── FIN DU BLOC TASK 5-b ──────────────────────────────────────────────
+
+  // ── 0.6.104 — imprimante par défaut par kiosque (Fault: le kiosque doit
+  //    imprimer sur l'imprimante enregistrée/reliée à sa succursale ;
+  //    assignable par kiosque depuis le gestionnaire d'appareils). Clés
+  //    préfixées dmKioskPrinter* pour éviter les conflits. ──
+  dmKioskPrinterDefault: "Imprimante par défaut",
+  dmKioskPrinterAgencyDefault: "Valeur par défaut de l’agence",
+  dmKioskPrinterNoRegistered: "Aucune imprimante enregistrée",
+  dmKioskPrinterTag: "Imprimante",
+  dmKioskPrinterSaved: "Imprimante par défaut enregistrée pour ce kiosque",
+  dmKioskPrinterSaveFailed: "Échec de l’enregistrement de l’imprimante par défaut",
 
   // --- Status translations ---
   statusPending: 'En attente',

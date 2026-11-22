@@ -675,6 +675,15 @@ async function checkCounterOccupancy(ctx, counterId) {
   if (counterId && counterId !== controlled.id) {
     return { ok: false, body: { success: false, error: 'COUNTER_CONTROL_REQUIRED', legacyError: 'OCCUPY_COUNTER_FIRST' } }
   }
+  // 0.6.104 (r25) — liveness touch: any queue operation from the controlling
+  // account refreshes its control heartbeat, so an actively working user can
+  // never look stale even when the client heartbeat timer is throttled
+  // (cloud parity with enforceCounterControlGate). Best-effort, never fails
+  // the gate.
+  await db.counter.updateMany({
+    where: { id: controlled.id, controlledByUserId: ctx.userId },
+    data: { controlHeartbeatAt: new Date() },
+  }).catch(() => null)
   return { ok: true, counter: controlled }
 }
 
@@ -13039,6 +13048,9 @@ function createApp() {
       try { localRealtime.broadcastLocalRealtime(type, payload) } catch { /* non-fatal */ }
     },
     diagLog,
+    // 0.6.104 — branch queue write lock for the kiosk join-queue (same
+    // serialization the staff walk-in route uses — ticket number collision fix).
+    withQueueWriteLock,
     // 0.6.100 — the local session token, so the host print service can accept
     // the master's own UI as a caller.
     sessionToken,
@@ -13133,6 +13145,16 @@ function createApp() {
     // the local session used to authenticate the cloud call.
     cloudFetch: (path, init, opts) => cloudFetchWithRetry(path, init, opts),
     getSessionToken: () => sessionToken,
+    // 0.6.104 — kiosk public routes (local-first): the module's new
+    // /public/join-queue issues tickets with the SAME queue-issuance plumbing
+    // the staff walk-in route above uses — branch queue write lock, outbox
+    // transaction, deterministic outcome logging and the open/paused/full
+    // gates — so a kiosk walk-in can never duplicate a ticket number against
+    // a concurrent staff walk-in and always reaches the cloud via the outbox.
+    withQueueWriteLock,
+    withOutboxTransaction,
+    logDeterministicOutcome,
+    checkQueueIssuanceGates,
   })
 
   // ═══ Static UI server (Task 58) ═════════════════════════════════════════
@@ -13447,15 +13469,19 @@ async function startLocalApi(dbPath, port, options) {
   fileSync.start()
   console.log(`[LocalAPI] File store: ${fileStore.resolveFilesRoot()} — file-sync worker started`)
 
-  // ── r21-8: local counter-control sweeper (lease TTL + 60s auto-claim) ──
+  // ── r21-8/r25: local counter-control sweeper (request resolution only) ──
   // Mirrors the cloud worker (apps/api/src/workers/counter-control-sweeper.ts)
-  // against the local SQLite source of truth:
-  //   1. counters whose controlHeartbeatAt went quiet for > 3min are released
-  //      (counter:lost + counter:released) — logout/close already releases
-  //      eagerly, this is the crash/force-kill safety net;
-  //   2. PENDING control requests past their 60s window auto-transfer control
-  //      to the requester while they are still an active agency member,
-  //      otherwise the request is stamped EXPIRED.
+  // against the local SQLite source of truth. r25 (user ruling — control is
+  // lost ONLY when the owner reassigns the staff, the app closes, or a
+  // handover request is accepted):
+  //   1. The historic TTL auto-free of stale leases is REMOVED — an open app
+  //      must never lose control because its heartbeat timer was throttled
+  //      (backgrounded phone). Heartbeats are liveness TRACKING only.
+  //   2. PENDING control requests past their 60s window still resolve: they
+  //      auto-transfer control ONLY when the holder's lease has been silent
+  //      for the 15-MINUTE CRASH WINDOW (app closed/crashed without a
+  //      release) or there is no holder at all; a live holder keeps control
+  //      and the request expires with HOLDER_ACTIVE.
   // Raw-SQL on purpose: runs on every boot regardless of generated-client
   // generation, and lease/request state is runtime state (no outbox rows).
   try {
@@ -13465,40 +13491,20 @@ async function startLocalApi(dbPath, port, options) {
       counterSweeperBusy = true
       try {
         const nowIso = new Date().toISOString()
-        const cutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString()
-        const stale = await db.$queryRawUnsafe(
-          `SELECT c."id" AS id, c."name" AS name, c."number" AS number, b."agencyId" AS agencyId
-             FROM "Counter" c JOIN "Branch" b ON b."id" = c."branchId"
-            WHERE c."controlledByUserId" IS NOT NULL
-              AND (c."controlHeartbeatAt" IS NULL OR c."controlHeartbeatAt" < ?)`,
-          cutoff
-        ).catch(() => [])
-        for (const row of stale || []) {
-          await db.$executeRawUnsafe(
-            `UPDATE "Counter"
-                SET "controlledByUserId" = NULL, "controlledByStaffId" = NULL,
-                    "controlClaimedAt" = NULL, "controlHeartbeatAt" = NULL,
-                    "occupiedAt" = NULL, "staffId" = NULL, "updatedAt" = ?
-              WHERE "id" = ?`,
-            nowIso, row.id
-          ).catch(() => null)
-          emitEvent('counter:lost', { agencyId: row.agencyId, counterId: row.id, counterName: row.name, counterNumber: row.number })
-          emitEvent('counter:released', { agencyId: row.agencyId, counterId: row.id, counterName: row.name, counterNumber: row.number })
-        }
         const expired = await db.$queryRawUnsafe(
           `SELECT * FROM "CounterControlRequest"
             WHERE "status" = 'PENDING' AND "expiresAt" < ?`,
           nowIso
         ).catch(() => [])
-        // r24 holder-liveness gate (cloud parity — user ruling: "control must
-        // only be lost when the owner reassigns the staff, the app closes, or
-        // a takeover request is ACCEPTED"). A PENDING request past its 60s
-        // window must NOT yank control from a LIVE holder: the holder's app is
-        // open and heartbeating (60s beats, 3min lease) — the request expires
-        // with HOLDER_ACTIVE and the requester retries or an owner assigns.
-        // Auto-claim fires ONLY when the holder's lease itself went stale
-        // (app closed / crashed) or there is no holder at all.
-        const holderCutoffMs = Date.now() - 3 * 60 * 1000
+        // r24/r25 holder-liveness gate (cloud parity — user ruling: "control
+        // must only be lost when the owner reassigns the staff, the app
+        // closes, or a takeover request is ACCEPTED"). A PENDING request past
+        // its 60s window must NOT yank control from a LIVE holder. Auto-claim
+        // fires ONLY when the holder's lease has been silent for the 15-minute
+        // CRASH WINDOW (app closed / crashed with no release) or there is no
+        // holder at all. 15 min covers Android backgrounded WebViews whose JS
+        // timers freeze for many minutes while the app is still open.
+        const holderCutoffMs = Date.now() - 15 * 60 * 1000
         for (const request of expired || []) {
           let holderAlive = false
           try {
@@ -13572,7 +13578,7 @@ async function startLocalApi(dbPath, port, options) {
       }
     }, 60 * 1000)
     counterControlSweeper.unref && counterControlSweeper.unref()
-    console.log('[LocalAPI] Counter-control sweeper started (lease TTL 3min, request window 60s)')
+    console.log('[LocalAPI] Counter-control sweeper started (request window 60s, crash window 15min, TTL auto-free REMOVED r25)')
   } catch (sweeperBootErr) {
     console.warn('[LocalAPI] counter-control sweeper boot skipped (non-fatal):', sweeperBootErr?.message || sweeperBootErr)
   }
@@ -13734,6 +13740,62 @@ async function startLocalApi(dbPath, port, options) {
         })
       } catch (reconcileErr) {
         console.warn('[LocalAPI] cloud device-accept reconcile failed (non-fatal):', reconcileErr && reconcileErr.message)
+      }
+    })
+    // 0.6.104 — CLOUD WALK-IN MIRROR: a kiosk that joined the queue against
+    // the CLOUD store (its LAN pin failed) emits queue:walk-in there. The
+    // relayed event reached the desktop UI instantly, but the RESERVATION ROW
+    // only arrived at the next sync pull — the full-screen display refetched
+    // and found nothing, so the ticket appeared ~5s late (poll cadence).
+    // Mirror the row from the event payload BEFORE the relay fans out; the
+    // sync pull remains the authority and reconciles any richer fields.
+    // NEVER outboxed: the row originated in the cloud, pushing it back would
+    // create a duplicate outbox replay.
+    localRealtime.setCloudWalkInMirror(async (event) => {
+      try {
+        if (!db || !event || typeof event !== 'object') return
+        const payload = (event.data && typeof event.data === 'object') ? event.data : event
+        const reservationId = typeof payload.reservationId === 'string' ? payload.reservationId
+          : (payload.reservation && typeof payload.reservation.id === 'string' ? payload.reservation.id : '')
+        const agencyId = typeof payload.agencyId === 'string' ? payload.agencyId
+          : (typeof event.agencyId === 'string' ? event.agencyId : '')
+        if (!reservationId || !agencyId) return
+        const existing = await db.reservation.findUnique({ where: { id: reservationId } }).catch(() => null)
+        if (existing) return // idempotent — local join-queue rows are already present
+        const src = (payload.reservation && typeof payload.reservation === 'object') ? payload.reservation : {}
+        await db.reservation.create({
+          data: {
+            id: reservationId,
+            agencyId,
+            serviceId: typeof payload.serviceId === 'string' ? payload.serviceId
+              : (typeof src.serviceId === 'string' ? src.serviceId : ''),
+            userId: src.userId ?? null,
+            queueNumber: typeof src.queueNumber === 'number' ? src.queueNumber : 0,
+            displayNumber: typeof src.displayNumber === 'string' && src.displayNumber
+              ? src.displayNumber
+              : (typeof payload.displayNumber === 'string' ? payload.displayNumber : ''),
+            status: typeof src.status === 'string' ? src.status : 'WAITING',
+            isWalkIn: src.isWalkIn !== false,
+            walkInCustomerName: src.walkInCustomerName
+              ?? (typeof payload.customerName === 'string' ? payload.customerName : null),
+            joinedAt: src.joinedAt ? new Date(src.joinedAt) : new Date(),
+            estimatedWait: typeof payload.estimatedWait === 'number' ? payload.estimatedWait
+              : (typeof src.estimatedWait === 'number' ? src.estimatedWait : 0),
+          },
+        }).catch(() => null)
+        if (typeof payload.importToken === 'string' && payload.importToken) {
+          await db.reservation.update({
+            where: { id: reservationId },
+            data: { importToken: payload.importToken },
+          }).catch(() => null)
+        }
+        try {
+          require('./lib/queue-event').queueEvent('ticket_mirror_cloud',
+            'Cloud kiosk ticket mirrored locally: ' + (payload.displayNumber || reservationId),
+            { agencyId, ticketId: reservationId, ticketNumber: payload.displayNumber || undefined, source: 'kiosk-cloud-relay', status: 'WAITING' })
+        } catch { /* log only */ }
+      } catch (mirrorErr) {
+        console.warn('[LocalAPI] cloud walk-in mirror failed (non-fatal):', mirrorErr && mirrorErr.message)
       }
     })
   } catch (rtErr) {

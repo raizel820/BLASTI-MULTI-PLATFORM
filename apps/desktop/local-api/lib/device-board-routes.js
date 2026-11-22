@@ -354,10 +354,15 @@ function registerDeviceBoardRoutes(app, ctx) {
     // Cloud-sync plumbing (join-queue walk-ins reach the cloud via the
     // canonical outbox — same transactional pattern as /api/agency/queue/walk-in).
     withOutboxTransaction, logDeterministicOutcome, checkQueueIssuanceGates,
+    // 0.6.104 — branch queue write lock: serializes kiosk joins against the
+    // desktop's own walk-ins so two concurrent issuances can never read the
+    // same lastIssuedNumber (ticket number collision).
+    withQueueWriteLock,
   } = ctx
   // Defensive fallbacks: never let a missing helper break the kiosk flow.
   const txRunner = withOutboxTransaction || ((work) => getDb().$transaction(work))
   const logOutcome = logDeterministicOutcome || (() => {})
+  const queueLock = withQueueWriteLock || ((work) => work())
 
   const log = (...args) => { try { (diagLog || console.log)('[device-board]', ...args) } catch { /* ignore */ } }
 
@@ -1238,15 +1243,18 @@ function registerDeviceBoardRoutes(app, ctx) {
       })
       const estimatedWait = estimateWaitMinutes(waitingCount, agency.averageServiceTime, activeCounters)
 
-      // Create the reservation with per-service numbering (cloud parity),
-      // atomically with its canonical outbox row.
-      const reservation = await txRunner(async (tx) => {
-        const lastReservation = await tx.reservation.findFirst({
-          where: { serviceId },
-          orderBy: { queueNumber: 'desc' },
-        })
-        const nextNumber = ((lastReservation && lastReservation.queueNumber) || 0) + 1
-        const displayNumber = `${service.prefix}-${String(nextNumber).padStart(3, '0')}`
+      // Create the reservation with the GLOBAL issuance cursor (0.6.104 —
+      // collision fix): the historic per-service numbering OVERWROTE
+      // queueSettings.lastIssuedNumber with a per-service counter, so a
+      // kiosk ticket for service B could collide with the next desktop
+      // walk-in on service A (both got the same number). The desktop's own
+      // walk-in path (index.js /api/agency/queue/walk-in) uses the GLOBAL
+      // cursor — the kiosk now does exactly the same, atomically inside the
+      // outbox transaction and under the branch queue write lock.
+      const reservation = await queueLock(() => txRunner(async (tx) => {
+        const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
+        const nextNumber = ((qsTx && qsTx.lastIssuedNumber) || 0) + 1
+        const displayNumber = `${service.prefix || 'A'}${String(nextNumber).padStart(3, '0')}`
 
         const created = await tx.reservation.create({
           data: {
@@ -1264,10 +1272,14 @@ function registerDeviceBoardRoutes(app, ctx) {
           },
         })
         // Keep the global issued-number cursor in lockstep (same transaction).
-        if (agency.queueSettings.length > 0) {
+        if (qsTx) {
           await tx.queueSettings.update({
-            where: { id: agency.queueSettings[0].id },
+            where: { id: qsTx.id },
             data: { lastIssuedNumber: nextNumber },
+          })
+        } else {
+          await tx.queueSettings.create({
+            data: { agencyId, lastIssuedNumber: nextNumber, currentServingNumber: 0, isPaused: false },
           })
         }
         // Awaited (Task 2-b fix): the outbox INSERT must join THIS open
@@ -1275,7 +1287,7 @@ function registerDeviceBoardRoutes(app, ctx) {
         // INSERT then hits the closed transaction (Prisma P2028).
         await logOutcome('Reservation', created.id, 'create', created, null, { tx })
         return created
-      })
+      }))
 
       // QR import token so a customer can claim the ticket into their app.
       let importToken = ''

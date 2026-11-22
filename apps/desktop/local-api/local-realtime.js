@@ -595,6 +595,19 @@ function setCloudDeviceAcceptReconciler(fn) {
   _reconcileCloudDeviceAccept = typeof fn === 'function' ? fn : null
 }
 
+// 0.6.104 — CLOUD WALK-IN MIRROR. A kiosk that joined the queue against the
+// CLOUD store (LAN pin failed) emits queue:walk-in there; the relay below
+// delivered the EVENT to the desktop UI instantly, but the RESERVATION ROW
+// itself only landed in the local DB at the next sync pull — the full-screen
+// display fetched nothing new and the ticket appeared seconds late. The
+// mirror callback (registered from index.js, where the Prisma client lives)
+// upserts the reservation row BEFORE the relayed event fans out, so the UI's
+// refetch triggered by this very event finds the data already present.
+let _mirrorCloudWalkIn = null
+function setCloudWalkInMirror(fn) {
+  _mirrorCloudWalkIn = typeof fn === 'function' ? fn : null
+}
+
 /**
  * Relay one event received on the SYNC ENGINE's cloud socket into the local
  * rooms. The cloud already routed the event to the agency room the engine
@@ -621,6 +634,14 @@ function relayCloudRealtime(eventName, args) {
   if (eventName === 'agency-device:connected' && typeof _reconcileCloudDeviceAccept === 'function') {
     try { _reconcileCloudDeviceAccept(event) } catch (reconcileErr) {
       warn('cloud device-accept reconcile failed:', reconcileErr && reconcileErr.message)
+    }
+  }
+
+  // 0.6.104 — CLOUD WALK-IN MIRROR (before the relay: the event handlers the
+  // relay triggers refetch immediately, so the row must exist first).
+  if (eventName === 'queue:walk-in' && typeof _mirrorCloudWalkIn === 'function') {
+    try { _mirrorCloudWalkIn(event) } catch (mirrorErr) {
+      warn('cloud walk-in mirror failed:', mirrorErr && mirrorErr.message)
     }
   }
 
@@ -665,6 +686,7 @@ module.exports = {
   broadcastLocalRealtime,
   setLocalRealtimeRelayContext,
   setCloudDeviceAcceptReconciler,
+  setCloudWalkInMirror,
   relayCloudRealtime,
   getLocalRealtimeStats,
   // 0.6.101 — pre-pairing delivery rooms (join sanitation + tests)

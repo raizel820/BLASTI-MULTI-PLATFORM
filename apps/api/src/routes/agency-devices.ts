@@ -61,8 +61,17 @@ import {
 // 0.6.78 — the printAuth middleware on POST /discovery/print resolves the
 // kiosk device from the X-Device-Token header and hands it to the route
 // handler through this context variable.
+// 0.6.104 — kiosk-assigned default printer: the full kiosk row is needed so
+// the print route can read its printerConfig JSON (`defaultPrinterDeviceId`).
 interface AgencyDevicesEnv {
-  Variables: { printDevice?: { agencyId: string | null } }
+  Variables: {
+    printDevice?: {
+      id: string
+      type: string
+      agencyId: string | null
+      printerConfig: string | null
+    }
+  }
 }
 
 const app = new Hono<AgencyDevicesEnv>()
@@ -4095,8 +4104,9 @@ app.post('/discovery/connect', async (c) => {
 // Raw ESC/POS ticket print — accepts EITHER a staff session (manager "print
 // test page") OR a kiosk deviceToken in the X-Device-Token header, so a
 // kiosk can print its tickets on the agency's LAN printer without any OS
-// driver. The printer target: explicit ip:port, else the agency's saved
-// default printer.
+// driver. The printer target: explicit ip:port, else — for a KIOSK device —
+// the printer assigned on its own row (printerConfig.defaultPrinterDeviceId,
+// 0.6.104), else the agency's saved default printer.
 const printAuth: MiddlewareHandler<AgencyDevicesEnv> = async (c, next) => {
   const deviceToken = c.req.header('x-device-token')
   if (deviceToken) {
@@ -4185,6 +4195,108 @@ app.post('/discovery/print', printAuth, async (c) => {
       } catch { /* fall through to the normal path */ }
     }
 
+    // 0.6.104 — kiosk-assigned default printer (Fault: kiosk must print on the
+    // printer registered/attached to its branch, assignable per-kiosk from the
+    // device manager). When the authenticated print device is a KIOSK and the
+    // request carries NO explicit target (ip/port/printerDeviceId), read the
+    // kiosk row's printerConfig JSON key `defaultPrinterDeviceId` — the
+    // printer AgencyDevice id chosen in the Device Manager:
+    //   • USB-attached printer with a host PC (printerConfig.attachment USB +
+    //     hostIp) → forward the job to http://<hostIp>:<hostPort|3080>
+    //     /api/agency-devices/host/print-job, authenticated with the printer
+    //     row's adopted deviceToken (mirror of the local route's host-forward).
+    //   • Network printer (row ipAddress / printerConfig.ip) → raw ESC/POS
+    //     target, port from printerConfig.port || 9100 (shared code below).
+    //   • Loopback / USB-local printer → 409: the cloud box can never reach
+    //     another PC's USB port; pair the host PC so jobs can be forwarded.
+    // No assignment (or a missing/deleted/unusable printer row) → fall back to
+    // the agency DefaultPrinter logic below; the success response then carries
+    // a `note` so the kiosk UI can surface the degraded path.
+    let printNote: string | undefined
+    const hasExplicitTarget = !!(ip || port || printBody.printerDeviceId)
+    if (!hasExplicitTarget && kioskDevice && kioskDevice.type === 'KIOSK') {
+      const kioskCfg = parseJSON(kioskDevice.printerConfig) as Record<string, unknown>
+      const assignedId = typeof kioskCfg.defaultPrinterDeviceId === 'string' ? kioskCfg.defaultPrinterDeviceId : ''
+      if (assignedId) {
+        let assignedUsed = false
+        try {
+          const printerRow = await db.agencyDevice.findUnique({ where: { id: assignedId } })
+          if (printerRow && printerRow.type === 'PRINTER') {
+            const pcfg = parseJSON(printerRow.printerConfig) as Record<string, unknown>
+            const hostIp = typeof pcfg.hostIp === 'string' ? pcfg.hostIp : ''
+            if (pcfg.attachment === 'USB' && hostIp) {
+              // USB-attached — forward to the branch host PC's local API.
+              const hostPort = Number(pcfg.hostPort) > 0 ? Number(pcfg.hostPort) : 3080
+              const hostToken = printerRow.deviceToken || ''
+              if (!hostToken) {
+                return c.json({ success: false, error: 'HOST_NOT_PAIRED — pair the host PC first so print jobs can be authenticated' }, 409)
+              }
+              const ctl = new AbortController()
+              const timer = setTimeout(() => ctl.abort(), 20_000)
+              try {
+                const fwd = await fetch(`http://${hostIp}:${hostPort}/api/agency-devices/host/print-job`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${hostToken}` },
+                  body: JSON.stringify({
+                    printerName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName)
+                      || (typeof pcfg.osPrinterName === 'string' && pcfg.osPrinterName)
+                      || printerRow.name
+                      || undefined,
+                    cupsName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName) || undefined,
+                    ticket: printBody.ticket || undefined,
+                  }),
+                  signal: ctl.signal,
+                })
+                const fwdData = await fwd.json().catch(() => null) as { success?: boolean; error?: string } | null
+                if (fwd.ok && fwdData && fwdData.success) {
+                  try {
+                    appendDeviceEvent({
+                      event: 'print_job_done',
+                      message: `USB print job forwarded to host ${hostIp}:${hostPort} for ${printerRow.name}`,
+                      deviceId: printerRow.id,
+                      deviceName: printerRow.name,
+                      deviceType: 'PRINTER',
+                      agencyId: printerRow.agencyId,
+                      data: { source: 'usb-forward', kioskDeviceId: kioskDevice.id },
+                    })
+                  } catch { /* log only */ }
+                  return c.json({ success: true, via: 'host-forward', host: `${hostIp}:${hostPort}` })
+                }
+                return c.json({ success: false, error: (fwdData && fwdData.error) || `Host print failed (${fwd.status})`, host: `${hostIp}:${hostPort}` }, 502)
+              } finally {
+                clearTimeout(timer)
+              }
+            }
+            // Raw ESC/POS target for network printers (NOT for USB-local ones:
+            // the row's ipAddress then holds the HOST pc address, and a
+            // loopback target can never be reached from the cloud box).
+            const rawIp = (typeof printerRow.ipAddress === 'string' && printerRow.ipAddress)
+              || (typeof pcfg.ip === 'string' && pcfg.ip)
+              || ''
+            const isUsbLocal = printerRow.connectionType === 'USB'
+              || pcfg.attachment === 'USB'
+              || rawIp === '127.0.0.1'
+              || rawIp === 'localhost'
+              || rawIp === '::1'
+            if (isUsbLocal) {
+              return c.json({
+                success: false,
+                error: 'USB printer is attached to a branch PC — pair the host PC so jobs can be forwarded',
+              }, 409)
+            }
+            if (rawIp) {
+              ip = rawIp
+              port = Number(pcfg.port) > 0 ? Number(pcfg.port) : 9100
+              assignedUsed = true
+            }
+          }
+        } catch { /* treat as a missing assignment below */ }
+        if (!assignedUsed && !ip) {
+          printNote = 'assigned printer missing — used agency default'
+        }
+      }
+    }
+
     // No explicit target → the agency's saved default printer
     if (!ip) {
       let agencyId: string | null = null
@@ -4240,7 +4352,9 @@ app.post('/discovery/print', printAuth, async (c) => {
     if (!result.ok) {
       return c.json({ success: false, error: result.error || 'Printer unreachable', target: `${ip}:${port || 9100}` }, 502)
     }
-    return c.json({ success: true, bytesSent: result.bytesSent, latencyMs: result.latencyMs, target: `${ip}:${port || 9100}` })
+    // 0.6.104 — `note` surfaces the degraded path: the kiosk's assigned
+    // printer was missing/unusable and the agency default was used instead.
+    return c.json({ success: true, bytesSent: result.bytesSent, latencyMs: result.latencyMs, target: `${ip}:${port || 9100}`, ...(printNote ? { note: printNote } : {}) })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
       return c.json(rateLimitErrorResponse(error).data, 429)

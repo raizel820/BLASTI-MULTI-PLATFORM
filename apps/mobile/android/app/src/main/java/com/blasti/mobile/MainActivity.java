@@ -2,6 +2,12 @@ package com.blasti.mobile;
 
 import android.os.Bundle;
 import android.util.Log;
+import android.view.View;
+import android.view.ViewGroup;
+import android.webkit.WebView;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
@@ -44,6 +50,58 @@ public class MainActivity extends BridgeActivity {
         //        showWhenLocked/turnScreenOn manifest attributes were removed
         //        for exactly this reason).
         BlastiNativeStatus.applyLaunchPreferences(this);
+
+        // 5) 0.6.104 — SYSTEM BAR INSETS (user fault: "the app behaves as if
+        //    it is always in full-screen — it covers the system data in the
+        //    top bar (time, battery, date, signals) and the navigation
+        //    buttons at the bottom"). With targetSdk 36 edge-to-edge is
+        //    ENFORCED, so the WebView drew UNDER the status bar and the
+        //    navigation bar. Capacitor 8.5.2 ships no margin adjustment for
+        //    that, so we apply the system-bar + display-cutout insets as
+        //    MARGINS on the WebView ourselves: the app content starts below
+        //    the status bar and ends above the navigation bar — the clock,
+        //    battery, date, signal icons and the back/home buttons stay
+        //    permanently visible. The listener re-fires on rotation and
+        //    foldable posture changes, keeping the margins correct.
+        applySystemBarInsets();
+    }
+
+    /**
+     * 0.6.104 — inset the WebView by the system bars (status + navigation)
+     * and the display cutout. Margins (not padding) are used because the
+     * Android WebView ignores padding for page layout. Best-effort: any
+     * failure only degrades to the previous edge-to-edge behavior.
+     */
+    private void applySystemBarInsets() {
+        try {
+            BridgeActivity activity = this;
+            WebView webView = activity.getBridge() != null ? activity.getBridge().getWebView() : null;
+            if (webView == null) {
+                Log.w(TAG, "applySystemBarInsets: WebView not ready");
+                return;
+            }
+            final View webViewView = webView;
+            ViewCompat.setOnApplyWindowInsetsListener(webViewView, (v, windowInsets) -> {
+                Insets bars = windowInsets.getInsets(
+                        WindowInsetsCompat.Type.systemBars()
+                                | WindowInsetsCompat.Type.displayCutout());
+                ViewGroup.LayoutParams lpRaw = v.getLayoutParams();
+                if (lpRaw instanceof ViewGroup.MarginLayoutParams) {
+                    ViewGroup.MarginLayoutParams lp = (ViewGroup.MarginLayoutParams) lpRaw;
+                    if (lp.leftMargin != bars.left || lp.topMargin != bars.top
+                            || lp.rightMargin != bars.right || lp.bottomMargin != bars.bottom) {
+                        lp.setMargins(bars.left, bars.top, bars.right, bars.bottom);
+                        v.setLayoutParams(lp);
+                    }
+                }
+                // Consume: no descendant needs the raw insets again.
+                return WindowInsetsCompat.CONSUMED;
+            });
+            // Request a dispatch pass now that the listener is attached.
+            ViewCompat.requestApplyInsets(webViewView);
+        } catch (Throwable t) {
+            Log.w(TAG, "applySystemBarInsets failed (non-fatal)", t);
+        }
     }
 
     /**

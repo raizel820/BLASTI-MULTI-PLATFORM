@@ -29,13 +29,16 @@ import {
   Copy, ExternalLink, Loader2, QrCode, Monitor, Unplug, Trash2, RefreshCw,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import type { TranslationKeys } from '@/i18n';
 import {
   type AgencyDevice, type Branch, type DeviceType, type ConnectionType,
   type DeviceStatus, type ScreenLayout, type CommandType, type DisplaySettings,
   DEVICE_TYPE_CONFIG, SCREEN_LAYOUT_CONFIG, getLocalizedLabel, getLocalizedString,
 } from './types';
 
-type TranslateFn = (key: string) => string;
+// 0.6.104 — typed against TranslationKeys (was `(key: string) => string`,
+// which made DeviceManager's `t` prop assignment a tsc error).
+type TranslateFn = (key: TranslationKeys, params?: Record<string, string>) => string;
 
 // ─── Edit / Add device ──────────────────────────────────────────────────────
 
@@ -46,11 +49,13 @@ export interface DeviceFormState {
   autoDiscovery: boolean; screenLayout: ScreenLayout;
   branchId: string; serviceFilter: string;
   status: DeviceStatus; displaySettings: DisplaySettings;
+  /** 0.6.104 — kiosk default printer (AgencyDevice id, '' = agency default). */
+  defaultPrinterDeviceId: string;
 }
 
 export function EditDeviceDialog({
   open, lang, rtl, t, submitting, editing,
-  form, branches, onFormChange, onOpenChange, onSubmit, onPreviewTv,
+  form, branches, printers, onFormChange, onOpenChange, onSubmit, onPreviewTv,
 }: {
   open: boolean;
   lang: string;
@@ -60,6 +65,8 @@ export function EditDeviceDialog({
   editing: AgencyDevice | null;
   form: DeviceFormState;
   branches: Branch[];
+  /** 0.6.104 — agency's registered printers (kiosk default-printer select). */
+  printers: AgencyDevice[];
   onFormChange: (patch: Partial<DeviceFormState>) => void;
   onOpenChange: (open: boolean) => void;
   onSubmit: () => void;
@@ -170,6 +177,34 @@ export function EditDeviceDialog({
             <div className="grid gap-2">
               <Label htmlFor="dev-filter">{t('dmServiceFilter')}</Label>
               <Input id="dev-filter" value={form.serviceFilter} onChange={(e) => onFormChange({ serviceFilter: e.target.value })} placeholder="serviceId1,serviceId2" />
+            </div>
+          )}
+
+          {/* 0.6.104 — kiosk default printer (Fault: the kiosk must print on the
+              printer registered/attached to its branch). Choosing a printer
+              persists it on the KIOSK row's printerConfig JSON
+              (defaultPrinterDeviceId); "Agency default" clears the key so the
+              agency-level DefaultPrinter is used. */}
+          {form.type === 'KIOSK' && (
+            <div className="grid gap-2 rounded-xl border bg-muted/30 p-3">
+              <Label htmlFor="dev-kiosk-printer">{t('dmKioskPrinterDefault')}</Label>
+              <Select
+                value={form.defaultPrinterDeviceId || 'agency-default'}
+                onValueChange={(v) => onFormChange({ defaultPrinterDeviceId: v === 'agency-default' ? '' : v })}
+              >
+                <SelectTrigger id="dev-kiosk-printer"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="agency-default">{t('dmKioskPrinterAgencyDefault')}</SelectItem>
+                  {printers.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {getLocalizedString(p.nameAr || p.name, p.nameFr || p.name, p.name, lang)} · {p.connectionType}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {printers.length === 0 && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">{t('dmKioskPrinterNoRegistered')}</p>
+              )}
             </div>
           )}
         </div>

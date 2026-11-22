@@ -6,7 +6,9 @@
 // the cloud (web) is now served by 127.0.0.1:3080.
 //
 // Registered into the Hono app by local-api/index.js BEFORE the static-UI
-// catch-all. ctx = { authMiddleware, requireAgencyId, broadcast, diagLog }.
+// catch-all. ctx = { authMiddleware, requireAgencyId, broadcast, diagLog,
+//   getDb, cloudFetch, getSessionToken, withQueueWriteLock,
+//   withOutboxTransaction, logDeterministicOutcome, checkQueueIssuanceGates }.
 //
 // Scope:
 //   - Management: list / unpaired / create / get / patch / delete / pair /
@@ -21,8 +23,18 @@
 //     lib/cast-service.js — these do not exist on the cloud API; on desktop
 //     they make real device casting work offline.
 //
-// Device-side (kiosk) endpoints (/public/*, /device/*) are intentionally NOT
-// part of this module — they use deviceToken auth and are a separate concern.
+// Device-side (kiosk) endpoints (/public/*, /device/*) authenticate with a
+// deviceToken instead of a staff session. 0.6.104 — they ARE part of this
+// module now (see the "KIOSK PUBLIC ROUTES" section at the end of
+// registerAgencyDeviceRoutes): a kiosk that pins its API base to this desktop
+// (apps/web/src/lib/kiosk-lan-base.ts) must be served LOCAL-FIRST —
+// reservations created in the local store, queue:walk-in pushed over the
+// local realtime socket, the cloud copy replayed by the outbox.
+// NOTE on precedence: lib/device-board-routes.js (registered EARLIER in
+// index.js for /device/pair + /device/config shadowing reasons) serves some
+// of the same paths in the current build; where they overlap, Hono keeps the
+// FIRST registration. This module's own section keeps it self-contained and
+// carries the stricter issuance discipline (queue write lock, rate limits).
 //
 // All output/comments in English. No new npm dependencies.
 
@@ -795,7 +807,15 @@ async function buildConnectionProfile(ip, preferredPort) {
 // ─── Route registration ──────────────────────────────────────────────────────
 
 module.exports = function registerAgencyDeviceRoutes(app, ctx) {
-  const { authMiddleware, requireAgencyId, broadcast, diagLog, getDb } = ctx
+  const {
+    authMiddleware, requireAgencyId, broadcast, diagLog, getDb,
+    // 0.6.104 — kiosk public routes (local-first): the same queue-issuance
+    // plumbing the staff walk-in route uses in index.js. All optional — the
+    // defensive fallbacks in the route section keep the module working when
+    // an older index.js does not pass them.
+    withQueueWriteLock, withOutboxTransaction, logDeterministicOutcome,
+    checkQueueIssuanceGates,
+  } = ctx
   // 0.6.88 — DEVICE EVENT STREAM: every scan/pair/link/kiosk event below is
   // emitted through lib/device-event.js (local diag trail + cloud _devices
   // stream via the local /api/logs forward pipeline).
@@ -817,6 +837,88 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     try {
       if (typeof broadcast === 'function') broadcast(type, payload)
     } catch { /* realtime must never break a route */ }
+  }
+
+  // ─── 0.6.104 — device-surface helpers (kiosk public routes) ──────────────
+
+  // Device auth WITHOUT a staff session: resolves the Bearer token or the
+  // X-Device-Token header to an AgencyDevice row (same mechanism printAuth
+  // uses — the kiosk sends `Authorization: Bearer <deviceToken>`).
+  const kioskDeviceAuth = async (db2, c) => {
+    const header = c.req.header('authorization') || ''
+    const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
+    const token = bearer || (c.req.header('x-device-token') || '').trim()
+    if (!token) return null
+    try {
+      return await db2.agencyDevice.findUnique({ where: { deviceToken: token } })
+    } catch { return null }
+  }
+
+  // HMAC-signed QR import token — payload/sig format IDENTICAL to the cloud
+  // route (apps/api/src/routes/agency-devices.ts) so a locally-issued ticket
+  // scans against either backend. 30-minute expiry, base64url payload + hex sig.
+  const generateKioskImportToken = (reservationId, agencyId2, customerId) => {
+    const secret = process.env.NEXTAUTH_SECRET || 'blast1-qr-dev-key'
+    const exp = Math.floor(Date.now() / 1000) + 30 * 60
+    const payload = JSON.stringify({ reservationId, agencyId: agencyId2, customerId: customerId || 'Anonymous', exp })
+    const sig = crypto.createHmac('sha256', secret).update(payload).digest('hex')
+    return Buffer.from(payload).toString('base64url') + '.' + sig
+  }
+
+  // Per-IP in-memory rate limiter (minimal local version of the cloud
+  // KIOSK_RATE_LIMIT): max 30 requests per minute per IP, 429 beyond that.
+  // Device-token-authenticated callers skip it (same dual-auth rule as the
+  // cloud kiosk routes).
+  const kioskRateHits = new Map()
+  const KIOSK_RATE_LIMIT_MAX = 30
+  const KIOSK_RATE_WINDOW_MS = 60_000
+  const kioskRateLimitOk = (c) => {
+    const ip = (c.req.header('x-forwarded-for') || '').split(',')[0].trim()
+      || c.req.header('x-real-ip') || 'lan'
+    const now = Date.now()
+    const entry = kioskRateHits.get(ip) || { count: 0, windowStart: now }
+    if (now - entry.windowStart > KIOSK_RATE_WINDOW_MS) {
+      entry.count = 0
+      entry.windowStart = now
+    }
+    entry.count += 1
+    kioskRateHits.set(ip, entry)
+    if (kioskRateHits.size > 500) kioskRateHits.clear()
+    return entry.count <= KIOSK_RATE_LIMIT_MAX
+  }
+
+  // Compact local ETA (no 200-row historical scan — keep the kiosk join fast):
+  // people ahead × average service time, floored at 5 min per person.
+  const kioskSimpleEta = (waiting, avgMinutes) => {
+    if (!waiting || waiting <= 0) return 0
+    const avg = Number(avgMinutes) > 0 ? Math.round(Number(avgMinutes)) : 5
+    return waiting * Math.max(1, avg)
+  }
+
+  // Branch display names for the kiosk join response (the device's own branch
+  // first, then the agency's oldest active branch — cloud parity).
+  const kioskBranchNames = async (db2, deviceRow, agencyId2) => {
+    let branch = null
+    try {
+      if (deviceRow && deviceRow.branchId) {
+        branch = await db2.branch.findUnique({
+          where: { id: deviceRow.branchId },
+          select: { name: true, nameAr: true, nameFr: true },
+        })
+      }
+      if (!branch && agencyId2) {
+        branch = await db2.branch.findFirst({
+          where: { agencyId: agencyId2, isActive: true },
+          select: { name: true, nameAr: true, nameFr: true },
+          orderBy: { createdAt: 'asc' },
+        })
+      }
+    } catch { /* branch tables optional on very old mirrors */ }
+    return {
+      branchName: branch ? branch.name : null,
+      branchNameAr: branch ? branch.nameAr : null,
+      branchNameFr: branch ? branch.nameFr : null,
+    }
   }
 
   // ═══ Discovery (embedded scanner) — registered BEFORE /:id routes ════════
@@ -1179,8 +1281,9 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   // Raw ESC/POS ticket print — accepts EITHER a staff session (manager "print
   // test page") OR a kiosk deviceToken in the X-Device-Token header, so a
   // kiosk can print its tickets on the agency's LAN printer without any OS
-  // driver. The printer target: explicit ip:port, else the agency's saved
-  // default printer.
+  // driver. The printer target: explicit ip:port, else the kiosk's own default
+  // printer (printerConfig.defaultPrinterDeviceId — 0.6.104), else the
+  // agency's saved default printer.
   const printAuth = async (c, next) => {
     const deviceToken = c.req.header('x-device-token')
     if (deviceToken && typeof getDb === 'function') {
@@ -1196,6 +1299,62 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       } catch { /* fall through to staff auth */ }
     }
     return authMiddleware(c, next)
+  }
+
+  // 0.6.104 — KIOSK DEFAULT PRINTER RESOLUTION. The device manager UI (Task
+  // 1-d) writes the kiosk's chosen printer into its printerConfig JSON as
+  // `defaultPrinterDeviceId`. This helper loads that PRINTER AgencyDevice row
+  // and classifies it the same way the print route already supports:
+  //   { mode: 'host-forward', hostIp, hostPort, cupsName, printerRow }
+  //       — USB printer attached to a HOST branch PC (attachment USB + hostIp)
+  //   { mode: 'os-print', cupsName, printerRow }
+  //       — locally-attached on THIS machine (USB without host, loopback ip)
+  //   { mode: 'raw', ip, port, cupsName, printerRow }
+  //       — network printer with a real JetDirect target
+  // Returns null when the kiosk has no usable default (the caller then falls
+  // back to the agency DefaultPrinter, which stays the LAST resort).
+  const resolveKioskDefaultPrinter = async (db2, kioskDeviceRow) => {
+    if (!kioskDeviceRow || kioskDeviceRow.type !== 'KIOSK') return null
+    const cfg = typeof kioskDeviceRow.printerConfig === 'string'
+      ? parseJSON(kioskDeviceRow.printerConfig)
+      : (kioskDeviceRow.printerConfig || {})
+    const wantedId = cfg && typeof cfg.defaultPrinterDeviceId === 'string' ? cfg.defaultPrinterDeviceId : ''
+    if (!wantedId) return null
+    let printerRow = null
+    try {
+      printerRow = await db2.agencyDevice.findUnique({ where: { id: wantedId } })
+    } catch { return null }
+    if (!printerRow || printerRow.type !== 'PRINTER') return null
+    const pCfg = typeof printerRow.printerConfig === 'string'
+      ? parseJSON(printerRow.printerConfig)
+      : (printerRow.printerConfig || {})
+    // 1. USB printer physically attached to a HOST branch PC → forward there.
+    if (pCfg && pCfg.attachment === 'USB' && pCfg.hostIp) {
+      return {
+        printerRow,
+        mode: 'host-forward',
+        hostIp: pCfg.hostIp,
+        hostPort: Number(pCfg.hostPort) > 0 ? Number(pCfg.hostPort) : 3080,
+        cupsName: pCfg.cupsName || pCfg.osPrinterName || printerRow.name || null,
+      }
+    }
+    const rowIp = printerRow.ipAddress || pCfg.ip || null
+    const rowPort = Number(printerRow.port) > 0 ? Number(printerRow.port)
+      : (Number(pCfg.port) > 0 ? Number(pCfg.port) : 9100)
+    // 2. Locally-attached on THIS machine (USB without a host, loopback ip).
+    const isLoopbackRow = rowIp === '127.0.0.1' || rowIp === 'localhost' || rowIp === '::1'
+    if (isLoopbackRow || (printerRow.connectionType === 'USB' && !(pCfg && pCfg.hostIp))) {
+      return {
+        printerRow,
+        mode: 'os-print',
+        cupsName: pCfg.cupsName || pCfg.osPrinterName || printerRow.name || null,
+      }
+    }
+    // 3. Network printer → raw JetDirect target.
+    if (rowIp) {
+      return { printerRow, mode: 'raw', ip: rowIp, port: rowPort, cupsName: pCfg.cupsName || printerRow.name || null }
+    }
+    return null
   }
 
   app.post('/api/agency-devices/discovery/print', printAuth, async (c) => {
@@ -1253,6 +1412,72 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
 
     // No explicit target → the agency's saved default printer
     let defaultPrinterRow = null
+
+    // 0.6.104 — KIOSK DEFAULT PRINTER: when the authenticated caller is a
+    // KIOSK and the body carries no explicit target (no ip, no
+    // printerDeviceId), resolve the printer row pinned in the kiosk's own
+    // printerConfig (`defaultPrinterDeviceId` — Task 1-d convention). This
+    // runs BEFORE the agency DefaultPrinter fallback below, which remains the
+    // last resort. The existing USB host-forward, os-print and raw-TCP paths
+    // are untouched:
+    //   host-forward → handled right here (same contract as the 0.6.100 branch)
+    //   os-print     → pre-fills defaultPrinterRow + loopback ip so the
+    //                  EXISTING isLoopbackTarget path below performs the print
+    //   raw          → pre-fills ip/port for the EXISTING raw TCP path
+    if (!ip && !printerDeviceId && kioskDevice && kioskDevice.type === 'KIOSK') {
+      let kioskDefault = null
+      try {
+        kioskDefault = await resolveKioskDefaultPrinter(db, kioskDevice)
+      } catch (kdErr) {
+        if (diagLog) diagLog('AGENCY-DEVICE print kiosk-default resolve error: ' + (kdErr && kdErr.message))
+      }
+      if (kioskDefault && kioskDefault.mode === 'host-forward') {
+        const hostToken = kioskDefault.printerRow.deviceToken || ''
+        if (!hostToken) {
+          return c.json({ success: false, error: 'HOST_NOT_PAIRED — pair the host PC first so print jobs can be authenticated' }, 409)
+        }
+        const ctl = new AbortController()
+        const timer = setTimeout(() => ctl.abort(), 20_000)
+        try {
+          const fwd = await fetch(`http://${kioskDefault.hostIp}:${kioskDefault.hostPort}/api/agency-devices/host/print-job`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + hostToken },
+            body: JSON.stringify({
+              printerName: kioskDefault.cupsName || undefined,
+              cupsName: kioskDefault.cupsName || undefined,
+              ticket: body.ticket || undefined,
+              escposBase64: body.escposBase64 || undefined,
+            }),
+            signal: ctl.signal,
+          })
+          const fwdData = await fwd.json().catch(() => null)
+          if (fwd.ok && fwdData && fwdData.success) {
+            try { deviceEvents.deviceEvent('print_job_done', `Kiosk default printer forwarded to host ${kioskDefault.hostIp}:${kioskDefault.hostPort} for ${kioskDefault.printerRow.name}`, { deviceType: 'PRINTER', status: 'OK', sessionId: kioskDefault.printerRow.id, source: 'kiosk-default-host-forward' }) } catch { /* log only */ }
+            return c.json({ success: true, via: 'host-forward', host: `${kioskDefault.hostIp}:${kioskDefault.hostPort}` })
+          }
+          return c.json({ success: false, error: (fwdData && fwdData.error) || `Host print failed (${fwd.status})`, host: `${kioskDefault.hostIp}:${kioskDefault.hostPort}` }, 502)
+        } finally {
+          clearTimeout(timer)
+        }
+      } else if (kioskDefault && kioskDefault.mode === 'os-print') {
+        // Loopback / locally-attached → let the EXISTING 0.6.103 os-print path
+        // below handle it (test pages included) by pointing it at the row.
+        defaultPrinterRow = {
+          id: kioskDefault.printerRow.id,
+          name: kioskDefault.printerRow.name,
+          cupsName: kioskDefault.cupsName,
+          connectionType: 'USB',
+          ip: '127.0.0.1',
+          port: 0,
+          source: 'kiosk-default',
+        }
+        ip = '127.0.0.1'
+      } else if (kioskDefault && kioskDefault.mode === 'raw') {
+        ip = kioskDefault.ip
+        port = port || kioskDefault.port || 9100
+      }
+    }
+
     if (!ip) {
       const agencyId = kioskDevice ? kioskDevice.agencyId : requireAgencyId(c)
       if (!agencyId) return c.json({ success: false, error: 'ip required (no default printer context)' }, 400)
@@ -2684,5 +2909,872 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     lanAuthority.onBlastiBeacon((rec) => { autoConnectFromBeacon(rec).catch(() => {}) })
   } catch { /* hook registration is best-effort */ }
 
-  if (diagLog) diagLog('AGENCY-DEVICES routes registered (management + embedded discovery + cast + live beacons)')
+  // ═══ 0.6.104 — KIOSK PUBLIC ROUTES (local-first) ═════════════════════════
+  //
+  // Device-side (kiosk/tablet) endpoints the kiosk webapp calls when it pins
+  // its API base to THIS desktop (apps/web/src/lib/kiosk-lan-base.ts →
+  // http://<desktop-ip>:3080). Served here, a kiosk walk-in is created in the
+  // LOCAL store, the local realtime socket (local-realtime.js) pushes
+  // queue:walk-in INSTANTLY to the desktop full-screen display, and the
+  // canonical outbox (logDeterministicOutcome inside withOutboxTransaction)
+  // replays the reservation to the cloud asynchronously — no more "every
+  // kiosk request 404s locally, hits the cloud, and the desktop only sees it
+  // after the 5s polling loop".
+  //
+  // PRECEDENCE NOTE: lib/device-board-routes.js (registered EARLIER in
+  // index.js — it must precede this module so its static /device/pair and
+  // /device/config routes are not shadowed by the dynamic /:id routes here)
+  // serves some of these same paths in the current build, and Hono keeps the
+  // FIRST registration. This in-module section keeps the management module
+  // self-contained (builds without the board module) and carries the stricter
+  // issuance discipline: withQueueWriteLock numbering, per-IP rate limiting
+  // and COMPLETED command acks.
+  //
+  // 0.6.104-a POST /public/join-queue        — local walk-in ticket + outbox
+  // 0.6.104-b GET  /public/agency?code=      — resolve agency by code
+  // 0.6.104-c GET  /public/queue-status      — waiting/serving snapshot
+  // 0.6.104-d POST /public/discover-register — orphan kiosk row + token
+  // 0.6.104-e GET  /public/device-status     — pairing requests + agency ctx
+  // 0.6.104-f POST /device/heartbeat         — presence + pending commands
+  // 0.6.104-g POST /device/command/:id/ack   — COMPLETED (+ FORCE_DISCONNECT)
+  // 0.6.104-h POST /device/accept-pairing    — bind + token adoption
+  // 0.6.104-i POST /device/reject-pairing    — FAILED
+  // 0.6.104-j POST /public/kiosk-auth        — pairing-code login
+  //
+  // All routes resolve the DB via getDb() (no staff session is involved) and
+  // every optional subsystem (outbox, gates, realtime, logs) fails soft.
+
+  const kioskLocalDb = () => {
+    const db2 = typeof getDb === 'function' ? getDb() : null
+    return db2
+  }
+
+  // ─── 0.6.104-a — POST /public/join-queue (local-first walk-in) ────────────
+  // Contract mirrors the cloud route (apps/api/src/routes/agency-devices.ts):
+  // body { agencyId, serviceId, customerName? } →
+  //   { success, reservation: { ticketNumber, importToken, ... }, deviceId? }
+  // with the SAME error strings the kiosk handles: 'Device not authorized for
+  // this agency' (403), 'Queue is currently closed' / 'Queue is currently
+  // paused' / 'Queue is full' (400), 'Service not found or inactive' (404).
+  app.post('/api/agency-devices/public/join-queue', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device && !kioskRateLimitOk(c)) {
+        return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      const agencyId = typeof body.agencyId === 'string' ? body.agencyId : ''
+      const serviceId = typeof body.serviceId === 'string' ? body.serviceId : ''
+      const customerName = typeof body.customerName === 'string' ? body.customerName.slice(0, 100) : ''
+      if (!agencyId) return c.json({ success: false, error: 'Agency ID is required' }, 400)
+      if (!serviceId) return c.json({ success: false, error: 'Service ID is required' }, 400)
+
+      // C1 — cross-agency guard + orphan auto-bind (cloud 0.6.95 parity): a
+      // freshly discovered kiosk has agencyId null and joins immediately; a
+      // device bound to ANOTHER agency may never join this one.
+      if (device && !device.agencyId) {
+        try {
+          await db.agencyDevice.update({ where: { id: device.id }, data: { agencyId } })
+          device.agencyId = agencyId
+        } catch (bindErr) {
+          if (diagLog) diagLog('AGENCY-DEVICE kiosk join auto-bind failed: ' + (bindErr && bindErr.message))
+        }
+      } else if (device && agencyId !== device.agencyId) {
+        return c.json({ success: false, error: 'Device not authorized for this agency' }, 403)
+      }
+
+      // Open / paused / full gates — the SAME helper the staff walk-in route
+      // uses in index.js (exact cloud error strings). It returns null for
+      // "may proceed" and "unknown agency" — the explicit lookups below yield
+      // the 404s. Defensive .catch keeps a gate failure non-fatal.
+      const gate = typeof checkQueueIssuanceGates === 'function'
+        ? await Promise.resolve(checkQueueIssuanceGates(agencyId)).catch(() => null)
+        : null
+      if (gate) return c.json(gate.body, gate.status)
+
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId, isActive: true },
+        include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
+      })
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+      if (!agency.isQueueOpen) return c.json({ success: false, error: 'Queue is currently closed' }, 400)
+      if (agency.queueSettings.length > 0 && agency.queueSettings[0].isPaused) {
+        return c.json({ success: false, error: 'Queue is currently paused' }, 400)
+      }
+      const service = await db.service.findUnique({ where: { id: serviceId } })
+      if (!service || service.agencyId !== agencyId || !service.isActive) {
+        return c.json({ success: false, error: 'Service not found or inactive' }, 404)
+      }
+      const activeCount = await db.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
+      if (activeCount >= agency.maxActiveReservations) {
+        return c.json({ success: false, error: 'Queue is full' }, 400)
+      }
+
+      const waitingCount = await db.reservation.count({ where: { agencyId, serviceId, status: 'WAITING' } })
+      const estimatedWait = kioskSimpleEta(waitingCount, agency.averageServiceTime)
+      const walkInName = (customerName && customerName.trim()) || 'Anonymous'
+      const joinedAt = new Date()
+
+      // Issuance inside the branch queue write lock + outbox transaction —
+      // the LOCAL walk-in pattern (index.js POST /api/agency/queue/walk-in):
+      // the number cursor is read INSIDE the tx, displayNumber follows the
+      // desktop's own walk-ins (`<prefix>00N` — NOT the cloud's per-service
+      // numbering), and logDeterministicOutcome joins the SAME tx so the
+      // canonical outbox row commits atomically with the ticket (the sync
+      // engine then pushes the reservation to the cloud in the background).
+      const queueLock = typeof withQueueWriteLock === 'function' ? withQueueWriteLock : (fn) => fn()
+      const outboxTx = typeof withOutboxTransaction === 'function'
+        ? withOutboxTransaction
+        : (fn) => db.$transaction(fn)
+      const created = await queueLock(() => outboxTx(async (tx) => {
+        // Cheap re-check inside the lock (cloud parity — 'FULL' throw).
+        const cnt = await tx.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
+        if (cnt >= agency.maxActiveReservations) throw new Error('FULL')
+        const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
+        const nextNumber = ((qsTx && qsTx.lastIssuedNumber) || 0) + 1
+        const displayNumber = `${service.prefix || 'A'}${String(nextNumber).padStart(3, '0')}`
+        const row = await tx.reservation.create({
+          data: {
+            id: crypto.randomUUID(),
+            agencyId,
+            serviceId,
+            userId: null,
+            queueNumber: nextNumber,
+            displayNumber,
+            status: 'WAITING',
+            estimatedWait,
+            isWalkIn: true,
+            walkInCustomerName: walkInName,
+            joinedAt,
+          },
+        })
+        // Keep the global issued-number cursor in lockstep (same transaction).
+        if (qsTx) {
+          await tx.queueSettings.update({ where: { id: qsTx.id }, data: { lastIssuedNumber: nextNumber } })
+        } else {
+          await tx.queueSettings.create({ data: { agencyId, lastIssuedNumber: nextNumber, currentServingNumber: 0, isPaused: false } })
+        }
+        // Outbox row joins THIS transaction — the sync engine replays the
+        // create to the cloud (deterministic record-level push).
+        if (typeof logDeterministicOutcome === 'function') {
+          await logDeterministicOutcome('Reservation', row.id, 'create', row, null, { tx })
+        }
+        return row
+      }))
+
+      // QR import token (cloud-compatible HMAC) persisted on the reservation.
+      let importToken = ''
+      try {
+        importToken = generateKioskImportToken(created.id, agencyId, walkInName)
+        await db.reservation.update({ where: { id: created.id }, data: { importToken } })
+      } catch (tokenErr) {
+        if (diagLog) diagLog('AGENCY-DEVICE kiosk join import token failed: ' + (tokenErr && tokenErr.message))
+      }
+
+      const branchNames = await kioskBranchNames(db, device, agencyId)
+      const position = waitingCount + 1
+      const reservationPayload = {
+        ...created,
+        ticketNumber: created.displayNumber,
+        importToken,
+      }
+
+      // INSTANT desktop update: broadcast = emitEvent +
+      // broadcastLocalRealtime (index.js deps pass). The local realtime
+      // router sends queue:* by payload.agencyId into the `agency:<id>` room
+      // the desktop full-screen display joins (use-realtime → 127.0.0.1:3080)
+      // — sub-second, no polling loop involved. The payload shape mirrors the
+      // staff walk-in emit ({ agencyId, reservation }).
+      broadcastSafe('queue:walk-in', {
+        agencyId,
+        reservation: reservationPayload,
+        deviceId: device ? device.id : undefined,
+      })
+
+      // QUEUE event trail (the cloud logs its own copy when the outbox lands).
+      try {
+        require('./lib/queue-event').queueEvent(
+          'ticket_created_kiosk',
+          'Kiosk ticket ' + created.displayNumber + ' issued (local)',
+          {
+            agencyId,
+            ticketId: created.id,
+            ticketNumber: created.displayNumber,
+            serviceId,
+            serviceName: service.name,
+            deviceId: device ? device.id : undefined,
+            source: 'kiosk',
+            status: 'WAITING',
+          },
+        )
+      } catch { /* logging must never break the join */ }
+
+      return c.json({
+        success: true,
+        reservation: {
+          ...reservationPayload,
+          agencyName: agency.name,
+          agencyNameAr: agency.nameAr,
+          agencyNameFr: agency.nameFr,
+          branchName: branchNames.branchName,
+          branchNameAr: branchNames.branchNameAr,
+          branchNameFr: branchNames.branchNameFr,
+          serviceName: service.name,
+          serviceNameAr: service.nameAr,
+          serviceNameFr: service.nameFr,
+          method: 'WALK_IN',
+          customerName: walkInName,
+          estimatedWaitMinutes: estimatedWait,
+          position,
+          joinedAt: created.joinedAt,
+        },
+        deviceId: device ? device.id : null,
+      }, 201)
+    } catch (err) {
+      if (err && err.message === 'FULL') {
+        return c.json({ success: false, error: 'Queue is full' }, 400)
+      }
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk join-queue error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to join queue' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-b — GET /public/agency?code= (resolve agency by code) ────────
+  // Mirrors the cloud response: { success, agency{...}, services[...],
+  // queueStats{...}, deviceId }. customCode is included (the kiosk uses it to
+  // persist the agency code after pairing), plus currentlyServingList with
+  // counter names for LAN displays. Accepts Authorization: Bearer
+  // <deviceToken> and echoes back deviceId (cloud parity).
+  app.get('/api/agency-devices/public/agency', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device && !kioskRateLimitOk(c)) {
+        return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
+      }
+      const code = c.req.query('code')
+      if (!code) return c.json({ success: false, error: 'Agency code is required' }, 400)
+      // Cloud semantics: lookup by customCode (the branch code), id fallback
+      // for local convenience — same order as /public/register.
+      let agency = null
+      try {
+        agency = await db.agency.findUnique({ where: { customCode: code, isActive: true } })
+      } catch { /* fall through to id lookup */ }
+      if (!agency) {
+        try { agency = await db.agency.findUnique({ where: { id: code, isActive: true } }) } catch { /* invalid id shape */ }
+      }
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+
+      const qs = await db.queueSettings.findFirst({
+        where: { agencyId: agency.id },
+        select: { isPaused: true },
+        orderBy: { updatedAt: 'desc' },
+      }).catch(() => null)
+      const services = await db.service.findMany({
+        where: { agencyId: agency.id, isActive: true },
+        select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true, durationMinutes: true },
+        orderBy: { createdAt: 'asc' },
+      }).catch(() => [])
+      const waiting = await db.reservation.count({ where: { agencyId: agency.id, status: 'WAITING' } }).catch(() => 0)
+      const servingRows = await db.reservation.findMany({
+        where: { agencyId: agency.id, status: { in: ['CALLED', 'SERVING'] } },
+        select: { id: true, displayNumber: true, calledAt: true, counter: { select: { name: true } } },
+        orderBy: { calledAt: 'desc' },
+        take: 5,
+      }).catch(() => [])
+      const currentlyServingList = servingRows.map((r) => ({
+        ticketNumber: r.displayNumber,
+        counterName: r.counter ? r.counter.name : null,
+      }))
+      return c.json({
+        success: true,
+        agency: {
+          id: agency.id, name: agency.name, nameAr: agency.nameAr, nameFr: agency.nameFr,
+          category: agency.category, customCode: agency.customCode, logoUrl: agency.logoUrl,
+          workingHoursStart: agency.workingHoursStart, workingHoursEnd: agency.workingHoursEnd,
+          isQueueOpen: agency.isQueueOpen,
+          isPaused: qs ? qs.isPaused : false,
+        },
+        // P2-10 parity: per-service duration wins over the agency average.
+        services: services.map((s) => ({
+          id: s.id, name: s.name, nameAr: s.nameAr, nameFr: s.nameFr, prefix: s.prefix,
+          avgTime: (s.durationMinutes != null && s.durationMinutes > 0) ? s.durationMinutes : agency.averageServiceTime,
+        })),
+        queueStats: {
+          waiting,
+          currentServing: currentlyServingList.length > 0 ? currentlyServingList[0].ticketNumber : null,
+          estimatedWait: kioskSimpleEta(waiting, agency.averageServiceTime),
+          currentlyServingList,
+        },
+        deviceId: device ? device.id : null,
+      })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk public/agency error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to resolve agency' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-c — GET /public/queue-status?agencyId= (kiosk status poll) ───
+  // { success, totalWaiting, currentlyServing: [{ticketNumber, counterName}],
+  //   totalEstimatedWait } — the exact shape refreshKioskStatus in
+  // device-kiosk.tsx reads. totalEstimatedWait is the sum of the waiting
+  // rows' ETA snapshots (0 when none carry one).
+  app.get('/api/agency-devices/public/queue-status', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device && !kioskRateLimitOk(c)) {
+        return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
+      }
+      const agencyId = c.req.query('agencyId')
+      if (!agencyId) return c.json({ success: false, error: 'Agency ID is required' }, 400)
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId, isActive: true },
+        select: { id: true },
+      })
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+      const waitingRows = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        select: { estimatedWait: true },
+        orderBy: { joinedAt: 'asc' },
+        take: 500,
+      }).catch(() => [])
+      const servingRows = await db.reservation.findMany({
+        where: { agencyId, status: { in: ['CALLED', 'SERVING'] } },
+        select: { id: true, displayNumber: true, calledAt: true, counter: { select: { name: true } } },
+        orderBy: { calledAt: 'desc' },
+        take: 20,
+      }).catch(() => [])
+      return c.json({
+        success: true,
+        totalWaiting: waitingRows.length,
+        currentlyServing: servingRows.map((r) => ({
+          ticketNumber: r.displayNumber,
+          counterName: r.counter ? r.counter.name : null,
+        })),
+        totalEstimatedWait: waitingRows.reduce((sum, r) => sum + (Number(r.estimatedWait) || 0), 0),
+      })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk queue-status error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to load queue status' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-d — POST /public/discover-register (orphan kiosk row) ────────
+  // "Wait for Discovery": creates an ORPHAN AgencyDevice (agencyId null,
+  // status PAIRING) with a locally-minted deviceToken — the same token scheme
+  // every local pairing flow uses (crypto.randomBytes(32).toString('hex')).
+  // Re-registration with the same fingerprint re-issues the SAME row's token.
+  app.post('/api/agency-devices/public/discover-register', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      if (!kioskRateLimitOk(c)) {
+        return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      // PHONE included (0.6.102): a phone in kiosk standby may wait for
+      // approval like any other shell. Default stays KIOSK.
+      const deviceType = ['KIOSK', 'TV', 'DISPLAY', 'PRINTER', 'APP', 'PHONE'].includes(body.deviceType)
+        ? body.deviceType
+        : 'KIOSK'
+      const connectionType = ['LAN', 'WIFI', 'CABLE', 'MANUAL'].includes(body.connectionType)
+        ? body.connectionType
+        : 'LAN'
+      const deviceName = (typeof body.deviceName === 'string' && body.deviceName.trim())
+        ? body.deviceName.trim().slice(0, 100)
+        : 'BLASTI Kiosk'
+      const deviceFingerprint = (typeof body.deviceFingerprint === 'string' && body.deviceFingerprint)
+        ? body.deviceFingerprint.slice(0, 200)
+        : null
+      const appVersion = (typeof body.appVersion === 'string' && body.appVersion)
+        ? body.appVersion.slice(0, 50)
+        : null
+
+      let existing = null
+      if (deviceFingerprint) {
+        try {
+          existing = await db.agencyDevice.findFirst({ where: { deviceFingerprint, status: 'PAIRING' } })
+        } catch { /* non-fatal */ }
+      }
+      if (existing) {
+        let token = existing.deviceToken
+        if (!token) {
+          token = crypto.randomBytes(32).toString('hex')
+          await db.agencyDevice.update({
+            where: { id: existing.id },
+            data: {
+              deviceToken: token,
+              connectionType,
+              name: deviceName,
+              type: deviceType,
+              ...(appVersion ? { appVersion } : {}),
+              lastHeartbeatAt: new Date(),
+            },
+          })
+        }
+        return c.json({
+          success: true,
+          deviceToken: token,
+          device: { id: existing.id, name: existing.name, type: existing.type, status: existing.status },
+        })
+      }
+
+      const deviceToken = crypto.randomBytes(32).toString('hex')
+      const row = await db.agencyDevice.create({
+        data: {
+          agencyId: null,
+          name: deviceName,
+          type: deviceType,
+          status: 'PAIRING',
+          connectionType,
+          deviceToken,
+          deviceFingerprint,
+          ...(appVersion ? { appVersion } : {}),
+          screenLayout: deviceType === 'KIOSK' ? 'SERVICE_SELECTOR' : 'QUEUE_BOARD',
+          offlineCapable: deviceType === 'KIOSK',
+          autoDiscovery: true,
+          lastHeartbeatAt: new Date(),
+          statusChangedAt: new Date(),
+        },
+      })
+      try {
+        deviceEvents.deviceEvent('device_registered', `Kiosk registered for discovery: ${row.name}`, { deviceId: row.id, deviceName: row.name, deviceType: row.type, status: 'PAIRING' })
+      } catch { /* log only */ }
+      return c.json({
+        success: true,
+        deviceToken,
+        device: { id: row.id, name: row.name, type: row.type, status: row.status },
+      }, 201)
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk discover-register error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to register device' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-e — GET /public/device-status (pairing poll + agency ctx) ────
+  // deviceToken auth; touches lastHeartbeatAt (the poll IS a heartbeat for
+  // pairing-stage devices); returns the PENDING PAIRING_REQUEST commands in
+  // the cloud pairingRequests shape (payload.deviceToken rides along — the
+  // manager-minted token the device adopts on accept), and — once paired —
+  // the agency (incl. customCode, which the kiosk uses to auto-connect via
+  // /public/agency?code=) + the active services.
+  app.get('/api/agency-devices/public/device-status', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      try {
+        await db.agencyDevice.update({ where: { id: device.id }, data: { lastHeartbeatAt: new Date() } })
+      } catch { /* presence touch is best-effort */ }
+
+      let pairingRequests = []
+      try {
+        const pending = await db.deviceCommand.findMany({
+          where: { deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING' },
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+        })
+        pairingRequests = pending.map((cmd) => {
+          const payload = parseJSON(cmd.payload)
+          return {
+            id: cmd.id,
+            agencyId: payload.agencyId,
+            agencyName: payload.agencyName,
+            agencyNameAr: payload.agencyNameAr,
+            agencyNameFr: payload.agencyNameFr,
+            branchId: payload.branchId,
+            branchName: payload.branchName,
+            sentByName: payload.sentByName,
+            // 0.6.100 — the manager-issued token the device adopts on accept
+            // (single canonical token across the manager store and this one).
+            deviceToken: payload.deviceToken || undefined,
+            sentAt: cmd.createdAt,
+          }
+        })
+      } catch { /* DeviceCommand absent on very old mirrors */ }
+
+      let agencyData = null
+      if (device.agencyId && device.status !== 'DISABLED') {
+        const agency = await db.agency.findUnique({
+          where: { id: device.agencyId, isActive: true },
+          select: {
+            id: true, name: true, nameAr: true, nameFr: true, customCode: true,
+            category: true, logoUrl: true, isQueueOpen: true,
+            workingHoursStart: true, workingHoursEnd: true,
+          },
+        })
+        if (agency) {
+          const services = await db.service.findMany({
+            where: { agencyId: device.agencyId, isActive: true },
+            select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
+          }).catch(() => [])
+          const qs = await db.queueSettings.findFirst({
+            where: { agencyId: device.agencyId },
+            select: { isPaused: true },
+            orderBy: { updatedAt: 'desc' },
+          }).catch(() => null)
+          agencyData = { ...agency, isPaused: qs ? qs.isPaused : false, services }
+        }
+      }
+
+      return c.json({
+        success: true,
+        status: device.status,
+        agency: agencyData,
+        pairingRequests,
+      })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk device-status error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to load device status' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-f — POST /device/heartbeat (presence + pending commands) ─────
+  // Updates lastHeartbeatAt + status ONLINE (paired devices only — orphan
+  // PAIRING rows must stay PAIRING so the manager's strip keeps them),
+  // returns PENDING DeviceCommands as [{ id, type, payload }] (TTL filtered;
+  // expired rows flipped to EXPIRED). The kiosk understands FORCE_DISCONNECT,
+  // REBOOT, REFRESH and CONFIG_UPDATE.
+  app.post('/api/agency-devices/device/heartbeat', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      const body = await c.req.json().catch(() => ({}))
+      const updateData = { lastHeartbeatAt: new Date() }
+      if (typeof body.ipAddress === 'string' && body.ipAddress) updateData.ipAddress = body.ipAddress.slice(0, 50)
+      if (typeof body.appVersion === 'string' && body.appVersion) updateData.appVersion = body.appVersion.slice(0, 50)
+      // Cap the uptime delta like the cloud (max 24h between beats).
+      if (device.lastHeartbeatAt) {
+        const deltaSec = Math.floor((Date.now() - new Date(device.lastHeartbeatAt).getTime()) / 1000)
+        if (deltaSec > 0 && deltaSec < 86400) updateData.totalUptimeSec = (device.totalUptimeSec || 0) + deltaSec
+      }
+      if (device.agencyId && device.status !== 'ONLINE' && device.status !== 'DISABLED') {
+        updateData.status = 'ONLINE'
+        updateData.statusChangedAt = new Date()
+        updateData.connectedAt = device.connectedAt || new Date()
+      }
+      const updated = await db.agencyDevice.update({
+        where: { id: device.id },
+        data: updateData,
+        select: { id: true, status: true, lastHeartbeatAt: true },
+      })
+      let pendingCommands = []
+      try {
+        const rows = await db.deviceCommand.findMany({
+          where: { deviceId: device.id, status: 'PENDING' },
+          orderBy: { createdAt: 'asc' },
+        })
+        const nowMs = Date.now()
+        pendingCommands = rows
+          .filter((cmd) => nowMs - new Date(cmd.createdAt).getTime() < (cmd.ttl || 300) * 1000)
+          .map((cmd) => ({ id: cmd.id, type: cmd.type, payload: cmd.payload }))
+        const expiredIds = rows
+          .filter((cmd) => nowMs - new Date(cmd.createdAt).getTime() >= (cmd.ttl || 300) * 1000)
+          .map((cmd) => cmd.id)
+        if (expiredIds.length > 0) {
+          await db.deviceCommand.updateMany({ where: { id: { in: expiredIds } }, data: { status: 'EXPIRED' } })
+        }
+      } catch { /* DeviceCommand absent on very old mirrors */ }
+      return c.json({ success: true, pendingCommands, device: updated })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk heartbeat error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Heartbeat failed' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-g — POST /device/command/:id/ack (command acknowledgement) ───
+  // The kiosk acks every command it received ({ status: 'DELIVERED' }).
+  // Locally the ack means COMPLETED (deliveredAt kept for the audit) so the
+  // command is never re-delivered; FORCE_DISCONNECT additionally detaches the
+  // local row (idempotent — the manager's /:id/unpair usually did it already)
+  // and tells the manager UI instantly.
+  app.post('/api/agency-devices/device/command/:id/ack', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      const commandId = c.req.param('id')
+      await c.req.json().catch(() => ({}))
+      const cmd = await db.deviceCommand.findUnique({ where: { id: commandId } }).catch(() => null)
+      if (!cmd || cmd.deviceId !== device.id) {
+        return c.json({ success: false, error: 'Command not found' }, 404)
+      }
+      const now = new Date()
+      const updated = await db.deviceCommand.update({
+        where: { id: commandId },
+        data: { status: 'COMPLETED', deliveredAt: cmd.deliveredAt || now, completedAt: now },
+      }).catch(() => null)
+      if (cmd.type === 'FORCE_DISCONNECT' && device.agencyId) {
+        try {
+          const detachedAgencyId = device.agencyId
+          await db.agencyDevice.update({
+            where: { id: device.id },
+            data: {
+              agencyId: null,
+              branchId: null,
+              status: 'OFFLINE',
+              deviceToken: null,
+              pairingCode: null,
+              statusChangedAt: now,
+              connectedAt: null,
+            },
+          })
+          broadcastSafe('agency-device:disconnected', {
+            agencyId: detachedAgencyId,
+            deviceId: device.id,
+            deviceName: device.name,
+            reason: 'force-disconnect-ack',
+          })
+          deviceEvents.deviceEvent('disconnect', `Device detached after FORCE_DISCONNECT ack: ${device.name || device.id}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId: detachedAgencyId, status: 'OFFLINE' })
+        } catch { /* non-fatal */ }
+      }
+      return c.json({ success: true, command: updated })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk command ack error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Command ack failed' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-h — POST /device/accept-pairing (kiosk approves pairing) ─────
+  // deviceToken auth; locates the PAIRING_REQUEST command, verifies it
+  // targets THIS device and is still PENDING, binds the device to the agency
+  // (payload branchId wins over the body, the existing branchId is kept),
+  // ADOPTS the manager-minted deviceToken from the command payload when one
+  // is carried (shared-token model), marks the command COMPLETED (the rest
+  // FAILED), broadcasts agency-device:connected so the manager list updates
+  // INSTANTLY, and answers with the cloud shape: { success, agency{...},
+  // services[...] }.
+  app.post('/api/agency-devices/device/accept-pairing', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      const body = await c.req.json().catch(() => ({}))
+      const commandId = typeof body.commandId === 'string' ? body.commandId : ''
+      let command = null
+      let commandPayload = {}
+      if (commandId) {
+        command = await db.deviceCommand.findUnique({ where: { id: commandId } }).catch(() => null)
+        if (!command || command.deviceId !== device.id || command.type !== 'PAIRING_REQUEST') {
+          return c.json({ success: false, error: 'Pairing request not found' }, 404)
+        }
+        if (command.status !== 'PENDING') {
+          return c.json({ success: false, error: 'Pairing request already processed' }, 409)
+        }
+        commandPayload = parseJSON(command.payload)
+      }
+      const agencyId = (commandPayload && commandPayload.agencyId)
+        || (typeof body.agencyId === 'string' ? body.agencyId : '')
+      if (!agencyId) return c.json({ success: false, error: 'agencyId is required' }, 400)
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId, isActive: true },
+        select: {
+          id: true, name: true, nameAr: true, nameFr: true, customCode: true,
+          category: true, logoUrl: true, isQueueOpen: true,
+          workingHoursStart: true, workingHoursEnd: true,
+        },
+      })
+      if (!agency) return c.json({ success: false, error: 'Agency not found or inactive' }, 404)
+      const now = new Date()
+      const updated = await db.agencyDevice.update({
+        where: { id: device.id },
+        data: {
+          agencyId,
+          branchId: (commandPayload && commandPayload.branchId)
+            || (typeof body.branchId === 'string' && body.branchId)
+            || device.branchId
+            || null,
+          status: 'ONLINE',
+          statusChangedAt: now,
+          connectedAt: device.connectedAt || now,
+          lastHeartbeatAt: now,
+        },
+        select: DEVICE_SELECT_FIELDS,
+      })
+      // Token adoption (0.6.100 shared-token model): when the command payload
+      // carries the manager-minted token, make the LOCAL row hold exactly it
+      // so later cross-store commands (shared printing etc.) authorize.
+      const canonicalToken = commandPayload && typeof commandPayload.deviceToken === 'string'
+        ? commandPayload.deviceToken
+        : ''
+      if (canonicalToken && canonicalToken !== device.deviceToken) {
+        try {
+          await db.agencyDevice.update({ where: { id: device.id }, data: { deviceToken: canonicalToken } })
+        } catch { /* token uniqueness race — keep the local token */ }
+      }
+      // Settle the commands: the accepted one COMPLETED, every other pending
+      // PAIRING_REQUEST FAILED (only one agency can win).
+      if (commandId) {
+        try {
+          await db.deviceCommand.updateMany({
+            where: { id: commandId, deviceId: device.id, type: 'PAIRING_REQUEST' },
+            data: { status: 'COMPLETED', completedAt: now },
+          })
+        } catch { /* non-fatal */ }
+      }
+      try {
+        await db.deviceCommand.updateMany({
+          where: { deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING', id: { not: commandId || '___none___' } },
+          data: { status: 'FAILED', error: 'Rejected — another pairing was accepted' },
+        })
+      } catch { /* non-fatal */ }
+      const services = await db.service.findMany({
+        where: { agencyId, isActive: true },
+        select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
+      }).catch(() => [])
+      const qs = await db.queueSettings.findFirst({
+        where: { agencyId },
+        select: { isPaused: true },
+        orderBy: { updatedAt: 'desc' },
+      }).catch(() => null)
+      broadcastSafe('agency-device:connected', {
+        agencyId,
+        deviceId: device.id,
+        deviceName: device.name,
+        deviceType: device.type,
+      })
+      try {
+        deviceEvents.deviceEvent('pairing_accepted', `Kiosk accepted pairing with agency ${agency.name}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId, status: 'ONLINE' })
+      } catch { /* log only */ }
+      return c.json({
+        success: true,
+        device: updated,
+        agency: { ...agency, isPaused: qs ? qs.isPaused : false },
+        services,
+      })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk accept-pairing error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to accept pairing' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-i — POST /device/reject-pairing (kiosk declines pairing) ─────
+  app.post('/api/agency-devices/device/reject-pairing', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      const body = await c.req.json().catch(() => ({}))
+      if (!body.commandId) return c.json({ success: false, error: 'commandId is required' }, 400)
+      const result = await db.deviceCommand.updateMany({
+        where: { id: body.commandId, deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING' },
+        data: { status: 'FAILED', error: 'Rejected by device' },
+      }).catch(() => ({ count: 0 }))
+      if (!result || result.count === 0) {
+        return c.json({ success: false, error: 'Pairing request not found or already processed' }, 404)
+      }
+      try {
+        deviceEvents.deviceEvent('pairing_rejected', `Device rejected pairing request ${body.commandId}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type })
+      } catch { /* log only */ }
+      return c.json({ success: true })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk reject-pairing error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to reject pairing' }, 500)
+    }
+  })
+
+  // ─── 0.6.104-j — POST /public/kiosk-auth (pairing-code login) ─────────────
+  // body { pairingCode, deviceToken? }: resolves the AgencyDevice by its
+  // pairingCode (the code the manager issued via /:id/kiosk-credentials —
+  // that route keeps the row's agencyId, so a valid code implies a bound
+  // agency). A presented token must match (brute-force cost); with no token
+  // presented a fresh one is minted (refresh). Responds with the cloud
+  // shape: { success, agency{..., services}, services, deviceToken, device }.
+  app.post('/api/agency-devices/public/kiosk-auth', async (c) => {
+    const db = kioskLocalDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      if (!kioskRateLimitOk(c)) {
+        return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      const pairingCode = typeof body.pairingCode === 'string' ? body.pairingCode.trim().toUpperCase() : ''
+      if (!pairingCode) return c.json({ success: false, error: 'Pairing code is required' }, 400)
+      const foundDevice = await db.agencyDevice.findUnique({ where: { pairingCode } }).catch(() => null)
+      if (!foundDevice) {
+        return c.json({ success: false, error: 'Invalid pairing code' }, 404)
+      }
+      if (foundDevice.status === 'DISABLED') {
+        return c.json({ success: false, error: 'Device is disabled' }, 403)
+      }
+      if (!foundDevice.agencyId) {
+        return c.json({ success: false, error: 'Device is not paired with an agency' }, 409)
+      }
+      const agency = await db.agency.findUnique({
+        where: { id: foundDevice.agencyId, isActive: true },
+        select: {
+          id: true, name: true, nameAr: true, nameFr: true, customCode: true,
+          category: true, logoUrl: true, isQueueOpen: true,
+          workingHoursStart: true, workingHoursEnd: true,
+        },
+      })
+      if (!agency) return c.json({ success: false, error: 'Agency is not active' }, 403)
+      // Token: a presented token must match the row (cloud parity); with no
+      // token presented, mint a fresh one so the kiosk keeps THIS store.
+      let deviceToken = foundDevice.deviceToken
+      const presented = typeof body.deviceToken === 'string' && body.deviceToken ? body.deviceToken : ''
+      if (presented && deviceToken && presented !== deviceToken) {
+        return c.json({ success: false, error: 'Invalid device token. Contact your agency admin.' }, 401)
+      }
+      const now = new Date()
+      const updateData = {
+        status: 'ONLINE',
+        statusChangedAt: now,
+        lastHeartbeatAt: now,
+        connectedAt: foundDevice.connectedAt || now,
+      }
+      if (!presented || !deviceToken) {
+        deviceToken = crypto.randomBytes(32).toString('hex')
+        updateData.deviceToken = deviceToken
+      }
+      await db.agencyDevice.update({ where: { id: foundDevice.id }, data: updateData })
+      const services = await db.service.findMany({
+        where: { agencyId: foundDevice.agencyId, isActive: true },
+        select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
+      }).catch(() => [])
+      const qs = await db.queueSettings.findFirst({
+        where: { agencyId: foundDevice.agencyId },
+        select: { isPaused: true },
+        orderBy: { updatedAt: 'desc' },
+      }).catch(() => null)
+      broadcastSafe('agency-device:connected', {
+        agencyId: foundDevice.agencyId,
+        deviceId: foundDevice.id,
+        deviceName: foundDevice.name,
+        deviceType: foundDevice.type,
+      })
+      try {
+        deviceEvents.deviceEvent('kiosk_auth_success', `Kiosk authenticated with pairing code (${foundDevice.name})`, { deviceId: foundDevice.id, deviceName: foundDevice.name, deviceType: foundDevice.type, agencyId: foundDevice.agencyId, status: 'ONLINE' })
+      } catch { /* log only */ }
+      return c.json({
+        success: true,
+        deviceToken,
+        device: {
+          id: foundDevice.id,
+          name: foundDevice.name,
+          type: foundDevice.type,
+          status: 'ONLINE',
+          screenLayout: foundDevice.screenLayout,
+          branchId: foundDevice.branchId,
+        },
+        agency: { ...agency, isPaused: qs ? qs.isPaused : false, services },
+      })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE kiosk-auth error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Kiosk authentication failed' }, 500)
+    }
+  })
+
+  if (diagLog) diagLog('AGENCY-DEVICES routes registered (management + embedded discovery + cast + live beacons + kiosk public routes)')
 }

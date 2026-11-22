@@ -1766,6 +1766,10 @@ const ar = {
   kioskModeEnabled: 'وضع الكشك مفعّل',
   kioskModeDesc: 'السماح للعملاء بأخذ تذاكر من شاشة اللمس العامة',
 
+  // 0.6.104 — kiosk ticket action row (receipt choice + auto-return flow)
+  kioskPrintReceipt: 'طباعة الوصل',
+  kioskNextCustomer: 'تم — الزبون التالي',
+
   // ─── Kiosk Login ──────
   kioskLoginTitle: 'تسجيل دخول جهاز الكشك',
   kioskLoginDesc: 'أدخل رمز الربط ورمز الجهاز الذي قدمه مدير الوكالة',
@@ -2962,6 +2966,16 @@ const ar = {
   dmCastStart: "بدء البث",
   dmCastStop: "إيقاف البث",
   // ── نهاية كتلة TASK 5-b ────────────────────────────────────────────────
+
+  // ── 0.6.104 — الطابعة الافتراضية لكل كيوسك ( Fault: يجب أن يطبع الكيوسك على
+  //    الطابعة المسجلة/الموصولة بفرعه، وتُعيَّن لكل كيوسك من مدير الأجهزة ).
+  //    المفاتيح مسبوقة بـ dmKioskPrinter* لتفادي التعارض مع المهام الموازية. ──
+  dmKioskPrinterDefault: "الطابعة الافتراضية",
+  dmKioskPrinterAgencyDefault: "افتراضية الوكالة",
+  dmKioskPrinterNoRegistered: "لا توجد طابعات مسجلة",
+  dmKioskPrinterTag: "الطابعة",
+  dmKioskPrinterSaved: "تم حفظ الطابعة الافتراضية لهذا الكيوسك",
+  dmKioskPrinterSaveFailed: "فشل حفظ الطابعة الافتراضية",
 
   // --- Status translations ---
   statusPending: 'قيد الانتظار',

@@ -2,7 +2,7 @@
 
 import { motion } from 'framer-motion';
 import { Users, Ticket, Clock, XCircle, Pause, WifiOff } from 'lucide-react';
-import type { AgencyInfo, ServiceInfo, QueueStats } from './kiosk-types';
+import type { AgencyInfo, ServiceInfo, QueueStats, KioskViewportSize } from './kiosk-types';
 import { getLocalizedName } from './kiosk-types';
 import { getProxiedUrl } from '@/lib/utils';
 
@@ -15,6 +15,8 @@ interface KioskServiceSelectorProps {
   rtl: boolean;
   lang: 'ar' | 'fr' | 'en';
   error: string | null;
+  /** 0.6.104 — viewport classification from device-kiosk (multi-layout flow). */
+  size: KioskViewportSize;
   t: (key: string) => string;
   pageVariants: {
     enter: { opacity: number; x: number };
@@ -35,12 +37,25 @@ export function KioskServiceSelector({
   rtl,
   lang,
   error,
+  size,
   t,
   pageVariants,
   onSelectService,
   onBack,
   onNext,
 }: KioskServiceSelectorProps) {
+  // 0.6.104 — multi-layout: xs (very small phones) compacts paddings/text so
+  // the whole selector + NEXT button fit without scrolling. The card is a
+  // bounded flex column: the service list flexes and scrolls INSIDE it while
+  // the action row stays pinned (shrink-0) at the bottom.
+  const isXs = size === 'xs';
+  const cardPad = isXs ? 'p-3' : 'p-4 sm:p-5';
+  const svcRowPad = isXs ? 'min-h-[48px] p-2.5' : 'min-h-[60px] p-3';
+  const svcNameCls = isXs ? 'text-sm' : 'text-base';
+  const nextBtnCls = `w-full rounded-2xl font-bold shadow-lg flex items-center justify-center gap-2 transition-all ${
+    isXs ? 'min-h-[48px] text-base mt-2' : 'min-h-[52px] text-lg mt-3'
+  }`;
+
   return (
     <motion.div
       key="services"
@@ -49,11 +64,11 @@ export function KioskServiceSelector({
       animate="center"
       exit="exit"
       transition={{ duration: 0.3, ease: 'easeInOut' }}
-      className="w-full max-w-lg"
+      className="w-full max-w-lg h-full max-h-full flex flex-col justify-center min-h-0"
     >
-      <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl p-4 sm:p-5">
+      <div className={`bg-white dark:bg-gray-900 rounded-3xl shadow-2xl ${cardPad} flex flex-col min-h-0 max-h-full`}>
         {/* Agency header with logo */}
-        <div className="flex items-center gap-3 mb-3">
+        <div className={`flex items-center gap-3 ${isXs ? 'mb-2' : 'mb-3'} shrink-0`}>
           <button
             onClick={onBack}
             className="min-h-[40px] min-w-[40px] rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center hover:bg-gray-200 transition-colors flex-shrink-0"
@@ -77,7 +92,7 @@ export function KioskServiceSelector({
 
         {/* Queue status badges */}
         {queueStats && !isOfflineMode && (
-          <div className="flex gap-2 mb-3">
+          <div className={`flex gap-2 ${isXs ? 'mb-2' : 'mb-3'} shrink-0`}>
             <div className="flex-1 bg-emerald-50 rounded-lg p-2 text-center">
               <Users className="h-4 w-4 text-emerald-600 mx-auto mb-0.5" />
               <p className="text-base font-bold text-emerald-700 leading-tight">{queueStats.waiting}</p>
@@ -98,27 +113,29 @@ export function KioskServiceSelector({
 
         {/* Queue status warnings */}
         {!agency.isQueueOpen && (
-          <div className="mb-2 p-2.5 rounded-xl bg-red-50 border border-red-200 flex items-center gap-2">
+          <div className={`${isXs ? 'mb-1.5' : 'mb-2'} p-2.5 rounded-xl bg-red-50 border border-red-200 flex items-center gap-2 shrink-0`}>
             <XCircle className="h-5 w-5 text-red-500 flex-shrink-0" />
             <p className="text-red-700 font-semibold text-sm">{t('queueClosedKiosk')}</p>
           </div>
         )}
         {agency.isPaused && agency.isQueueOpen && (
-          <div className="mb-2 p-2.5 rounded-xl bg-amber-50 border border-amber-200 flex items-center gap-2">
+          <div className={`${isXs ? 'mb-1.5' : 'mb-2'} p-2.5 rounded-xl bg-amber-50 border border-amber-200 flex items-center gap-2 shrink-0`}>
             <Pause className="h-5 w-5 text-amber-500 flex-shrink-0" />
             <p className="text-amber-700 font-semibold text-sm">{t('queuePausedKiosk')}</p>
           </div>
         )}
 
         {/* Service selection */}
-        <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+        <h3 className={`text-sm font-semibold text-gray-800 dark:text-gray-200 ${isXs ? 'mb-1' : 'mb-2'} shrink-0`}>
           {t('selectServiceKiosk')}
         </h3>
 
         {services.length === 0 ? (
-          <p className="text-gray-400 text-center py-6">{t('kioskNoServices')}</p>
+          <p className="text-gray-400 text-center py-6 shrink-0">{t('kioskNoServices')}</p>
         ) : (
-          <div className="space-y-2 max-h-[32vh] overflow-y-auto pe-1">
+          // 0.6.104 — the list is the ONLY flexible part: it scrolls internally
+          // when the viewport is short, so the NEXT button never leaves the screen.
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pe-1">
             {services.map((service) => {
               const isSelected = selectedService === service.id;
               return (
@@ -126,7 +143,7 @@ export function KioskServiceSelector({
                   key={service.id}
                   whileTap={{ scale: 0.98 }}
                   onClick={() => onSelectService(service.id)}
-                  className={`w-full min-h-[60px] rounded-xl p-3 text-start transition-all border-2 flex items-center justify-between ${
+                  className={`w-full ${svcRowPad} rounded-xl text-start transition-all border-2 flex items-center justify-between ${
                     isSelected
                       ? 'border-emerald-500 bg-emerald-50 shadow-lg shadow-emerald-100'
                       : 'border-gray-100 bg-white hover:border-emerald-200 hover:shadow-md'
@@ -137,10 +154,10 @@ export function KioskServiceSelector({
                       {service.prefix}
                     </span>
                     <div>
-                      <p className="text-base font-semibold text-gray-900 dark:text-gray-100">
+                      <p className={`${svcNameCls} font-semibold text-gray-900 dark:text-gray-100`}>
                         {getLocalizedName(service, lang)}
                       </p>
-                      <p className="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-1">
+                      <p className={`text-gray-500 dark:text-gray-400 flex items-center gap-1 ${isXs ? 'text-[10px]' : 'text-xs'}`}>
                         <Clock className="h-3 w-3" />
                         ~{service.avgTime} {t('minutesKiosk')}
                       </p>
@@ -167,19 +184,19 @@ export function KioskServiceSelector({
           <motion.div
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
-            className="mt-3 p-2.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm font-medium"
+            className={`${isXs ? 'mt-2' : 'mt-3'} p-2.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm font-medium shrink-0`}
           >
             {error}
           </motion.div>
         )}
 
-        {/* Next button */}
+        {/* Next button — pinned at the bottom of the card (shrink-0) */}
         <motion.button
           whileHover={{ scale: selectedService ? 1.02 : 1 }}
           whileTap={{ scale: selectedService ? 0.98 : 1 }}
           onClick={onNext}
           disabled={!selectedService || (!isOfflineMode && (!agency.isQueueOpen || agency.isPaused))}
-          className={`w-full min-h-[52px] rounded-2xl text-lg font-bold shadow-lg mt-3 flex items-center justify-center gap-2 transition-all ${
+          className={`${nextBtnCls} shrink-0 ${
             !selectedService || (!isOfflineMode && (!agency.isQueueOpen || agency.isPaused))
               ? 'bg-gray-200 text-gray-400 cursor-not-allowed shadow-none'
               : isOfflineMode

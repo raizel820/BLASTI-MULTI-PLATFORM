@@ -2,13 +2,17 @@
  * Counter CONTROL (live operator claim) — Feature C.
  *
  * Model: exactly ONE agency account controls a counter at a time.
- *  - Claim   (POST /counters/:id/occupy)          — atomic; stale claims (no
- *    heartbeat within CONTROL_TTL_MS) are automatically takeable.
+ *  - Claim   (POST /counters/:id/occupy)          — atomic; claims whose
+ *    holder has been silent for the CONTROL_CRASH_TTL_MS crash window (r25)
+ *    are takeable.
  *  - Release (POST /counters/:id/release)         — controller themself, or a
  *    force-release by the agency owner / branch MANAGER / SUPER_ADMIN.
  *  - Heartbeat (POST /counters/:id/heartbeat)     — controller pings every
- *    CONTROL_HEARTBEAT_INTERVAL_MS; the sweeper frees counters whose
- *    heartbeat went stale (logout / app close / crash).
+ *    CONTROL_HEARTBEAT_INTERVAL_MS. r25 (user ruling): heartbeats are
+ *    LIVENESS TRACKING ONLY and never free control by themselves. Control is
+ *    lost ONLY via explicit release (app close/logout), an owner/manager
+ *    force transfer, or an accepted handover request; heartbeat staleness
+ *    feeds solely the HOLDER_GONE decision (CONTROL_CRASH_TTL_MS).
  *  - Request  (POST /counters/:id/request-control) — when another account
  *    controls the counter the claimant files a CounterControlRequest; the
  *    controller APPROVES/REJECTS it (owner / branch MANAGER bypass approval
@@ -22,8 +26,28 @@ import { recordSyncChangeNow } from './sync-helpers'
 
 /** How often a controlling client must heartbeat (ms). */
 export const CONTROL_HEARTBEAT_INTERVAL_MS = 60_000
-/** Controls without a heartbeat for longer than this are freed by the sweeper. */
+/**
+ * r25 (user ruling) — KEPT only for backward compatibility (existing imports);
+ * nothing in the control lifecycle frees with it anymore. Heartbeats are
+ * LIVENESS TRACKING ONLY — they never free control by themselves. Control is
+ * lost ONLY via explicit release (app close/logout), an owner/manager force
+ * transfer, or an accepted handover request.
+ */
 export const CONTROL_TTL_MS = 3 * 60_000
+/**
+ * r25 — crash window: CONTROL_CRASH_TTL_MS of heartbeat silence is treated as
+ * "the holder's client is really gone" (crashed / closed without a release).
+ * Per the user's strict rule, control is lost ONLY on explicit release /
+ * owner transfer / accepted handover, so this window never frees anything by
+ * itself either. It is used exclusively to decide whether a crashed or
+ * closed-without-release holder is really gone, for:
+ *   (i)  the stale-claim takeover path in claimCounterControl(), and
+ *   (ii) HOLDER_GONE auto-approval of pending handover requests in
+ *        sweepExpiredCounterRequests().
+ * 15 minutes covers Android backgrounded WebViews whose JS timers freeze for
+ * many minutes while the app is still open.
+ */
+export const CONTROL_CRASH_TTL_MS = 15 * 60_000
 
 /**
  * Field set written when a counter loses control. `staffId`/`occupiedAt` are
@@ -94,9 +118,14 @@ export function parseCounterServiceIds(raw: string | null | undefined): string[]
   }
 }
 
-/** Stale cutoff for takeover eligibility. */
-function staleCutoff(): Date {
-  return new Date(Date.now() - CONTROL_TTL_MS)
+/**
+ * r25 — crash cutoff for takeover eligibility: a holder silent for longer
+ * than CONTROL_CRASH_TTL_MS is presumed really gone (crash / closed app
+ * without release). An open-but-backgrounded holder (throttled timers) stays
+ * inside this window and can never be taken over.
+ */
+function crashCutoff(): Date {
+  return new Date(Date.now() - CONTROL_CRASH_TTL_MS)
 }
 
 /** Who currently controls the counter (for 409 bodies + UI display). */
@@ -167,9 +196,12 @@ export async function claimCounterControl(params: {
   const now = new Date()
   const mine = counter.controlledByUserId === userId
   const free = !counter.controlledByUserId
+  // r25 — takeover eligibility now uses the 15-minute CONTROL_CRASH_TTL_MS
+  // crash window, not the old 3-minute heartbeat TTL: an actively-open but
+  // backgrounded holder (throttled timers) must not be taken over.
   const stale =
     !!counter.controlledByUserId &&
-    (!counter.controlHeartbeatAt || counter.controlHeartbeatAt < staleCutoff())
+    (!counter.controlHeartbeatAt || counter.controlHeartbeatAt < crashCutoff())
 
   // Controlled by someone else whose membership ended → treat as free.
   let invalidController = false
@@ -190,7 +222,7 @@ export async function claimCounterControl(params: {
   const claimed = await db.counter.updateMany({
     where: {
       id: counter.id,
-      OR: [{ controlledByUserId: null }, { controlledByUserId: userId }, { controlHeartbeatAt: { lt: staleCutoff() } }],
+      OR: [{ controlledByUserId: null }, { controlledByUserId: userId }, { controlHeartbeatAt: { lt: crashCutoff() } }],
     },
     data: {
       controlledByUserId: userId,
@@ -308,6 +340,14 @@ export async function enforceCounterControlGate(
     select: { id: true },
   })
   if (!controlled) return { ok: false, status: 403, error: 'COUNTER_CONTROL_REQUIRED' }
+  // 0.6.104 — best-effort LIVENESS TOUCH: any authenticated queue operation
+  // from the controlling account refreshes its controlHeartbeatAt, so an
+  // actively working user can never look stale (and never drift into the
+  // CONTROL_CRASH_TTL_MS crash window) even when the client heartbeat timer
+  // is throttled. Failure is ignored — this must not alter the gate result.
+  await db.counter
+    .updateMany({ where: { id: controlled.id, controlledByUserId: user.id }, data: { controlHeartbeatAt: new Date() } })
+    .catch(() => {})
   if (counterId && counterId !== controlled.id) {
     return { ok: false, status: 403, error: 'COUNTER_CONTROL_REQUIRED' }
   }
@@ -448,9 +488,15 @@ export async function releaseAllUserControl(userId: string): Promise<ReleasedCou
 }
 
 /**
- * Sweeper pass — free counters whose control heartbeat went stale (client
- * crash / closed app without a release). Returns the freed counters WITH the
- * previous controller so the worker can emit counter:lost + counter:released.
+ * r25 (user ruling): the TTL auto-free is REMOVED. An open app must never
+ * lose control. Control is released only by explicit release (app close /
+ * logout), owner/manager transfer, or an accepted handover request.
+ * Heartbeat staleness now only feeds the HOLDER_GONE decision in
+ * sweepExpiredCounterRequests() via CONTROL_CRASH_TTL_MS.
+ *
+ * Kept exported as a NO-OP (always returns []) because the worker still
+ * imports it; the sweep pass simply has nothing left to free. SweptCounter
+ * stays exported for any existing consumers.
  */
 export type SweptCounter = {
   counterId: string
@@ -461,40 +507,7 @@ export type SweptCounter = {
 }
 
 export async function sweepStaleCounterControl(): Promise<SweptCounter[]> {
-  const stale = await db.counter.findMany({
-    where: {
-      controlledByUserId: { not: null },
-      OR: [
-        { controlHeartbeatAt: { lt: staleCutoff() } },
-        { controlHeartbeatAt: null, controlClaimedAt: { lt: staleCutoff() } },
-      ],
-    },
-    select: {
-      id: true,
-      name: true,
-      number: true,
-      controlledByUserId: true,
-      branch: { select: { agencyId: true } },
-    },
-  })
-  const swept: SweptCounter[] = []
-  for (const counter of stale) {
-    await db.counter.updateMany({ where: { id: counter.id }, data: { ...CONTROL_FREE_DATA } })
-    await recordSyncChangeNow({
-      agencyId: counter.branch.agencyId,
-      model: 'Counter',
-      recordId: counter.id,
-      operation: 'update',
-    })
-    swept.push({
-      counterId: counter.id,
-      agencyId: counter.branch.agencyId,
-      counterName: counter.name,
-      counterNumber: counter.number,
-      previousUserId: counter.controlledByUserId,
-    })
-  }
-  return swept
+  return []
 }
 
 export type ExpiredRequestOutcome =
@@ -511,6 +524,11 @@ export type ExpiredRequestOutcome =
  * there is no holder at all. A live holder (fresh heartbeat) keeps control;
  * its request expires with reason HOLDER_ACTIVE and the requester is told
  * the holder is still active (they can retry, or an owner can force-assign).
+ *
+ * r25: the holder-liveness gate now compares against the 15-minute
+ * CONTROL_CRASH_TTL_MS crash cutoff (crashCutoff()) instead of the old
+ * 3-minute heartbeat TTL, so backgrounded WebViews with frozen JS timers
+ * are not misread as gone.
  */
 export async function sweepExpiredCounterRequests(): Promise<ExpiredRequestOutcome[]> {
   const pending = await db.counterControlRequest.findMany({
@@ -531,14 +549,16 @@ export async function sweepExpiredCounterRequests(): Promise<ExpiredRequestOutco
     })
     if (claimedRow.count === 0) continue
 
-    // r24 — HOLDER LIVENESS GATE. The holder is "active" while its control
-    // heartbeat is fresh (app open — heartbeats flow every 60s, TTL 3min).
-    // A just-claimed counter with no heartbeat yet counts as alive too.
+    // r24/r25 — HOLDER LIVENESS GATE. The holder is "active" while its control
+    // heartbeat is fresh against the 15-minute CONTROL_CRASH_TTL_MS crash
+    // cutoff (app open — heartbeats flow every 60s; open-but-backgrounded
+    // holders stay inside the crash window). A just-claimed counter with no
+    // heartbeat yet counts as alive too.
     const counter = await db.counter.findUnique({
       where: { id: req.counter.id },
       select: { controlledByUserId: true, controlHeartbeatAt: true, controlClaimedAt: true },
     })
-    const cutoff = staleCutoff()
+    const cutoff = crashCutoff()
     const holderAlive =
       !!counter?.controlledByUserId &&
       (counter.controlHeartbeatAt

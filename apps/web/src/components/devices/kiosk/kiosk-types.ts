@@ -2,7 +2,15 @@ import type { Language } from '@/i18n';
 
 // ─── Shared Types ───────────────────────────────────────────────
 
-export type KioskStep = 'method-select' | 'code' | 'credentials' | 'services' | 'name' | 'ticket' | 'qr-scan' | 'discovery' | 'pairing-approval';
+// 0.6.104 — the optional customer-name step was removed from the kiosk flow
+// (user request: reserve directly from services). The member is gone from the
+// union; kiosks now join the queue anonymously (server treats empty name as
+// 'Anonymous').
+export type KioskStep = 'method-select' | 'code' | 'credentials' | 'services' | 'ticket' | 'qr-scan' | 'discovery' | 'pairing-approval';
+
+// 0.6.104 — kiosk viewport classification used by the multi-layout responsive
+// flow (very small phones → large tablets). Computed in device-kiosk.tsx.
+export type KioskViewportSize = 'xs' | 'sm' | 'md' | 'lg';
 
 export interface PairingRequest {
   id: string;
@@ -89,7 +97,7 @@ export interface TicketInfo {
 
 // ─── Step configuration ─────────────────────────────────────────
 
-export const STEP_ORDER: KioskStep[] = ['code', 'services', 'name', 'ticket'];
+export const STEP_ORDER: KioskStep[] = ['code', 'services', 'ticket'];
 
 // ─── Constants ──────────────────────────────────────────────────
 

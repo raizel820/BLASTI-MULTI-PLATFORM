@@ -27,9 +27,7 @@ import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import {
   Search,
-  Users,
   Loader2,
-  Ticket,
   ScanLine,
   Globe,
   XCircle,
@@ -52,7 +50,7 @@ import {
   DiscoveryStartButton,
   type DiscoveryStatus,
 } from './kiosk/kiosk-discovery-login';
-import type { PairingRequest } from './kiosk/kiosk-types';
+import type { PairingRequest, KioskViewportSize } from './kiosk/kiosk-types';
 import { KioskOfflineBanner } from './kiosk/kiosk-offline-banner';
 import { KioskServiceSelector } from './kiosk/kiosk-service-selector';
 import { KioskTicketDisplay } from './kiosk/kiosk-ticket-display';
@@ -107,6 +105,40 @@ function getStableKioskFingerprint(): string {
   return getStableDeviceFingerprint();
 }
 
+// ─── 0.6.104 — Kiosk viewport classification (multi-layout support) ────
+// Classifies the viewport so EVERY kiosk screen — from a ~320x560 phone to a
+// large tablet — renders a layout where ALL buttons and information stay on
+// screen (content is never pushed below the fold, no scrolling required).
+//   xs : width < 360 OR height < 640   (very small phones)
+//   sm : width < 480 OR height < 780   (phones / short landscape screens)
+//   md : width < 768                   (small tablets)
+//   lg : everything else               (large tablets / desktop kiosks)
+function classifyKioskViewport(width: number, height: number): KioskViewportSize {
+  if (width < 360 || height < 640) return 'xs';
+  if (width < 480 || height < 780) return 'sm';
+  if (width < 768) return 'md';
+  return 'lg';
+}
+
+function useKioskViewportSize(): KioskViewportSize {
+  // SSR-safe default ('lg'); corrected before interaction via the effect below.
+  const [size, setSize] = useState<KioskViewportSize>('lg');
+  const measure = useCallback(() => {
+    setSize(classifyKioskViewport(window.innerWidth, window.innerHeight));
+  }, []);
+  useEffect(() => {
+    measure();
+    // Resize/orientation events are rare on kiosks — no debounce needed.
+    window.addEventListener('resize', measure);
+    window.addEventListener('orientationchange', measure);
+    return () => {
+      window.removeEventListener('resize', measure);
+      window.removeEventListener('orientationchange', measure);
+    };
+  }, [measure]);
+  return size;
+}
+
 export function DeviceKiosk() {
   const { t, lang, setLang } = useLanguage();
   const rtl = isRTL(lang);
@@ -126,7 +158,9 @@ export function DeviceKiosk() {
   const [services, setServices] = useState<ServiceInfo[]>([]);
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [selectedService, setSelectedService] = useState<string | null>(null);
-  const [customerName, setCustomerName] = useState('');
+  // 0.6.104 — the optional customer-name step was REMOVED (user request:
+  // reserve directly from services). customerName is intentionally gone: every
+  // join is anonymous (server stores 'Anonymous' when the name is absent).
   const [ticket, setTicket] = useState<TicketInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -179,6 +213,10 @@ export function DeviceKiosk() {
 
   // Inactivity timer
   const [inactivitySeconds, setInactivitySeconds] = useState(0);
+  // 0.6.104 — auto-return timer after the receipt choice (fault 4: once the
+  // operator has decided about printing, the kiosk must go back to the
+  // services page for the next customer). Cleared on reset and unmount.
+  const printResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Digital clock
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -266,13 +304,16 @@ export function DeviceKiosk() {
   // Kiosk's own IP (detected via WebRTC)
   const [kioskIp, setKioskIp] = useState<string | null>(null);
 
-  // Step indicator labels (only shown for queue steps, not login)
+  // Step indicator labels (only shown for queue steps, not login).
+  // 0.6.104 — the 'name' step is gone (services → join directly).
   const stepLabels: Record<string, string> = {
     code: t('kioskStepCode'),
     services: t('kioskStepService'),
-    name: t('kioskStepName'),
     ticket: t('kioskStepTicket'),
   };
+
+  // 0.6.104 — viewport classification drives the multi-layout responsive flow.
+  const viewportSize = useKioskViewportSize();
 
   const languages: { code: 'ar' | 'fr' | 'en'; label: string }[] = [
     { code: 'ar', label: 'عربي' },
@@ -424,7 +465,6 @@ export function DeviceKiosk() {
             setServices([]);
             setQueueStats(null);
             setSelectedService(null);
-            setCustomerName('');
             setTicket(null);
             setStep('method-select');
             setIsDeviceRegistered(false);
@@ -624,6 +664,8 @@ export function DeviceKiosk() {
     return () => {
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
       if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+      // 0.6.104 — clear the pending post-print auto-return.
+      if (printResetTimerRef.current) clearTimeout(printResetTimerRef.current);
     };
   }, []);
 
@@ -638,7 +680,6 @@ export function DeviceKiosk() {
   useEffect(() => {
     const announcing =
       step !== 'services' &&
-      step !== 'name' &&
       step !== 'ticket' &&
       discoveryStatus !== 'discovered' &&
       discoveryStatus !== 'connecting';
@@ -717,7 +758,6 @@ export function DeviceKiosk() {
     setStep('services');
     setQueueStats(null);
     setSelectedService(null);
-    setCustomerName('');
     setTicket(null);
     setTicketQrUrl(null);
     setShowQrDetail(false);
@@ -727,6 +767,8 @@ export function DeviceKiosk() {
     setRetryCount(0);
     setShowContactAdmin(false);
     if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
+    // 0.6.104 — a pending post-print auto-return is satisfied by any reset.
+    if (printResetTimerRef.current) { clearTimeout(printResetTimerRef.current); printResetTimerRef.current = null; }
   }, []);
 
   useEffect(() => {
@@ -862,7 +904,9 @@ export function DeviceKiosk() {
       const res = await apiFetch('/api/agency-devices/public/join-queue', {
         method: 'POST',
         headers: joinHeaders,
-        body: JSON.stringify({ agencyId: agency.id, serviceId: selectedService, customerName: customerName.trim() || undefined }),
+        // 0.6.104 — name step removed: kiosk joins are anonymous (the server
+        // already stores 'Anonymous' when customerName is absent).
+        body: JSON.stringify({ agencyId: agency.id, serviceId: selectedService }),
       });
       const data = await res.json();
       if (!data.success) {
@@ -871,7 +915,7 @@ export function DeviceKiosk() {
         // Re-register against the CURRENT base and retry once instead of
         // showing the kiosk a permissions failure (the field-log CRITICAL).
         if (res.status === 403 && /not authorized/i.test(String(data.error || ''))) {
-          const healed = await reregisterAndRetryJoin(agency.id, selectedService, customerName.trim() || undefined);
+          const healed = await reregisterAndRetryJoin(agency.id, selectedService, undefined);
           if (healed.ok && healed.data) {
             const rd = healed.data;
             try {
@@ -937,14 +981,31 @@ export function DeviceKiosk() {
   };
 
   // ─── Print Ticket ──────────────────────────────────────────
+  // 0.6.104 — after the receipt choice the kiosk AUTO-RETURNS to the services
+  // page for the next customer (1.8s after a SUCCESSFUL print so the success
+  // toast is readable). On print FAILURE the error banner stays visible and
+  // the operator taps "Done — next customer" manually — the kiosk is never
+  // trapped on a failed print.
+  const schedulePostPrintReset = useCallback(() => {
+    if (printResetTimerRef.current) clearTimeout(printResetTimerRef.current);
+    // 0.6.104 — auto-return to services for the next customer after the receipt choice.
+    printResetTimerRef.current = setTimeout(() => { handleReset(); }, 1800);
+  }, [handleReset]);
+
   const handlePrint = async () => {
     if (!ticket) return;
     if (typeof window !== 'undefined' && (window as any).electronAPI?.printSilent) {
       try {
         const result = await (window as any).electronAPI.printSilent();
-        if (!result?.success) { toast.error(t('printerError')); setPrintError(result?.message || t('printerErrorMessage')); }
-      } catch (err) { toast.error(t('printerError')); setPrintError('Failed to communicate with printer'); }
-      return;
+        if (!result?.success) {
+          // Failure — keep the error visible; NO auto-return.
+          toast.error(t('printerError'));
+          setPrintError(result?.message || t('printerErrorMessage'));
+          return;
+        }
+        schedulePostPrintReset();
+        return;
+      } catch { toast.error(t('printerError')); setPrintError('Failed to communicate with printer'); return; }
     }
     // 0.6.78 — LAN printer path: ask the BLASTI local API to push this ticket
     // to the agency's saved default printer over raw TCP/ESC-POS (port 9100).
@@ -959,6 +1020,10 @@ export function DeviceKiosk() {
           ...(deviceToken ? { 'X-Device-Token': deviceToken } : {}),
         },
         body: JSON.stringify({
+          // 0.6.104 — the kiosk's device id lets the desktop print route resolve
+          // the printer ASSIGNED to this kiosk (printerConfig.defaultPrinterDeviceId)
+          // and fall back to the agency default printer when none is assigned.
+          deviceId: deviceId || undefined,
           ticket: {
             agencyName: ticket.agencyName,
             branchName: ticket.branchName || undefined,
@@ -979,6 +1044,8 @@ export function DeviceKiosk() {
       const printData = await printRes.json().catch(() => ({}));
       if (printRes.ok && printData.success) {
         toast.success(t('printTicket') || 'Ticket sent to printer');
+        // 0.6.104 — successful LAN print → auto-return for the next customer.
+        schedulePostPrintReset();
         return;
       }
       // Non-success — continue to the browser popup fallback below.
@@ -1026,6 +1093,8 @@ export function DeviceKiosk() {
           <script>window.onload=function(){window.print();window.close();}</script>
           </body></html>`);
         win.document.close();
+        // 0.6.104 — popup print initiated successfully → auto-return.
+        schedulePostPrintReset();
       } else { setPrintError('Popup blocked — please allow popups for this site'); }
     } catch { setPrintError('Failed to print ticket'); }
   };
@@ -1405,7 +1474,8 @@ export function DeviceKiosk() {
       serviceName: getLocalizedName(service, lang),
       servicePrefix: service.prefix,
       ticketNumber,
-      customerName: customerName.trim(),
+      // 0.6.104 — anonymous (name step removed); offline tickets stay nameless.
+      customerName: '',
       issuedAt: new Date().toISOString(),
       synced: false,
     };
@@ -1437,7 +1507,7 @@ export function DeviceKiosk() {
     setShowConfetti(true);
     setTimeout(() => setShowConfetti(false), 3500);
     toast.success(t('kioskOfflineTicketIssued'));
-  }, [agency, selectedService, services, customerName, lang, t]);
+  }, [agency, selectedService, services, lang, t]);
 
   const pageVariants = getPageVariants(rtl);
 
@@ -1517,15 +1587,16 @@ export function DeviceKiosk() {
         />
       )}
 
-      {/* Step Indicator */}
+      {/* Step Indicator — compact variant on xs/sm viewports (0.6.104) */}
       {step !== 'code' && step !== 'discovery' && step !== 'qr-scan' && step !== 'method-select' && step !== 'credentials' && (
         <div className="px-4 pt-0.5 pb-0.5 print:hidden shrink-0">
-          <KioskStepIndicator currentStep={step} stepLabels={stepLabels} rtl={rtl} />
+          <KioskStepIndicator currentStep={step} stepLabels={stepLabels} rtl={rtl} compact={viewportSize === 'xs' || viewportSize === 'sm'} />
         </div>
       )}
 
-      {/* Currently Serving Banner (compact) */}
-      {agency && queueStats && !isOfflineMode && (queueStats.currentServing || (queueStats.currentlyServingList && queueStats.currentlyServingList.length > 0)) && step !== 'ticket' && (
+      {/* Currently Serving Banner (compact) — hidden on xs: every pixel of
+          height matters there (0.6.104) */}
+      {agency && queueStats && !isOfflineMode && (queueStats.currentServing || (queueStats.currentlyServingList && queueStats.currentlyServingList.length > 0)) && step !== 'ticket' && viewportSize !== 'xs' && (
         <div className="px-4 pb-1 print:hidden shrink-0">
           <motion.div
             initial={{ opacity: 0, y: -5 }}
@@ -1715,6 +1786,7 @@ export function DeviceKiosk() {
               rtl={rtl}
               lang={lang}
               error={error}
+              size={viewportSize}
               t={t}
               pageVariants={pageVariants}
               onSelectService={setSelectedService}
@@ -1722,78 +1794,16 @@ export function DeviceKiosk() {
               onNext={() => {
                 if (selectedService) {
                   setError(null);
-                  if (isOfflineMode) { handleOfflineJoinQueue(); } else { setStep('name'); }
+                  // 0.6.104 — name step REMOVED (user request: reserve directly
+                  // from services). Services → join; the join is anonymous
+                  // (customerName omitted, server stores 'Anonymous').
+                  if (isOfflineMode) { handleOfflineJoinQueue(); } else { handleJoinQueue(); }
                 }
               }}
             />
           )}
 
-          {/* Step 3: Enter Name (optional) */}
-          {step === 'name' && agency && selectedService && (
-            <motion.div
-              key="name"
-              variants={pageVariants}
-              initial="enter"
-              animate="center"
-              exit="exit"
-              transition={{ duration: 0.3, ease: 'easeInOut' }}
-              className="w-full max-w-md"
-            >
-              <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl p-5 sm:p-6 text-center">
-                <div className="h-12 w-12 mx-auto rounded-xl bg-emerald-100 flex items-center justify-center mb-2">
-                  <Users className="h-6 w-6 text-emerald-600" />
-                </div>
-                <h2 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-1">{t('enterYourName')}</h2>
-
-                {services.find((s) => s.id === selectedService) && (
-                  <div className="mb-4 mt-3 p-2.5 rounded-xl bg-emerald-50 border border-emerald-200">
-                    <p className="text-sm text-emerald-600 font-medium">
-                      {services.find((s) => s.id === selectedService)?.prefix} — {getLocalizedName(services.find((s) => s.id === selectedService)!, lang)}
-                    </p>
-                  </div>
-                )}
-
-                <input
-                  type="text"
-                  value={customerName}
-                  onChange={(e) => setCustomerName(e.target.value)}
-                  placeholder={t('enterYourName')}
-                  className="w-full min-h-[52px] rounded-2xl border-2 border-gray-200 dark:border-gray-700 px-5 text-lg focus:border-emerald-500 focus:outline-none transition-colors text-center text-gray-900 dark:text-gray-100"
-                  autoFocus
-                />
-
-                {error && (
-                  <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="mt-3 p-2.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm font-medium">
-                    {error}
-                  </motion.div>
-                )}
-
-                <motion.button
-                  whileHover={{ scale: 1.02 }}
-                  whileTap={{ scale: 0.98 }}
-                  onClick={isOfflineMode ? handleOfflineJoinQueue : handleJoinQueue}
-                  disabled={loading && !isOfflineMode}
-                  className={`w-full min-h-[56px] rounded-2xl text-lg font-bold shadow-lg mt-4 flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                    isOfflineMode
-                      ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:shadow-xl'
-                      : 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white hover:shadow-xl'
-                  }`}
-                >
-                  {loading && !isOfflineMode ? <Loader2 className="h-6 w-6 animate-spin" /> : isOfflineMode ? <WifiOff className="h-6 w-6" /> : <Ticket className="h-6 w-6" />}
-                  {isOfflineMode ? t('kioskOfflineMode') : t('joinQueueKiosk')}
-                </motion.button>
-
-                <button
-                  onClick={() => { setStep('services'); setError(null); }}
-                  className="mt-3 min-h-[44px] px-5 rounded-xl text-gray-500 dark:text-gray-400 hover:text-gray-700 hover:bg-gray-100 font-medium transition-colors"
-                >
-                  {t('kioskBack')}
-                </button>
-              </div>
-            </motion.div>
-          )}
-
-          {/* Step 4: Ticket Display */}
+          {/* Step 3: Ticket Display */}
           {step === 'ticket' && ticket && agency && (
             <KioskTicketDisplay
               ticket={ticket}
@@ -1801,6 +1811,7 @@ export function DeviceKiosk() {
               isOfflineMode={isOfflineMode}
               rtl={rtl}
               lang={lang}
+              size={viewportSize}
               t={t}
               pageVariants={pageVariants}
               showConfetti={showConfetti}
@@ -1861,13 +1872,15 @@ export function DeviceKiosk() {
         </AnimatePresence>
       </div>
 
-      {/* Footer */}
-      <div className="text-center pb-4 text-white/40 text-xs print:hidden">
-        BLASTI — {t('kioskTitle')}
-      </div>
+      {/* Footer — hidden on xs: every pixel of height matters there (0.6.104) */}
+      {viewportSize !== 'xs' && (
+        <div className="text-center pb-4 text-white/40 text-xs print:hidden">
+          BLASTI — {t('kioskTitle')}
+        </div>
+      )}
 
-      {/* LAN Connection Indicator */}
-      {!isDiscovering && (
+      {/* LAN Connection Indicator — hidden on xs (0.6.104) */}
+      {!isDiscovering && viewportSize !== 'xs' && (
         <div className="fixed bottom-4 end-4 z-50">
           {lanServer ? (
             <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 dark:bg-green-950 dark:text-green-400 dark:border-green-800">

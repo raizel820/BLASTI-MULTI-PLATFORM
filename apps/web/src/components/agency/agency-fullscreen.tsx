@@ -578,6 +578,9 @@ export function AgencyFullscreen() {
   // r24: an OPEN app IS active — the beat fires immediately on claim/restore
   // and on every return to the foreground (browsers throttle hidden-tab
   // timers), so an idle-but-running account can never drift past the lease TTL.
+  // r25: server-side TTL auto-free is gone; heartbeats are liveness tracking
+  // only — this renewal exists so a genuinely crashed holder can eventually be
+  // auto-claimed, never to free an open app.
   useEffect(() => {
     if (!selectedCounterId) return;
     let stopped = false;
@@ -604,10 +607,18 @@ export function AgencyFullscreen() {
       if (document.visibilityState === 'visible' && !stopped) void beat();
     };
     document.addEventListener('visibilitychange', onVisible);
+    // 0.6.104 — also beat on window focus: some desktop platforms (and certain
+    // WebViews) do not fire visibilitychange reliably when the window regains
+    // focus, so focus is a second liveness trigger.
+    const onFocus = () => {
+      if (!stopped) void beat();
+    };
+    window.addEventListener('focus', onFocus);
     return () => {
       stopped = true;
       clearInterval(id);
       document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
     };
   }, [selectedCounterId, releaseLocalControl, fetchCounters, t]);
 

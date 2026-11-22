@@ -1,71 +1,34 @@
 /**
- * Counter control sweeper (Feature C / r21-7).
+ * Counter control sweeper (Feature C / r21-7; lifecycle reworked in r25).
  *
- * Counter control must never outlive the controlling session. Clients claim
- * control via POST /api/agency/counters/:counterId/claim and then heartbeat
- * every CONTROL_HEARTBEAT_INTERVAL_MS. When an account logs out or closes the
- * app the heartbeats stop — an explicit release usually fires first (logout
- * route / release-mine keepalive / desktop close hook), but a crashed client
- * would leave the counter locked forever. This worker:
+ * r25 (user ruling): an OPEN app must NEVER lose counter control. Control is
+ * released only by explicit release (app close / logout via release-mine), an
+ * owner/manager force transfer, or an ACCEPTED handover request. There is NO
+ * TTL auto-free anymore — the old Pass 1 (frees counters whose heartbeat went
+ * quiet) was removed: heartbeat staleness is liveness tracking only and feeds
+ * solely the HOLDER_GONE decision below via CONTROL_CRASH_TTL_MS (15-minute
+ * crash window, covering Android backgrounded WebViews whose JS timers freeze
+ * while the app is still open).
  *
- *   1. frees any control whose heartbeat is older than CONTROL_TTL_MS
- *      (emitting counter:lost + counter:released to the agency room), and
- *   2. resolves PENDING CounterControlRequests past their 60s expiresAt —
- *      AUTO-APPROVE (transfer control to the requester) when they are still
- *      an active agency member, else mark EXPIRED (emitting
- *      counter:request-approved / counter:request-expired).
- *
- * The legacy agency:updated counter-released action keeps firing so the old
- * dashboard UI (which listens only for that envelope) stays in sync.
+ * This worker therefore only resolves PENDING CounterControlRequests past
+ * their 60s expiresAt — AUTO-APPROVE (transfer control to the requester) when
+ * the holder is really gone (crash window elapsed) and the requester is still
+ * an active agency member, else mark EXPIRED (emitting
+ * counter:request-approved / counter:request-expired).
  */
-import {
-  CONTROL_TTL_MS,
-  sweepStaleCounterControl,
-  sweepExpiredCounterRequests,
-} from '../lib/counter-control'
-import { emitAgencyEvent, emitCounterEvent } from '../lib/realtime-emit'
+import { CONTROL_CRASH_TTL_MS, sweepExpiredCounterRequests } from '../lib/counter-control'
+import { emitCounterEvent } from '../lib/realtime-emit'
 
 const SWEEP_INTERVAL_MS = 60_000
 
 let timer: ReturnType<typeof setInterval> | null = null
 
-/** Legacy agency:updated envelope — the old dashboard UI depends on this action name. */
-function emitLegacyCounterUpdate(
-  agencyId: string,
-  action: 'counter-released' | 'counter-occupied',
-  counterId: string,
-): void {
-  void emitAgencyEvent('agency:updated', agencyId, { action, counterId })
-}
-
 async function runSweepPass(): Promise<void> {
-  // Pass 1 — release counters whose control heartbeat went stale.
-  const swept = await sweepStaleCounterControl()
-  for (const counter of swept) {
-    // counter:lost tells the (dead) controller's other sessions; counter:released
-    // tells everyone the counter is free again.
-    void emitCounterEvent('counter:lost', counter.agencyId, {
-      agencyId: counter.agencyId,
-      counterId: counter.counterId,
-      counterName: counter.counterName,
-      counterNumber: counter.counterNumber,
-      reason: 'HEARTBEAT_EXPIRED',
-      previousController: { userId: counter.previousUserId },
-    })
-    void emitCounterEvent('counter:released', counter.agencyId, {
-      agencyId: counter.agencyId,
-      counterId: counter.counterId,
-      counterName: counter.counterName,
-      counterNumber: counter.counterNumber,
-      actor: { kind: 'SYSTEM', reason: 'HEARTBEAT_EXPIRED' },
-    })
-    emitLegacyCounterUpdate(counter.agencyId, 'counter-released', counter.counterId)
-  }
-  if (swept.length > 0) {
-    console.log(`[counter-control-sweeper] freed ${swept.length} stale counter control(s)`)
-  }
+  // r25 — Pass 1 (sweepStaleCounterControl TTL auto-free) was REMOVED: an
+  // open app must never lose control; heartbeat staleness only feeds the
+  // HOLDER_GONE decision inside sweepExpiredCounterRequests().
 
-  // Pass 2 — expire / auto-approve takeover requests past their 60s window.
+  // Pass — expire / auto-approve takeover requests past their 60s window.
   const outcomes = await sweepExpiredCounterRequests()
   for (const outcome of outcomes) {
     if (outcome.kind === 'AUTO_APPROVED') {
@@ -130,8 +93,9 @@ export function startCounterControlSweeper(): void {
   }, SWEEP_INTERVAL_MS)
   // Never keep the process alive just for the sweeper.
   if (typeof timer.unref === 'function') timer.unref()
-  console.log(`[counter-control-sweeper] registered (interval=60s, ttl=${CONTROL_TTL_MS / 1000}s, request-window=60s)`)
-  // One pass at boot so a restart reaps anything left stale while offline.
+  console.log(`[counter-control-sweeper] registered (interval=60s, request-window=60s, crash-ttl=${CONTROL_CRASH_TTL_MS / 1000}s, ttl-autofree=REMOVED)`)
+  // One pass at boot so a restart resolves any takeover requests left pending
+  // while offline (no control is ever freed — r25).
   runSweepPass().catch((error) => {
     console.error('[counter-control-sweeper] boot sweep failed:', error)
   })

@@ -185,6 +185,46 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
     return () => clearInterval(interval);
   }, [fetchMyCounter]);
 
+  // 0.6.104 — counter control heartbeat (Fault: control lost every ~3 min
+  // while the app is open — this dashboard claimed counters but never renewed
+  // the lease; the server's TTL sweep freed them). While a controlled counter
+  // id is known, renew the server-side control lease every 60s AND instantly
+  // on visibilitychange-to-visible (mobile browsers throttle background
+  // timers). A 403 COUNTER_CONTROL_LOST means control was genuinely lost
+  // (explicit release, owner transfer, or accepted handover): clear the local
+  // controlled-counter state so the claim gate comes back. Non-403 failures
+  // are ignored silently — the next beat retries.
+  const controlledCounterId = myControlledCounter?.id ?? null;
+  useEffect(() => {
+    if (!controlledCounterId) return;
+    let stopped = false;
+    const beat = async () => {
+      try {
+        const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(controlledCounterId)}/heartbeat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agencyId }),
+        });
+        if (res.status === 403 && !stopped) {
+          setMyControlledCounter(null);
+          fetchMyCounter(); // refresh the claimable target after the loss
+          toast.error(t('counterControlLost'));
+        }
+      } catch { /* transient — the next beat retries */ }
+    };
+    void beat(); // instant renewal on claim / restore — no 60s dead zone
+    const id = setInterval(beat, 60_000);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible' && !stopped) void beat();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [controlledCounterId, agencyId, fetchMyCounter, t]);
+
   // ─── KeepAwake on mount ──────────────────────────────────────────────
   useEffect(() => {
     // Try to keep the screen awake using WakeLock API (web standard)

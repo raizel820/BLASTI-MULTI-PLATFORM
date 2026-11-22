@@ -36,10 +36,14 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select';
+import {
   Crown, Loader2, Monitor, MonitorSmartphone, Printer, Server,
   Smartphone, Tv, Usb, Wifi, Check, X, Network, Hourglass, ChevronRight,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { useLanguage } from '@/hooks/use-language';
 import { getLocalizedString } from './types';
 import type { AgencyDevice } from './types';
 
@@ -123,14 +127,25 @@ export function DeviceTreeCard({
   agencyId,
   lang,
   devices,
+  printers,
+  onDeviceUpdated,
 }: {
   agencyId: string | undefined;
   lang: string;
   devices: AgencyDevice[];
+  /** 0.6.104 — agency's registered printers (kiosk default-printer select);
+   *  derived from the devices prop when the caller does not pass a list. */
+  printers?: AgencyDevice[];
+  /** 0.6.104 — notify the manager so it refetches after an assignment change. */
+  onDeviceUpdated?: () => void;
 }) {
+  const { t } = useLanguage();
   const [nodes, setNodes] = useState<LanNode[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [verdictBusy, setVerdictBusy] = useState<string | null>(null);
+  // 0.6.104 — per-kiosk default printer: PATCH-in-flight device id.
+  const [kioskPrinterBusyId, setKioskPrinterBusyId] = useState<string | null>(null);
+  const registeredPrinters = printers ?? devices.filter((d) => d.type === 'PRINTER');
 
   const fetchTopology = useCallback(async () => {
     if (!agencyId) return;
@@ -181,6 +196,56 @@ export function DeviceTreeCard({
       setVerdictBusy(null);
     }
   }, [agencyId, fetchTopology, lang]);
+
+  // 0.6.104 — kiosk-assigned default printer (Fault: the kiosk must print on
+  // the printer registered/attached to its branch, assignable per-kiosk from
+  // the device manager). Saves the chosen printer AgencyDevice id on the
+  // KIOSK row's printerConfig JSON (key `defaultPrinterDeviceId`); an empty
+  // printerId clears the key (falls back to the agency-level DefaultPrinter).
+  const kioskAssignedPrinterId = (dev: AgencyDevice): string => {
+    const cfg = parsePrinterConfig(dev);
+    return typeof cfg.defaultPrinterDeviceId === 'string' ? cfg.defaultPrinterDeviceId : '';
+  };
+
+  const saveKioskDefaultPrinter = useCallback(async (dev: AgencyDevice, printerId: string) => {
+    setKioskPrinterBusyId(dev.id);
+    try {
+      const nextCfg: Record<string, unknown> = { ...parsePrinterConfig(dev) };
+      if (printerId) nextCfg.defaultPrinterDeviceId = printerId;
+      else delete nextCfg.defaultPrinterDeviceId;
+      const res = await apiFetch(`/api/agency-devices/${encodeURIComponent(dev.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ printerConfig: nextCfg }),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.success) {
+        toast.success(getLocalizedString(
+          'تم حفظ الطابعة الافتراضية لهذا الكيوسك',
+          'Imprimante par défaut enregistrée pour ce kiosque',
+          'Default printer saved for this kiosk',
+          lang,
+        ));
+        onDeviceUpdated?.();
+      } else {
+        toast.error(data?.error || getLocalizedString(
+          'فشل حفظ الطابعة الافتراضية',
+          'Échec de l’enregistrement de l’imprimante par défaut',
+          'Failed to save the default printer',
+          lang,
+        ));
+      }
+    } catch {
+      toast.error(getLocalizedString(
+        'فشل حفظ الطابعة الافتراضية',
+        'Échec de l’enregistrement de l’imprimante par défaut',
+        'Failed to save the default printer',
+        lang,
+      ));
+    } finally {
+      setKioskPrinterBusyId(null);
+    }
+  }, [lang, onDeviceUpdated]);
 
   if (!agencyId || !loaded) return null;
 
@@ -341,7 +406,15 @@ export function DeviceTreeCard({
                 {getLocalizedString('الأجهزة المسجّلة (شاشات / كيوسكات / تطبيقات / طابعات شبكية)', 'Appareils enregistrés (écrans / kiosques / apps / imprimantes réseau)', 'Registered devices (TVs / kiosks / apps / network printers)', lang)}
               </div>
               <div className="mt-1.5 space-y-1 ps-3">
-                {standalone.slice(0, 24).map((dev) => (
+                {standalone.slice(0, 24).map((dev) => {
+                  // 0.6.104 — kiosk nodes get the default-printer assignment
+                  // tag + compact selector straight on the tree row.
+                  const isKioskNode = dev.type === 'KIOSK';
+                  const kioskPrinterId = isKioskNode ? kioskAssignedPrinterId(dev) : '';
+                  const kioskPrinter = kioskPrinterId
+                    ? registeredPrinters.find((p) => p.id === kioskPrinterId) ?? null
+                    : null;
+                  return (
                   <div key={dev.id} className="flex items-center gap-2 text-xs">
                     <StatusDot online={dev.status === 'ONLINE'} status={dev.status} />
                     <TypeIcon type={dev.type} />
@@ -353,8 +426,39 @@ export function DeviceTreeCard({
                         {getLocalizedString('بانتظار القبول', 'en attente', 'awaiting acceptance', lang)}
                       </span>
                     )}
+                    {isKioskNode && (
+                      <span className="inline-flex items-center gap-1 rounded-md bg-sky-100 px-1.5 py-px text-[9px] text-sky-700 dark:bg-sky-950/40 dark:text-sky-400 max-w-[220px]">
+                        <Printer className="h-2.5 w-2.5 shrink-0" />
+                        <span className="truncate">
+                          {`${t('dmKioskPrinterTag')}: ${kioskPrinter ? getLocalizedString(kioskPrinter.nameAr || kioskPrinter.name, kioskPrinter.nameFr || kioskPrinter.name, kioskPrinter.name, lang) : t('dmKioskPrinterAgencyDefault')}`}
+                        </span>
+                      </span>
+                    )}
+                    {isKioskNode && registeredPrinters.length > 0 && (
+                      <Select
+                        value={kioskPrinterId || 'agency-default'}
+                        onValueChange={(v) => saveKioskDefaultPrinter(dev, v === 'agency-default' ? '' : v)}
+                        disabled={kioskPrinterBusyId === dev.id}
+                      >
+                        <SelectTrigger className="h-6 w-[150px] shrink-0 text-[10px] ms-auto">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="agency-default">{t('dmKioskPrinterAgencyDefault')}</SelectItem>
+                          {registeredPrinters.map((p) => (
+                            <SelectItem key={p.id} value={p.id}>{p.name} · {p.connectionType}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    {isKioskNode && registeredPrinters.length === 0 && (
+                      <span className="text-[9px] text-amber-600 dark:text-amber-400 ms-auto shrink-0">
+                        {t('dmKioskPrinterNoRegistered')}
+                      </span>
+                    )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
