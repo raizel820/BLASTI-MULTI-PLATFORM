@@ -314,6 +314,19 @@ export function DeviceManager() {
     ),
     [unpairedDevices],
   );
+  // 0.6.115 — identity keys of the REGISTERED registry. A device that is
+  // already registered (paired kiosk, saved TV/printer/PC) must not ALSO
+  // render as a live scan card — one entry per app running on a device
+  // (user requirement: never show "a device AND an app" for the same unit).
+  const registeredKeys = useMemo(
+    () => new Set(
+      devices
+        .flatMap((d) => [d.deviceFingerprint, d.ipAddress])
+        .filter((v: string | undefined | null): v is string => !!v)
+        .map((v: string) => v.toLowerCase()),
+    ),
+    [devices],
+  );
   const visibleDiscovered = useMemo(
     // 0.6.99 — SIGNAL-BASED whitelist (user requirement): only devices that
     // ANSWERED a discovery signal render here — BLASTI apps (beacon/mDNS/
@@ -332,10 +345,13 @@ export function DeviceManager() {
         const fp = (d.fingerprint || d.blastiInfo?.fingerprint || d.blastiInfo?.instanceId || '').toLowerCase();
         if (fp && unpairedKeys.has(fp)) return false;
         if (d.ip && d.ip !== '127.0.0.1' && unpairedKeys.has(d.ip.toLowerCase())) return false;
+        // 0.6.115 — the registry owns the entry once the device is registered.
+        if (fp && registeredKeys.has(fp)) return false;
+        if (d.ip && d.ip !== '127.0.0.1' && registeredKeys.has(d.ip.toLowerCase())) return false;
         return true;
       },
     ),
-    [discoveredDevices, dismissedIds, unpairedKeys],
+    [discoveredDevices, dismissedIds, unpairedKeys, registeredKeys],
   );
   const hasDiscoveryContent = scanState.scanning || visibleDiscovered.length > 0 || unpairedDevices.length > 0;
 

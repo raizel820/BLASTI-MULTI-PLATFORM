@@ -2362,7 +2362,20 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         if (devices.some((d) => d.id === cd.id)) continue
         merged.push({ ...cd, id: 'cloud-' + cd.id, cloudDevice: true })
       }
-      return c.json({ success: true, devices: merged })
+      // ── 0.6.115 — ONE CARD PER PHYSICAL DEVICE (legacy duplicate collapse) ──
+      // discover-register before 0.6.115 could mint several rows for the same
+      // fingerprint; collapse the merged strip (local + cloud) to one entry
+      // per fingerprint — newest heartbeat wins. Display-only, no writes.
+      const seenStripFps = new Set()
+      const collapsed = merged.filter((d) => {
+        const fp = typeof d.deviceFingerprint === 'string' && d.deviceFingerprint
+        if (!fp) return true
+        const key = fp.toLowerCase()
+        if (seenStripFps.has(key)) return false
+        seenStripFps.add(key)
+        return true
+      })
+      return c.json({ success: true, devices: collapsed })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE unpaired error: ' + (err && err.message))
       return c.json({ success: false, error: 'Failed to load unpaired devices' }, 500)
@@ -2477,6 +2490,19 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         orderBy: { createdAt: 'desc' },
       })
       devices = await attachBranches(db, devices)
+      // ── 0.6.115 — ONE ROW PER PHYSICAL DEVICE (legacy duplicate collapse) ──
+      // Legacy pairing bugs could leave two rows with the same fingerprint in
+      // one agency ("phone" + "kiosk mode" for one tablet). Collapse to the
+      // newest row — display-only, ids stay valid for actions.
+      const seenListFps = new Set()
+      devices = devices.filter((d) => {
+        const fp = typeof d.deviceFingerprint === 'string' && d.deviceFingerprint
+        if (!fp) return true
+        const key = fp.toLowerCase()
+        if (seenListFps.has(key)) return false
+        seenListFps.add(key)
+        return true
+      })
       // M7: parse JSON string fields before returning
       const parsedDevices = devices.map((d) => ({
         ...d,
@@ -3615,29 +3641,49 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       let existing = null
       if (deviceFingerprint) {
         try {
-          existing = await db.agencyDevice.findFirst({ where: { deviceFingerprint, status: 'PAIRING' } })
+          // ── 0.6.115 — ONE ROW PER DEVICE (status-independent match) ──
+          // The old filter `status: 'PAIRING'` minted a SECOND row whenever
+          // the same physical phone re-announced after its row went OFFLINE
+          // ("phone + kiosk shown as separate devices"). Match by fingerprint
+          // regardless of status; unpaired rows win over paired ones.
+          const candidates = await db.agencyDevice.findMany({
+            where: { deviceFingerprint },
+            orderBy: { createdAt: 'desc' },
+            take: 5,
+          })
+          existing = candidates.find((d) => !d.agencyId) || candidates[0] || null
         } catch { /* non-fatal */ }
       }
       if (existing) {
+        // 0.6.115 — ALWAYS refresh the row to the surface that is announcing
+        // NOW (type/name/connection). The old code reused the row but left
+        // the type untouched, so a kiosk surface over a PHONE row stayed
+        // "PHONE" forever — the manager then "could not discover the kiosk".
+        const now = new Date()
+        const wasUnpaired = !existing.agencyId
+        await db.agencyDevice.update({
+          where: { id: existing.id },
+          data: {
+            type: deviceType,
+            name: deviceName,
+            connectionType,
+            ...(deviceType === 'KIOSK' ? { screenLayout: 'SERVICE_SELECTOR', offlineCapable: true } : {}),
+            ...(wasUnpaired && existing.status !== 'PAIRING'
+              ? { status: 'PAIRING', statusChangedAt: now }
+              : {}),
+            ...(appVersion ? { appVersion } : {}),
+            lastHeartbeatAt: now,
+          },
+        }).catch(() => null)
         let token = existing.deviceToken
         if (!token) {
           token = crypto.randomBytes(32).toString('hex')
-          await db.agencyDevice.update({
-            where: { id: existing.id },
-            data: {
-              deviceToken: token,
-              connectionType,
-              name: deviceName,
-              type: deviceType,
-              ...(appVersion ? { appVersion } : {}),
-              lastHeartbeatAt: new Date(),
-            },
-          })
+          await db.agencyDevice.update({ where: { id: existing.id }, data: { deviceToken: token } }).catch(() => null)
         }
         return c.json({
           success: true,
           deviceToken: token,
-          device: { id: existing.id, name: existing.name, type: existing.type, status: existing.status },
+          device: { id: existing.id, name: deviceName, type: deviceType, status: wasUnpaired ? 'PAIRING' : existing.status },
         })
       }
 

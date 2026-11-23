@@ -1178,32 +1178,67 @@ app.post('/public/discover-register', async (c) => {
     const { deviceName, deviceType, connectionType, deviceFingerprint } = validation.data
     const effectiveName = deviceName || 'BLASTI Kiosk (Discovering)'
 
-    // Check if device with same fingerprint already exists
+    // ── 0.6.115 — ONE ROW PER DEVICE, TYPE = THE APP CURRENTLY RUNNING ──
+    // Field report (2026-11-23): "device manager could not discover kiosk
+    // device and discovered only the phone … before it shows the phone that
+    // run kiosk mode and kiosk mode as separated devices".
+    // Two defects caused it:
+    //   (a) the fingerprint match was filtered to status 'PAIRING' — the same
+    //       physical phone whose row had gone OFFLINE re-registered as a SECOND
+    //       row (the "device AND app" duplicates the user saw);
+    //   (b) a successful reuse NEVER updated the row's type — the phone's
+    //       staff surface registered the shared fingerprint as PHONE first,
+    //       then the kiosk surface silently reused that row, so the manager
+    //       saw a PHONE forever and "the kiosk was never discovered".
+    // Fix: match by fingerprint REGARDLESS of status (newest first, unpaired
+    // rows preferred over paired ones — never a duplicate), and ALWAYS update
+    // type/name/connection to the surface that is announcing right now.
     let existingDevice: any = null
     if (deviceFingerprint) {
       try {
-        existingDevice = await db.agencyDevice.findFirst({
-          where: { deviceFingerprint, status: 'PAIRING' },
+        const candidates = await db.agencyDevice.findMany({
+          where: { deviceFingerprint },
+          orderBy: { createdAt: 'desc' },
+          take: 5,
         })
+        // Prefer the device's own unpaired row (it keeps its token + PAIRING
+        // visibility); a paired row is still THE SAME physical device — reuse
+        // it (never mint a second row) and let device-status reflect the pair.
+        existingDevice = candidates.find((d: any) => !d.agencyId) || candidates[0] || null
       } catch (e) {
         console.error('[DISCOVER-REGISTER] findFirst error:', e)
       }
     }
 
     if (existingDevice) {
-      // Return existing token
-      const token = existingDevice.deviceToken
-      if (!token) {
-        const newToken = crypto.randomBytes(32).toString('hex')
-        await db.agencyDevice.update({
-          where: { id: existingDevice.id },
-          data: { deviceToken: newToken, connectionType: connectionType || 'LAN', name: effectiveName, type: deviceType },
-        })
-        if (clientIp) recordSuccessfulRequest(clientIp)
-        return c.json({ success: true, device: { id: existingDevice.id, name: effectiveName, type: deviceType, status: 'PAIRING' }, deviceToken: newToken })
+      // Refresh the row to the surface that is announcing NOW.
+      const now = new Date()
+      const wasUnpaired = !existingDevice.agencyId
+      await db.agencyDevice.update({
+        where: { id: existingDevice.id },
+        data: {
+          type: deviceType,
+          name: effectiveName,
+          connectionType: connectionType || 'LAN',
+          ...(deviceType === 'KIOSK' ? { screenLayout: 'SERVICE_SELECTOR', offlineCapable: true } : {}),
+          // An unpaired row must stay visible in /unpaired — restore PAIRING
+          // when an older run left it OFFLINE.
+          ...(wasUnpaired && existingDevice.status !== 'PAIRING'
+            ? { status: 'PAIRING', statusChangedAt: now }
+            : {}),
+          lastHeartbeatAt: now,
+        },
+      })
+      const token = existingDevice.deviceToken || crypto.randomBytes(32).toString('hex')
+      if (!existingDevice.deviceToken) {
+        await db.agencyDevice.update({ where: { id: existingDevice.id }, data: { deviceToken: token } })
       }
       if (clientIp) recordSuccessfulRequest(clientIp)
-      return c.json({ success: true, device: { id: existingDevice.id, name: existingDevice.name, type: existingDevice.type, status: existingDevice.status }, deviceToken: token })
+      return c.json({
+        success: true,
+        device: { id: existingDevice.id, name: effectiveName, type: deviceType, status: wasUnpaired ? 'PAIRING' : existingDevice.status },
+        deviceToken: token,
+      })
     }
 
     // Create new orphan device
@@ -2214,7 +2249,21 @@ app.get('/unpaired', async (c) => {
       take: 50,
     })
 
-    return c.json({ success: true, devices })
+    // ── 0.6.115 — ONE CARD PER PHYSICAL DEVICE (legacy duplicate collapse) ──
+    // discover-register before 0.6.115 could mint several rows for the same
+    // fingerprint (status-filtered match). Collapse them here to the newest
+    // heartbeat so the approval strip never shows "phone + kiosk" twice for
+    // one device — display-only, no destructive writes.
+    const seenFingerprints = new Set<string>()
+    const collapsedDevices = (devices as any[]).filter((d: any) => {
+      if (!d.deviceFingerprint) return true
+      const key = d.deviceFingerprint.toLowerCase()
+      if (seenFingerprints.has(key)) return false
+      seenFingerprints.add(key)
+      return true
+    })
+
+    return c.json({ success: true, devices: collapsedDevices })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -2367,8 +2416,22 @@ app.get('/', async (c) => {
       orderBy: { createdAt: 'desc' },
     })
 
+    // ── 0.6.115 — ONE ROW PER PHYSICAL DEVICE (legacy duplicate collapse) ──
+    // Legacy pairing bugs could leave two rows with the same fingerprint in
+    // one agency (e.g. "phone" + "kiosk mode" for a single tablet). Collapse
+    // them to the newest row — display-only, ids stay valid for actions.
+    const seenListFingerprints = new Set<string>()
+    const collapsedListDevices = (devices as any[]).filter((d: any) => {
+      const fp = typeof d.deviceFingerprint === 'string' && d.deviceFingerprint
+      if (!fp) return true
+      const key = fp.toLowerCase()
+      if (seenListFingerprints.has(key)) return false
+      seenListFingerprints.add(key)
+      return true
+    })
+
     // M7: Parse JSON string fields before returning
-    const parsedDevices = devices.map(d => ({
+    const parsedDevices = collapsedListDevices.map((d: any) => ({
       ...d,
       displaySettings: parseJSON(d.displaySettings),
       printerConfig: parseJSON(d.printerConfig),

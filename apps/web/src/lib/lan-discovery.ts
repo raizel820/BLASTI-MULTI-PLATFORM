@@ -164,8 +164,14 @@ async function scanIP(ip: string, port: number): Promise<DiscoveredServer | null
       // 0.6.23 (R-21F-S2): pass the LAN-authority election fields through
       // when the desktop serves them (additive — absent fields stay unset and
       // everything behaves exactly as before on old desktops).
+      // 0.6.115 — field logs showed "pinned the branch desktop at
+      // undefined:3080": some desktop builds answered /api/discover WITHOUT
+      // the `ip` field. Backfill it from the address actually probed so the
+      // pinned server, the kiosk LAN base and every log line carry a real IP.
       return {
         ...beacon,
+        ip: typeof data.ip === 'string' && data.ip ? data.ip : ip,
+        hostname: typeof data.hostname === 'string' && data.hostname ? data.hostname : beacon.hostname || ip,
         role: typeof data.role === 'string' ? data.role : undefined,
         term: typeof data.term === 'number' ? data.term : undefined,
         specScore: typeof data.specScore === 'number' ? data.specScore : undefined,
@@ -267,8 +273,15 @@ async function scanSubnet(
  * a LAN host), (2) the /24 of the WebRTC local IP — the only reliable source
  * inside Capacitor/localhost shells, where window.location.hostname is
  * 'localhost' and the old hostname-derived subnet never existed.
+ * 0.6.115 — (3) the /24 of the DEVICE'S OWN reported LAN IP. Field logs
+ * (2026-11-23) showed a kiosk on 192.168.100.2 sweeping ONLY the three
+ * hardcoded fallbacks (192.168.0/192.168.1/10.0.0) because modern Android
+ * WebViews mDNS-obfuscate WebRTC — the 192.168.100 desktop was NEVER probed
+ * ("LAN discovery finished with NO desktop box found", 2,607 occurrences).
+ * The native plugin already reports the device's real LAN IP to the WebView;
+ * sweeping its /24 is the deterministic fix.
  */
-async function deriveCandidateSubnets(): Promise<string[]> {
+async function deriveCandidateSubnets(candidateIps: string[] = []): Promise<string[]> {
   const subnets: string[] = [];
   const push = (ip: string) => {
     const parts = ip.split('.');
@@ -280,6 +293,11 @@ async function deriveCandidateSubnets(): Promise<string[]> {
   const currentHost = typeof window !== 'undefined' ? window.location.hostname : '';
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(currentHost || '')) {
     push(currentHost);
+  }
+  // 0.6.115 — the device's self-reported LAN IP(s) (native plugin / heartbeat
+  // probe) come FIRST: they are the ground truth on shells where WebRTC lies.
+  for (const cand of candidateIps) {
+    if (cand && cand !== '127.0.0.1' && cand !== 'localhost') push(cand);
   }
   try {
     const rtcIp = await getLocalIp();
@@ -375,7 +393,10 @@ export async function quickDiscover(opts?: { preferRemote?: boolean; selfIps?: s
   const scanStartedAt = Date.now();
   try { logDevice('scan_started', 'LAN discovery started (cached → localhost → gateways → subnet sweep)'); } catch { /* never block */ }
   try {
-    const derived = await deriveCandidateSubnets();
+    // 0.6.115 — the device's own LAN IP(s) now seed the subnet derivation
+    // (previously only the WebRTC/hostname paths did — a kiosk on
+    // 192.168.100.x never swept its own subnet and never found the desktop).
+    const derived = await deriveCandidateSubnets([...selfIps]);
 
     // 0.6.75 — stage 1 runs in PARALLEL: cached-server liveness, localhost
     // probe and all derived-subnet gateway probes used to run back-to-back,
