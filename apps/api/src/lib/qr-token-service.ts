@@ -69,6 +69,38 @@ export function verifyQRToken(token: string): QRTokenPayload | null {
 }
 
 /**
+ * Signature-only verification — SAME HMAC check as verifyQRToken but WITHOUT
+ * the 30-minute expiry test. Used by the walk-in import path: a kiosk ticket
+ * QR is PRINTED on paper, so the customer may scan it hours after issuance.
+ * A token whose signature is valid AND which matches the reservation's stored
+ * importToken is authentic (it was minted by a trusted issuer) even if old.
+ * Returns the parsed payload when the signature is valid, else null.
+ */
+export function verifyQRTokenSignature(token: string): QRTokenPayload | null {
+  try {
+    const [encodedPayload, signature] = token.split('.')
+    if (!encodedPayload || !signature) return null
+
+    const payload = Buffer.from(encodedPayload, 'base64url').toString('utf8')
+
+    const expectedSignature = createHmac('sha256', QR_SECRET_KEY)
+      .update(payload)
+      .digest('hex')
+
+    if (signature.length !== expectedSignature.length) return null
+    let result = 0
+    for (let i = 0; i < signature.length; i++) {
+      result |= signature.charCodeAt(i) ^ expectedSignature.charCodeAt(i)
+    }
+    if (result !== 0) return null
+
+    return JSON.parse(payload) as QRTokenPayload
+  } catch {
+    return null
+  }
+}
+
+/**
  * Convenience wrapper: generate an import token for O2O QR bridge.
  */
 export function generateImportToken(reservationId: string, agencyId: string, customerId: string): string {

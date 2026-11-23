@@ -299,7 +299,11 @@ app.get('/', async (c) => {
     } catch {
       // Staff auth absent → try the DEVICE token (kiosk/TV waiting for pairing)
       const deviceToken = c.req.header('X-Device-Token') || c.req.header('Authorization')?.replace(/^Bearer\s+/i, '') || ''
-      if (!deviceToken) throw new Error('Authentication required')
+      if (!deviceToken) {
+        // 0.6.105 — a clean 401 instead of a thrown 500: anonymous console
+        // loads probe this route constantly and a 500 pollutes the logs.
+        return c.json({ success: false, error: 'Authentication required' }, 401)
+      }
       const device = await db.agencyDevice.findUnique({ where: { deviceToken }, select: { agencyId: true, status: true } })
       if (!device || !device.agencyId) {
         return c.json({ success: false, error: 'Authentication required' }, 401)

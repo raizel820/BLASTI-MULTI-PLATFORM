@@ -491,6 +491,12 @@ export interface AgencyAuthority {
   isOwner: boolean
   role: AgencyRole | null
   staffId: string | null
+  /**
+   * 0.6.105 — the caller's assigned branch (AgencyStaff.branchId). Owners
+   * have no staff row → null (agency-wide scope). Staff/manager device-manager
+   * views use it to scope paired PCs + counters to THEIR branch.
+   */
+  branchId: string | null
   permissions: Record<StaffPermission, boolean>
 }
 
@@ -519,7 +525,7 @@ export async function getAgencyAuthority(userId: string, agencyId: string): Prom
     select: { id: true },
   })
   if (ownership) {
-    return { isOwner: true, role: 'OWNER', staffId: null, permissions: allPermissionsTrue() }
+    return { isOwner: true, role: 'OWNER', staffId: null, branchId: null, permissions: allPermissionsTrue() }
   }
 
   const staffRow = await db.agencyStaff.findFirst({
@@ -531,12 +537,12 @@ export async function getAgencyAuthority(userId: string, agencyId: string): Prom
     for (const key of STAFF_PERMISSION_KEYS) {
       permissions[key] = Boolean((staffRow as Record<string, unknown>)[key])
     }
-    return { isOwner: role === 'OWNER', role, staffId: staffRow.id, permissions }
+    return { isOwner: role === 'OWNER', role, staffId: staffRow.id, branchId: staffRow.branchId ?? null, permissions }
   }
 
   const none = {} as Record<StaffPermission, boolean>
   for (const key of STAFF_PERMISSION_KEYS) none[key] = false
-  return { isOwner: false, role: null, staffId: null, permissions: none }
+  return { isOwner: false, role: null, staffId: null, branchId: null, permissions: none }
 }
 
 /**

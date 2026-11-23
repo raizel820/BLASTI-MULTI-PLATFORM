@@ -122,29 +122,40 @@ app.post('/claim', async (c) => {
       return c.json({ success: false, error: 'deviceId is required' }, 400)
     }
 
-    // Verify the QR token
+    // Verify the QR token — 0.6.110 acceptance ladder (parity with the
+    // import-walk-in route): strict HMAC+expiry verification FIRST, then an
+    // exact STORED-token match so a QR pass generated earlier (or a printed
+    // ticket scanned hours later) still claims. A regenerated token voids the
+    // old QR because the stored importToken is replaced on regeneration.
     const payload = verifyQRToken(token)
-    if (!payload) {
-      if (clientIp) recordFailedRequest(clientIp)
-      return c.json({ success: false, error: 'Invalid or expired QR token' }, 400)
+    let reservation = payload
+      ? await db.reservation.findUnique({
+          where: { id: payload.reservationId },
+          include: {
+            agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
+            service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
+            user: { select: { id: true, fullName: true } },
+          },
+        })
+      : null
+    if (!reservation) {
+      reservation = await db.reservation.findFirst({
+        where: { importToken: token },
+        include: {
+          agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
+          service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
+          user: { select: { id: true, fullName: true } },
+        },
+      })
     }
-
-    // Find the reservation
-    const reservation = await db.reservation.findUnique({
-      where: { id: payload.reservationId },
-      include: {
-        agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
-        service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
-        user: { select: { id: true, fullName: true } },
-      },
-    })
 
     if (!reservation) {
       if (clientIp) recordFailedRequest(clientIp)
       return c.json({ success: false, error: 'Reservation not found' }, 404)
     }
 
-    // Verify the token matches the stored importToken
+    // Verify the token matches the stored importToken (guards the ladder —
+    // a claimed token MUST be the one currently stored on the reservation).
     if (reservation.importToken !== token) {
       if (clientIp) recordFailedRequest(clientIp)
       return c.json({ success: false, error: 'Token does not match reservation' }, 400)
@@ -262,22 +273,30 @@ app.get('/verify/:token', async (c) => {
       return c.json({ success: false, error: 'Token is required' }, 400)
     }
 
-    // Verify the QR token
+    // Verify the QR token — 0.6.110 ladder (parity with /claim and
+    // import-walk-in): strict HMAC first, then the exact stored-token match
+    // so an older-but-current QR pass previews instead of "expired".
     const payload = verifyQRToken(token)
-    if (!payload) {
-      if (clientIp) recordFailedRequest(clientIp)
-      return c.json({ success: false, error: 'Invalid or expired QR token', valid: false }, 200)
+    let reservation = payload
+      ? await db.reservation.findUnique({
+          where: { id: payload.reservationId },
+          include: {
+            agency: { select: { id: true, name: true, nameAr: true, nameFr: true, category: true } },
+            service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
+            user: { select: { id: true, fullName: true } },
+          },
+        })
+      : null
+    if (!reservation) {
+      reservation = await db.reservation.findFirst({
+        where: { importToken: token },
+        include: {
+          agency: { select: { id: true, name: true, nameAr: true, nameFr: true, category: true } },
+          service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
+          user: { select: { id: true, fullName: true } },
+        },
+      })
     }
-
-    // Find the reservation for preview
-    const reservation = await db.reservation.findUnique({
-      where: { id: payload.reservationId },
-      include: {
-        agency: { select: { id: true, name: true, nameAr: true, nameFr: true, category: true } },
-        service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
-        user: { select: { id: true, fullName: true } },
-      },
-    })
 
     if (!reservation) {
       if (clientIp) recordFailedRequest(clientIp)

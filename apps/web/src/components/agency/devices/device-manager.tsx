@@ -60,6 +60,8 @@ import {
 } from './types';
 import { LanMasterCard } from './lan-master-card';
 import { DeviceTreeCard } from './device-tree';
+// 0.6.105 — dedicated Paired-PC section (realtime master PC + queue counters)
+import { PairedPCSection } from './paired-pc-section';
 import {
   type DeviceFormState,
   EditDeviceDialog, PairDeviceDialog, CommandDialog, ConfirmDialog,
@@ -147,6 +149,9 @@ export function DeviceManager() {
   const { scanState, discoveredDevices, serviceAvailable, startScan, stopScan } = useDiscoveryService(agencyId);
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<DeviceFilter>('ALL');
+  // 0.6.105 — owner-only per-branch filter for paired devices. Rendered ONLY
+  // when the agency has more than one branch; 'ALL' shows every branch.
+  const [branchFilter, setBranchFilter] = useState<string>('ALL');
 
   const [savedTvIps, setSavedTvIps] = useState<Set<string>>(new Set());
   const [defaultPrinterIp, setDefaultPrinterIp] = useState<string | null>(null);
@@ -287,6 +292,9 @@ export function DeviceManager() {
   const [tvQrOpen, setTvQrOpen] = useState(false);
 
   // ─── Derived ─────────────────────────────────────────────────────────────
+  // 0.6.105 — owner vs staff: the Paired-PC section scopes per branch for the
+  // owner and the branch filter only exists for owner accounts.
+  const isOwner = user?.role === 'AGENCY_OWNER' || user?.role === 'SUPER_ADMIN';
   // 0.6.104 — registered printers of the agency: the source list for the
   // per-kiosk "Default printer" selector (same GET the manager already runs,
   // filtered client-side by type like the KIOSK/PRINTER filter chips).
@@ -343,6 +351,15 @@ export function DeviceManager() {
       default: return devices.filter((d) => !['TV', 'DISPLAY', 'KIOSK', 'PRINTER'].includes(d.type));
     }
   }, [devices, filter]);
+
+  // 0.6.105 — the owner's per-branch paired-device filter (applies on top of
+  // the type/status chips; only ever non-ALL when the agency has >1 branch).
+  const branchFilteredDevices = useMemo(
+    () => (branchFilter === 'ALL'
+      ? filteredDevices
+      : filteredDevices.filter((d) => d.branchId === branchFilter)),
+    [filteredDevices, branchFilter],
+  );
 
   // ─── TV URLs ─────────────────────────────────────────────────────────────
   const buildTvUrl = useCallback((device: AgencyDevice | null, layout?: ScreenLayout) => {
@@ -1282,6 +1299,19 @@ export function DeviceManager() {
         {/* ── Branch PCs / LAN master ── */}
         <LanMasterCard agencyId={agencyId} lang={lang} />
 
+        {/* ── 0.6.105 — PAIRED PC DEVICES (realtime master + queue counters) ──
+            Staff: their branch only · Owner: per branch, honours the branch
+            filter below. The counters ride the same shared-queue list that the
+            master PC serializes. ── */}
+        <PairedPCSection
+          agencyId={agencyId}
+          lang={lang}
+          devices={devices}
+          branches={branches}
+          branchFilter={branchFilter}
+          isOwner={isOwner}
+        />
+
         {/* ── 0.6.100 — Branch DEVICE TREE (roles + status + pending pairings) ── */}
         <DeviceTreeCard
           agencyId={agencyId}
@@ -1404,6 +1434,31 @@ export function DeviceManager() {
               <span className={`ms-1.5 text-xs tabular-nums ${filter === chip.key ? 'opacity-80' : 'opacity-60'}`}>{chip.count}</span>
             </button>
           ))}
+
+          {/* 0.6.105 — OWNER-ONLY per-branch paired-device filter. Rendered
+              only when the agency has MORE THAN ONE branch (requirement). */}
+          {isOwner && branches.length > 1 && (
+            <div className="flex items-center gap-1.5 ms-auto">
+              <span className="text-xs text-muted-foreground whitespace-nowrap">
+                {getLocalizedString('الفرع:', 'Succursale :', 'Branch:', lang)}
+              </span>
+              <Select value={branchFilter} onValueChange={setBranchFilter}>
+                <SelectTrigger className="h-8 w-[170px] text-xs" aria-label={getLocalizedString('مرشّح الفرع', 'Filtre par succursale', 'Branch filter', lang)}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ALL" className="text-xs">
+                    {getLocalizedString('كل الفروع', 'Toutes les succursales', 'All branches', lang)}
+                  </SelectItem>
+                  {branches.map((b) => (
+                    <SelectItem key={b.id} value={b.id} className="text-xs">
+                      {getLocalizedName(b, lang)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </div>
 
         {/* ── Unified device grid ── */}
@@ -1425,7 +1480,7 @@ export function DeviceManager() {
               </CardContent></Card>
             ))}
           </div>
-        ) : filteredDevices.length === 0 ? (
+        ) : branchFilteredDevices.length === 0 ? (
           <Card className="border-dashed">
             <CardContent className="flex flex-col items-center gap-3 p-10 text-center">
               <div className="p-3 rounded-2xl bg-muted"><Search className="h-6 w-6 text-muted-foreground" /></div>
@@ -1446,7 +1501,7 @@ export function DeviceManager() {
           </Card>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {filteredDevices.map((device) => (
+            {branchFilteredDevices.map((device) => (
               <ManagerDeviceCard
                 key={device.id}
                 device={device}

@@ -108,6 +108,8 @@ const DEVICE_STATUSES = ['ONLINE', 'OFFLINE', 'PAIRING', 'DISABLED', 'UPDATING']
 // 0.6.105 — throttle for the /unpaired route's pairing-state backstop (the
 // cloud orphan-reconcile poll runs at most once every 15s across all callers).
 let _lastPairingStateCheckAt = 0
+// 0.6.110 — LAN pairing-state probe throttle (shares the 15s cadence).
+let _lastLanPairingStateCheckAt = 0
 
 // Hand-rolled validators (zod is not available in the local API). They accept
 // exactly the same values as the cloud zod schemas and return
@@ -1210,6 +1212,30 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
               })
               clearTimeout(offerTimer)
               const offerData = await offerRes.json().catch(() => null)
+              // 0.6.110 — ALREADY-PAIRED RECONCILE: the target reports it is
+              // bound to THIS agency → our orphan row missed its accept
+              // callback at some point (manager rebooting at accept time).
+              // Settle it right here so the pair becomes visible without any
+              // re-pairing round-trip — fully offline, device-to-device.
+              if (offerData && offerData.alreadyPaired && offerData.pairing
+                  && String((offerData.pairing.agencyId || '')) === String(agency.id)) {
+                try {
+                  const nowP = new Date()
+                  await db.agencyDevice.update({
+                    where: { id: device.id },
+                    data: {
+                      agencyId: agency.id,
+                      status: 'ONLINE',
+                      statusChangedAt: nowP,
+                      connectedAt: device.createdAt || nowP,
+                      lastHeartbeatAt: nowP,
+                    },
+                  })
+                  broadcastSafe('agency-device:connected', { agencyId: agency.id, deviceId: device.id, deviceName: device.name, deviceType: device.type, reconciled: true, via: 'already-paired-offer-response' })
+                  deviceEvents.deviceEvent('pairing_reconciled', 'Already-paired target reconciled from the pairing-offer response: ' + (device.name || device.id), { deviceId: device.id, deviceName: device.name, deviceType: device.type, status: 'ONLINE' })
+                  return 'reconciled'
+                } catch { /* fall through to the plain result */ }
+              }
               return !!(offerData && offerData.success)
             } catch { return false }
           })()
@@ -2208,6 +2234,62 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         }
       } catch (backstopErr) {
         if (diagLog) diagLog('AGENCY-DEVICE pairing-state backstop skipped: ' + (backstopErr && backstopErr.message))
+      }
+
+      // 0.6.110 — LAN PAIRING-STATE RECONCILE (offline backstop): the accept
+      // callback (target → manager, device-to-device) is the primary binding
+      // path now, but it can be missed (manager busy/rebooting at accept
+      // time, older target build). Throttled (once / 15s) probe each orphan's
+      // own local API (/api/discover now carries a `pairing` signal) and
+      // settle rows the target reports bound to THIS agency — fully offline,
+      // no cloud involved. Runs alongside the cloud backstop below so BOTH
+      // transports heal missed pairs.
+      try {
+        const orphansLan = devices.filter((d) => d.deviceFingerprint && d.ipAddress && d.port)
+        if (orphansLan.length > 0 && Date.now() - _lastLanPairingStateCheckAt > 15000) {
+          _lastLanPairingStateCheckAt = Date.now()
+          const sessionAgency = requireAgencyId(c)
+          await Promise.all(orphansLan.slice(0, 8).map(async (orphan) => {
+            try {
+              const ctl = new AbortController()
+              const timer = setTimeout(() => ctl.abort(), 2000)
+              const res = await fetch(`http://${orphan.ipAddress}:${orphan.port}/api/discover`, { signal: ctl.signal })
+              clearTimeout(timer)
+              if (!res.ok) return
+              const data = await res.json().catch(() => null)
+              if (!data || data.service !== 'blasti-local') return
+              if (!data.pairing || data.pairing.paired !== true) return
+              if (String(data.pairing.agencyId || '') !== String(sessionAgency)) return
+              // Identity guard: the probe must be the SAME machine the row
+              // describes (fingerprint match when both sides know it).
+              if (data.uid && orphan.deviceFingerprint && String(data.uid) !== String(orphan.deviceFingerprint)) return
+              const nowR = new Date()
+              await db.agencyDevice.update({
+                where: { id: orphan.id },
+                data: {
+                  agencyId: sessionAgency,
+                  status: 'ONLINE',
+                  statusChangedAt: nowR,
+                  connectedAt: orphan.createdAt || nowR,
+                  lastHeartbeatAt: nowR,
+                },
+              }).catch(() => null)
+              broadcastSafe('agency-device:connected', {
+                agencyId: sessionAgency,
+                deviceId: orphan.id,
+                deviceName: orphan.name,
+                deviceType: orphan.type,
+                reconciled: true,
+                via: 'lan-pairing-state-probe',
+              })
+              deviceEvents.deviceEvent('pairing_reconciled',
+                'LAN pairing-state probe reconciled: ' + (orphan.name || orphan.id),
+                { deviceId: orphan.id, deviceName: orphan.name, deviceType: orphan.type, status: 'ONLINE' })
+            } catch { /* unreachable — the next sweep retries */ }
+          }))
+        }
+      } catch (lanBackstopErr) {
+        if (diagLog) diagLog('AGENCY-DEVICE lan pairing-state backstop skipped: ' + (lanBackstopErr && lanBackstopErr.message))
       }
 
       // Cloud merge (best-effort — an offline desktop just sees local orphans).

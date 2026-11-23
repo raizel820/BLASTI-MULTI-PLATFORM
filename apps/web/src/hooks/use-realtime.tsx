@@ -32,6 +32,11 @@ import { wasTurnAlertDismissedNatively } from '@/lib/notification-channel'
 import { getNativeCloudUrl, ensureNativeCloudUrl, onNativeCloudStateChange } from '@/lib/native-cloud-resolver'
 // 0.6.107 — the pinned branch desktop (device-to-device realtime for kiosks).
 import { getKioskLanBase } from '@/lib/kiosk-lan-base'
+// 0.6.110 — LAN-authority follower repoint: when a counter PC / tablet JOINS
+// a branch master (offline multi-counter), the socket singleton must ride the
+// MASTER's local Socket.IO with the per-device lanToken — otherwise follower
+// counters never receive queue:called pushes while offline.
+import { getLanAuthorityOverride, getLanAuthorityLanToken, onLanAuthorityChange } from '@/lib/lan-authority-client'
 import { handleRealtimeCacheEvent } from '@/lib/realtime-cache-invalidation'
 // 0.6.91 — device event stream: realtime connect/disconnect is now visible
 // in the Logs Manager "Devices" tab for web AND mobile (this hook runs in the
@@ -113,6 +118,20 @@ function isDirectRealtimeHost(h: string): boolean {
 }
 
 function resolveSocketUrl(): string {
+  // 0.6.110 — LAN-AUTHORITY OVERRIDE FIRST (checked before the platform
+  // defaults): a device JOINED to a branch master as a follower — another
+  // counter PC (Electron), a staff tablet (Capacitor) or a browser session —
+  // must point its socket at the MASTER's local Socket.IO (http://<ip>:3080),
+  // exactly like its API base. Without this the follower desktop kept its
+  // socket on its own follower local API (which emits no queue events) and
+  // browser followers stayed on the unreachable cloud — offline counters
+  // never saw live queue pushes.
+  // A MASTER desktop has no override state (its own discovery path never
+  // joins itself), so the common single-PC case is unchanged.
+  const lanOverride = typeof window !== 'undefined' ? getLanAuthorityOverride() : null
+  if (lanOverride) {
+    return lanOverride.baseUrl
+  }
   // Electron: connect to the LOCAL API socket server (local-first; offline-capable)
   if (isElectronPlatform()) {
     return 'http://127.0.0.1:3080'
@@ -156,9 +175,16 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
   // Handshake credential: for the LOCAL server (Electron), the JWT session
   // token is the right credential — prefer it over the shared realtime secret.
   // Capacitor/web keep the previous precedence (env token first).
-  const authToken = isElectronPlatform()
-    ? useAppStore.getState().sessionToken || process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
-    : process.env.NEXT_PUBLIC_REALTIME_TOKEN || useAppStore.getState().sessionToken || ''
+  // 0.6.110 — while the LAN-authority override is ACTIVE the credential is
+  // the per-device lanToken (`blan-…`): the master's local Socket.IO verifies
+  // it against its join registry and resolves the follower's agency scope,
+  // so join:agency works for offline follower counters. The `auth` upgrade
+  // on every connect (below) re-evaluates this mid-session as well.
+  const lanToken = getLanAuthorityLanToken()
+  const authToken = lanToken
+    || (isElectronPlatform()
+      ? useAppStore.getState().sessionToken || process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
+      : process.env.NEXT_PUBLIC_REALTIME_TOKEN || useAppStore.getState().sessionToken || '')
 
   const baseOptions: Parameters<typeof io>[1] = {
     path: '/socket.io',
@@ -262,6 +288,26 @@ export function repointRealtimeToLanBase(url: string): void {
     if (typeof window === 'undefined') return
     repointGlobalSocket(url)
   } catch { /* never break the caller */ }
+}
+
+// 0.6.110 — FOLLOW THE LAN AUTHORITY: repoint the already-allocated socket
+// singleton whenever the LAN-authority override ACTIVATES (join / 409 hint)
+// or CLEARS (master lost / expired) — the socket must always target the same
+// server the API base targets. The per-hook 'connect' handlers re-run their
+// room joins + auth upgrade after the repoint reconnects, so a follower
+// counter is back in its agency room within one reconnect cycle.
+if (typeof window !== 'undefined') {
+  onLanAuthorityChange(() => {
+    try {
+      const override = getLanAuthorityOverride()
+      if (override) {
+        repointGlobalSocket(override.baseUrl)
+      } else {
+        const fallbackUrl = resolveSocketUrl()
+        if (fallbackUrl) repointGlobalSocket(fallbackUrl)
+      }
+    } catch { /* repoint must never break the authority */ }
+  })
 }
 
 function releaseSocket(): void {
@@ -370,7 +416,13 @@ export function useRealtime(options?: UseRealtimeOptions) {
         // rejected, so the dashboard never entered its agency room and the
         // UI only updated on a manual refresh. socket.io delivers events in
         // emit order, so auth lands before the joins below.
-        const currentToken = useAppStore.getState().sessionToken || REALTIME_TOKEN
+        // 0.6.110 — while a LAN-authority override is active the credential
+        // is the per-device lanToken: the MASTER's socket server does not
+        // know this follower's cloud session, but it DOES know its join
+        // registry — the lanToken resolves the follower's agency scope.
+        const currentToken = getLanAuthorityLanToken()
+          || useAppStore.getState().sessionToken
+          || REALTIME_TOKEN
         if (currentToken) socket.emit('auth', { token: currentToken })
         // Re-join all rooms that were previously joined
         for (const room of joinedRoomsRef.current) {
@@ -469,7 +521,9 @@ export function useRealtime(options?: UseRealtimeOptions) {
   //   the session existed were rejected server-side and never retried, so
   //   the agency room stayed empty until a full page refresh.
   useEffect(() => {
-    const authToken = sessionToken || REALTIME_TOKEN
+    // 0.6.110 — lanToken preferred while the LAN-authority override is active
+    // (the master verifies it against its join registry).
+    const authToken = getLanAuthorityLanToken() || sessionToken || REALTIME_TOKEN
     const socket = socketRef.current
     if (!authToken || !socket) return
     socket.emit('auth', { token: authToken })
@@ -804,7 +858,11 @@ export function useAgencyRealtime(agencyId: string | null) {
       // as in useRealtime's onConnect (handshake auth is captured once;
       // a socket created before login must upgrade FIRST or the join is
       // rejected and no agency events ever arrive).
-      const currentToken = useAppStore.getState().sessionToken || REALTIME_TOKEN
+      // 0.6.110 — lanToken preferred while a LAN-authority override is
+      // active (the master's socket server verifies its own join registry).
+      const currentToken = getLanAuthorityLanToken()
+        || useAppStore.getState().sessionToken
+        || REALTIME_TOKEN
       if (currentToken) socket.emit('auth', { token: currentToken })
       // Re-join all tracked rooms
       for (const room of joinedRoomsRef.current) {

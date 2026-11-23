@@ -2,7 +2,9 @@
 
 // ─── Task 42-e: branches comparison + counters table (tabs) ─────────────────
 // Tabs: 'branches' — per-branch volume bars with no-show rate + avg wait;
-//       'counters' — table of the top 12 counters (served, avg service, branch).
+//       'counters' — table of the top 12 counters (served, avg service, branch);
+//       'liveLog' — 0.6.105 AGENCY-OWNER-ONLY live counter-operations stream
+//                   per branch (GET /api/agency/counter-log, owner-gated).
 
 import { useState } from 'react';
 import { useLanguage } from '@/hooks/use-language';
@@ -13,6 +15,8 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Building2, MonitorSpeaker } from 'lucide-react';
 import { ak } from './i18n-keys';
 import type { AnalyticsBranchRow, AnalyticsCounterRow } from './types';
+import { CounterLiveLog } from './counter-live-log';
+import { getLocalizedString } from '@/components/agency/devices/types';
 
 function rateChipClass(rate: number): string {
   if (rate < 5) return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400';
@@ -23,11 +27,18 @@ function rateChipClass(rate: number): string {
 export function BranchesCountersPanel({
   branches,
   counters,
+  // 0.6.105 — LIVE counter-operations log: rendered ONLY for the agency
+  // OWNER (the analytics shell passes it when the viewer owns the agency;
+  // the admin dashboard reuses this panel WITHOUT the flag → no tab).
+  showLiveLog = false,
+  agencyId = null,
 }: {
   branches: AnalyticsBranchRow[];
   counters: AnalyticsCounterRow[];
+  showLiveLog?: boolean;
+  agencyId?: string | null;
 }) {
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
   const [tab, setTab] = useState('branches');
 
   const safe = (v: unknown): number => (Number.isFinite(v as number) ? (v as number) : 0);
@@ -45,12 +56,21 @@ export function BranchesCountersPanel({
                 <Building2 className="h-4 w-4 text-white" />
               </div>
               <CardTitle className="text-sm font-semibold">
-                {tab === 'branches' ? t(ak('analyticsSection.branches.title')) : t(ak('analyticsSection.counters.title'))}
+                {tab === 'branches'
+                  ? t(ak('analyticsSection.branches.title'))
+                  : tab === 'counters'
+                    ? t(ak('analyticsSection.counters.title'))
+                    : getLocalizedString('سجل عمليات العدّادات المباشر', 'Journal direct des guichets', 'Live counter operations', lang)}
               </CardTitle>
             </div>
             <TabsList className="h-8">
               <TabsTrigger value="branches" className="text-xs px-2.5 h-7">{t('branches')}</TabsTrigger>
               <TabsTrigger value="counters" className="text-xs px-2.5 h-7">{t('counters')}</TabsTrigger>
+              {showLiveLog && (
+                <TabsTrigger value="liveLog" className="text-xs px-2.5 h-7">
+                  {getLocalizedString('سجل مباشر', 'Journal direct', 'Live Log', lang)}
+                </TabsTrigger>
+              )}
             </TabsList>
           </div>
         </CardHeader>
@@ -146,6 +166,16 @@ export function BranchesCountersPanel({
               </div>
             )}
           </TabsContent>
+
+          {/* 0.6.105 — AGENCY-OWNER-ONLY live counter-operations log per branch */}
+          {showLiveLog && (
+            <TabsContent value="liveLog" className="mt-0">
+              <CounterLiveLog
+                agencyId={agencyId}
+                branches={branchRows.map((b) => ({ branchId: b.branchId, name: b.name }))}
+              />
+            </TabsContent>
+          )}
         </CardContent>
       </Tabs>
     </Card>

@@ -358,7 +358,12 @@ function OwnerAnalyticsSectionShell() {
 // ─── Original overview dashboard (Task 42-e) — behavior unchanged ────────
 function OverviewDashboard() {
   const { t, lang } = useLanguage();
+  const user = useAppStore((s) => s.user);
   const { period, setPeriod, data, state, lastUpdatedAt, refresh } = useAnalyticsData();
+  // 0.6.105 — the "Branches & Counters → Live Log" tab exists ONLY for the
+  // agency OWNER (staff analytics render a different shell entirely;
+  // SUPER_ADMIN keeps support parity with the owner view).
+  const isOwnerViewer = user?.role === 'AGENCY_OWNER' || user?.role === 'SUPER_ADMIN';
 
   const refreshedAtCaption = (() => {
     if (!lastUpdatedAt) return null;
@@ -496,7 +501,12 @@ function OverviewDashboard() {
               <ServiceBreakdown services={data.services} />
             </div>
             <div className="min-w-0">
-              <BranchesCountersPanel branches={data.branches} counters={data.counters} />
+              <BranchesCountersPanel
+                branches={data.branches}
+                counters={data.counters}
+                showLiveLog={isOwnerViewer}
+                agencyId={user?.agencyId ?? null}
+              />
             </div>
           </div>
 

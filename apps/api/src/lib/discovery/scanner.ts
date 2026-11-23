@@ -212,10 +212,15 @@ const PING_TIMEOUT_MS = 400
 // port sweep drains ~5× faster; LAN servers answer headers in <100ms anyway.
 const HTTP_CONCURRENCY = 48
 const HTTP_TIMEOUT_MS = 800
-// 0.6.74 speed pass: mDNS/SSDP answer within ~2.5s on real networks; 3s keeps
-// a margin for standby TVs without lengthening the total scan.
-const MDNS_TIMEOUT_MS = 3000
-const SSDP_TIMEOUT_MS = 3000
+// 0.6.108 — 3s missed standby TVs on lossy WiFi: multicast query packets are
+// sent at the basic rate and get dropped, and eco-standby TVs wake their
+// network stack only after the first hit (which is why Chrome — a 5s window
+// with retransmits — discovered the TV while BLASTI did not). 5s + 3 query
+// waves (0s / 1s / 2.5s) cover both loss and wake-up latency; both windows
+// still run CONCURRENTLY with the ping/TCP/beacon sweeps inside the 25s
+// scan deadline.
+const MDNS_TIMEOUT_MS = 5000
+const SSDP_TIMEOUT_MS = 5000
 
 // TCP-connect sweep ('tcp-sweep' phase) — Windows PCs drop ICMP and run
 // nothing on the HTTP scan ports; their hallmark services (SMB 445, RDP 3389,
@@ -230,8 +235,12 @@ const TCP_SWEEP_CONCURRENCY = 192
 // only unreachable hosts ever hit the ceiling, and they cost the sweep 128
 // sockets in parallel anyway.
 const TCP_SWEEP_TIMEOUT_MS = 700
-/** Hard cap on the whole tcp-sweep window (all subnets × all ports). */
-const TCP_SWEEP_MAX_WINDOW_MS = 9000
+/** Hard cap on the whole tcp-sweep window (all subnets × all ports).
+ *  0.6.108 — 9s silently truncated the sweep on WiFi networks where silent
+ *  hosts burn the full 700ms timeout each: with IP-major ordering the TVs
+ *  late in the DHCP range never got their cast ports probed. 15s keeps the
+ *  sweep inside the 25s scan deadline (multicast phases run concurrently). */
+const TCP_SWEEP_MAX_WINDOW_MS = 15000
 
 /** TCP ports probed by the tcp-sweep phase and how a hit is classified.
  *  0.6.78: this set is the UNION of the old hallmark ports and SCAN_PORTS —
@@ -250,6 +259,17 @@ export const TCP_SWEEP_PORTS: Array<{ port: number; service: string }> = [
   { port: 8001, service: 'samsung-tv' },// Samsung TV
   { port: 8008, service: 'googlecast' },// Chromecast / Android TV
   { port: 8009, service: 'googlecast' },// Chromecast / Android TV
+  // 0.6.108 — local Algerian TV brands (IRIS / Stream System / Condor / Enie
+  // / Thomson …) ship Android TV or Amlogic stacks with the remote/cast
+  // services below; without these ports the sets answered nothing we probed.
+  { port: 6466, service: 'androidtvremote' },   // Android TV remote v1 (Amlogic/Android TV)
+  { port: 6467, service: 'androidtvremote' },   // Android TV remote v2
+  { port: 10001, service: 'androidtv' },        // Android TV media/web service (TCL/Hisense/IRIS)
+  { port: 5555, service: 'adb' },               // ADB — exposed on many Android TV sets
+  { port: 8002, service: 'samsung-tv' },        // Samsung legacy cast
+  { port: 52235, service: 'samsung-tv' },       // Samsung 2016+ (SmartView)
+  { port: 55000, service: 'samsung-tv' },       // Samsung legacy
+  { port: 1925, service: 'philips-tv' },        // Philips jointSPACE (Vestel-based local sets)
   { port: 62078, service: 'ios-sync' }, // iPhone / iPad (lockdownd sync port)
   { port: 9100, service: 'jetdirect' }, // raw print / HP JetDirect
   { port: 8060, service: 'roku' },      // Roku TV (ECP)
@@ -331,6 +351,7 @@ const MDNS_SERVICE_TYPES = [
   '_googlecast._tcp.local',            // Chromecast / Android TV / Google TV
   '_android._tcp.local',               // Android (rarely advertised by OS — app-driven)
   '_androidtvremote._tcp.local',       // Android TV remote service
+  '_androidtvremote2._tcp.local',      // Android TV 11+ remote service (IRIS/Stream/Condor sets)
   '_apple-mobdev2._tcp.local',         // iPhone/iPad (companion link)
   '_companion-link._tcp.local',        // Apple companion link (iOS handoff)
   '_smb._tcp.local',                   // file shares (Windows / macOS / Linux)
@@ -1010,22 +1031,41 @@ export async function tcpSweep(
   const onProgress = opts.onProgress ?? (() => {})
   const skipServicesFor = opts.skipServicesFor
 
-  const jobs: Array<{ ip: string; port: number; service: string }> = []
+  const jobs: Array<{ ip: string; port: number; service: string; tier: number }> = []
+  // 0.6.108 — PRIORITY-TIER PORT-MAJOR ordering. The old loop was IP-major:
+  // every port of ip #1, then ip #2 … On WiFi networks full of silent hosts
+  // (each burning the full 700ms timeout) the window cap cut the sweep deep
+  // into the range — the TV at .107 never got its cast ports probed and
+  // stayed invisible while Chrome (own mDNS stack) found it. The queue is
+  // ordered PORT-major in two tiers: cast/TV/printer/Windows hallmarks for
+  // EVERY IP first, then the generic HTTP tail — the window cap can now only
+  // ever cut the low-value tail, never a TV.
+  const PRIORITY_SERVICES = new Set([
+    'googlecast', 'airplay', 'roku', 'samsung-tv', 'androidtvremote',
+    'androidtv', 'adb', 'philips-tv',
+    'jetdirect', 'ipp', 'wsd', 'ios-sync', 'smb', 'rdp', 'blasti-api',
+  ])
   for (const subnet of subnets) {
     for (let i = 1; i <= 254; i++) {
       const ip = `${subnet}.${i}`
       const skipped = skipServicesFor?.get(ip)
       for (const target of TCP_SWEEP_PORTS) {
         if (skipped?.has(target.service)) continue
-        jobs.push({ ip, port: target.port, service: target.service })
+        jobs.push({
+          ip, port: target.port, service: target.service,
+          tier: PRIORITY_SERVICES.has(target.service) ? 0 : 1,
+        })
       }
     }
   }
+  // Stable sort (ES2019 Array.prototype.sort is stable) keeps IP order within
+  // each tier so the progress UI stays deterministic.
+  jobs.sort((a, b) => a.tier - b.tier)
 
   const deadline = Date.now() + maxWindowMs
   const hits: TcpSweepHit[] = []
   const seen = new Set<string>()
-  const queue = [...jobs]
+  const queue = jobs
 
   async function worker() {
     while (queue.length > 0) {
@@ -1055,9 +1095,16 @@ export interface MdnsRecord {
   port: number
   name: string
   serviceType: string
+  /** 0.6.108 — record kind ('A' | 'PTR' | 'SRV' | 'TXT'); part of the dedupe
+   *  key so PTR and TXT for the same (ip, service) no longer overwrite
+   *  each other. */
+  kind?: 'A' | 'PTR' | 'SRV' | 'TXT'
   txt?: Record<string, string>
   /** Human-friendly instance/model name correlated from TXT/SRV records. */
   instanceName?: string
+  /** SRV host label (first label of the SRV target) — correlates A records
+   *  with the TXT instance map in the post-pass. */
+  hostLabel?: string
 }
 
 /**
@@ -1102,11 +1149,13 @@ export async function mdnsQuery(
   const hostByInstance = new Map<string, string>()
 
   return new Promise((resolve) => {
-    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+    let sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
     let closed = false
+    const waveTimers: NodeJS.Timeout[] = []
     const cleanup = () => {
       if (closed) return
       closed = true
+      for (const t of waveTimers) { try { clearTimeout(t) } catch { /* ignore */ } }
       try { sock.close() } catch { /* ignore */ }
       // Post-pass: enrich A records with the TXT/SRV-derived instance names.
       // An A record for "Living-Room-TV.local" picks up the friendly/model
@@ -1131,34 +1180,31 @@ export async function mdnsQuery(
       resolve(records)
     }
 
-    sock.on('error', () => cleanup())
-    sock.on('message', (msg, rinfo) => {
+    const onMessage = (msg: Buffer, rinfo: dgram.RemoteInfo) => {
       const parsed = parseMdnsResponse(msg)
       for (const rec of parsed) {
         rec.ip = rec.ip || rinfo.address
-        const key = `${rec.ip}:${rec.port}:${rec.serviceType}`
+        // 0.6.108 — dedupe key includes the record KIND: PTR and TXT for the
+        // same (ip, service) share `ip:0:service` and used to overwrite each
+        // other (the TXT — carrying the TV model name — was silently dropped).
+        const key = `${rec.ip}:${rec.port}:${rec.serviceType}:${rec.kind ?? ''}`
         if (!seen.has(key)) {
           seen.add(key)
           records.push(rec)
         }
         // Build the correlation maps while records stream in
-        if (rec.serviceType === 'TXT' && rec.txt) {
-          const instance = rec.name.split('.')[0]
-          if (instance) txtByInstance.set(instance, rec.txt)
-        } else if (rec.serviceType !== 'A' && rec.serviceType !== 'TXT') {
-          // PTR: name is the service type, "serviceType" holds the instance
-          // target; SRV: name is the instance, "name"-target embedded — both
-          // carry instance labels worth mapping.
-          const instanceLabel = (rec.serviceType && rec.serviceType.includes('.') ? rec.serviceType : rec.name).split('.')[0]
-          const hostLabel = rec.name.split('.')[0]
-          if (instanceLabel && hostLabel && instanceLabel !== hostLabel) {
-            hostByInstance.set(instanceLabel, hostLabel)
-          }
+        //  - TXT: instance label (first label of the record name) → TXT map
+        //    (carries the human model name: Chromecast md/fn, printer ty …)
+        //  - SRV: instance → host label (the A-record post-pass joins them)
+        if (rec.kind === 'TXT' && rec.txt && rec.instanceName) {
+          txtByInstance.set(rec.instanceName, rec.txt)
+        } else if (rec.kind === 'SRV' && rec.instanceName && rec.hostLabel && rec.instanceName !== rec.hostLabel) {
+          hostByInstance.set(rec.instanceName, rec.hostLabel)
         }
       }
-    })
+    }
 
-    sock.bind(0, '0.0.0.0', () => {
+    const onBound = () => {
       // FIX (Task 2-b): without joining the 224.0.0.251 multicast group the
       // OS silently drops the RESPONSES — only QU (unicast-response) devices
       // were ever seen. Join on every relevant interface (best-effort — some
@@ -1171,23 +1217,75 @@ export async function mdnsQuery(
       if (joined === 0) {
         try { sock.addMembership(MDNS_ADDR) } catch { /* ignore */ }
       }
-      // Build a DNS-SD PTR query for each requested service type
-      for (const st of serviceTypes) {
-        const query = buildMdnsQuery(st)
-        try {
-          sock.send(query, 0, query.length, MDNS_PORT, MDNS_ADDR)
-        } catch { /* ignore */ }
+      // 0.6.108 — send the query wave THREE times (0s / 1s / 2.5s). RFC 6762
+      // §8.1 requires at least two transmissions; WiFi multicast loss plus
+      // standby wake-up latency made the old single wave miss TVs entirely
+      // (Chrome retransmits too — that is why it found the TV).
+      const sendWave = () => {
+        if (closed) return
+        for (const st of serviceTypes) {
+          const query = buildMdnsQuery(st)
+          try {
+            sock.send(query, 0, query.length, MDNS_PORT, MDNS_ADDR)
+          } catch { /* ignore */ }
+        }
       }
+      sendWave()
+      waveTimers.push(setTimeout(sendWave, 1000))
+      waveTimers.push(setTimeout(sendWave, 2500))
+    }
+
+    // 0.6.108 — BIND 5353 (not an ephemeral port). Devices that reply to mDNS
+    // queries with MULTICAST responses (QM behaviour — most smart TVs and
+    // Chromecast built-ins) send to 224.0.0.251:5353; an ephemeral-port socket
+    // can never receive them, which is the #1 reason Chrome discovered the TV
+    // and BLASTI did not. 5353 > 1024 needs no privileges and reuseAddr lets
+    // the app's own mDNS responder coexist. EADDRINUSE/EACCES fallback:
+    // ephemeral port (QU/unicast responders still reachable).
+    let bindRetried = false
+    sock.on('message', onMessage)
+    sock.on('error', (err: NodeJS.ErrnoException) => {
+      if (!bindRetried && err && /EADDRINUSE|EACCES/i.test(String(err.code || err))) {
+        bindRetried = true
+        try { sock.close() } catch { /* ignore */ }
+        sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+        sock.on('message', onMessage)
+        sock.on('error', () => cleanup())
+        sock.bind(0, '0.0.0.0', onBound)
+        return
+      }
+      cleanup()
     })
+    sock.bind(MDNS_PORT, '0.0.0.0', onBound)
 
     setTimeout(cleanup, timeoutMs)
     if (isAborted()) cleanup()
   })
 }
 
+/** 0.6.108 — derive the SERVICE type (e.g. `_googlecast._tcp.local`) from a
+ *  DNS record name. Instance records are `instance._service._proto.local` —
+ *  stripping the first label yields the service. Names already starting with
+ *  `_` ARE service types (PTR record names / direct service queries).
+ *  Returns '' when the name is not a service-shaped name. */
+function serviceFromRecordName(recordName: string | undefined): string {
+  const labels = String(recordName || '').split('.').filter(Boolean)
+  if (labels.length === 0) return ''
+  if (labels[0].startsWith('_')) return labels.join('.')
+  if (labels.length >= 2 && labels[1].startsWith('_')) return labels.slice(1).join('.')
+  return ''
+}
+
 /**
  * Minimal mDNS response parser. Extracts A, PTR, SRV, TXT records.
  * Returns at most one record per answer, with IP/port filled where available.
+ *
+ * 0.6.108 — every record now carries a `kind` (A/PTR/SRV/TXT) and, for
+ * PTR/SRV/TXT, the real SERVICE type (e.g. `_googlecast._tcp.local`). The old
+ * parser put the PTR target into `serviceType` and literal 'TXT'/'A' markers
+ * into TXT/A records, so the merged device's `mdnsService` ended up as
+ * 'TXT'/'A'/an-instance-name — the googlecast evidence was DESTROYED before
+ * classification ever saw it (whitelist mdnsHit + TV typing both failed).
  */
 function parseMdnsResponse(msg: Buffer): MdnsRecord[] {
   const records: MdnsRecord[] = []
@@ -1217,17 +1315,31 @@ function parseMdnsResponse(msg: Buffer): MdnsRecord[] {
     if (rtype === 1) {
       // A record: 4 bytes IPv4
       const ip = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`
-      records.push({ ip, port: 0, name, serviceType: 'A' })
+      records.push({ kind: 'A', ip, port: 0, name, serviceType: 'A' })
     } else if (rtype === 12) {
-      // PTR record: rdata is a DNS name
+      // PTR record: `name` is the queried SERVICE type, rdata is the instance
+      // target. 0.6.108: keep both — serviceType = service, name/instanceName
+      // = target.
       const target = readName(msg, rdataStart)
-      records.push({ ip: '', port: 0, name: target, serviceType: target })
+      records.push({
+        kind: 'PTR', ip: '', port: 0,
+        name: target,
+        serviceType: serviceFromRecordName(name) || target,
+        instanceName: target,
+      })
     } else if (rtype === 33) {
-      // SRV record: priority(2) + weight(2) + port(2) + target name
+      // SRV record: priority(2) + weight(2) + port(2) + target name.
+      // `name` = instance name, target = host name.
       if (rdata.length >= 6) {
         const port = rdata.readUInt16BE(4)
         const target = readName(msg, rdataStart + 6)
-        records.push({ ip: '', port, name: target, serviceType: name })
+        records.push({
+          kind: 'SRV', ip: '', port,
+          name: target,
+          serviceType: serviceFromRecordName(name) || name,
+          instanceName: name.split('.')[0] || undefined,
+          hostLabel: target.split('.')[0] || undefined,
+        })
       }
     } else if (rtype === 16) {
       // TXT record (RFC 6763): sequence of len-byte-prefixed key=value strings.
@@ -1246,7 +1358,13 @@ function parseMdnsResponse(msg: Buffer): MdnsRecord[] {
         if (eq > 0) txt[seg.slice(0, eq)] = seg.slice(eq + 1)
         else if (eq === -1 && seg) txt[seg] = '' // boolean flag entry
       }
-      records.push({ ip: '', port: 0, name, serviceType: 'TXT', txt })
+      records.push({
+        kind: 'TXT', ip: '', port: 0,
+        name,
+        serviceType: serviceFromRecordName(name) || 'TXT',
+        txt,
+        instanceName: name.split('.')[0] || undefined,
+      })
     }
 
     offset = rdataStart + rdlength
@@ -1269,10 +1387,17 @@ function buildMdnsQuery(serviceType: string): Buffer {
   }
   qnameParts.push(Buffer.from([0])) // root label
   const qname = Buffer.concat(qnameParts)
-  // QTYPE=12 (PTR), QCLASS=1 (IN) + cache-flush bit (0x8000) for mDNS
+  // QTYPE=12 (PTR), QCLASS=0x0001 (IN, standard QM — multicast response).
+  // 0.6.108 — the old 0x8001 QU bit asked responders to UNICAST the answer
+  // to our source port; with the query socket now bound to :5353 (shared
+  // with the app's own mDNS responder) Windows can hand that unicast reply
+  // to the WRONG socket and the TV is lost again. Standard QM queries make
+  // every responder answer via multicast 224.0.0.251:5353, which is
+  // delivered to ALL sockets joined to the group — exactly how Chrome's
+  // discovery works (that's why Chrome found the TV and BLASTI did not).
   const qtail = Buffer.alloc(4)
   qtail.writeUInt16BE(12, 0)
-  qtail.writeUInt16BE(0x8001, 2)
+  qtail.writeUInt16BE(0x0001, 2)
   return Buffer.concat([header, qname, qtail])
 }
 
@@ -3101,6 +3226,9 @@ export interface FingerprintResult {
   confidence: number
   /** 0.6.78 — the evidence source behind the strongest identity signal. */
   identitySource: string
+  /** 0.6.108 — brand detected from TV_BRANDS (Algerian market first); filled
+   *  into the device's manufacturer field when it has none of its own. */
+  manufacturer?: string
 }
 
 /** Input signals for the classifier — one row per discovery-signal source. */
@@ -3139,6 +3267,10 @@ export interface FingerprintInput {
   /** Kept for parity with the CommonJS port — usually unset; callers pass
    *  the self-advertised name via upnpFriendlyName instead. */
   friendlyName?: string
+  /** 0.6.108 — optional model hint consumed by the TV-brand detector (the
+   *  CommonJS port reads the same field); usually unset — callers pass the
+   *  UPnP model via upnpModelName instead. */
+  model?: string
 }
 
 /**
@@ -3179,7 +3311,59 @@ export interface FingerprintInput {
  * `usbSource` is set when this fingerprint is for a USB / CUPS local printer
  * (not on the network) — the category becomes LOCAL with type PRINTER.
  */
-function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCategory; type: DeviceType; name: string } {
+// ─── 0.6.108 — TV BRAND VOCABULARY (Algerian market first) ──────────────
+// USER REQUIREMENT: "TV discovery protocols must support the local Algerian
+// brands like IRIS (اريس), Stream System (ستريم) and others." Most local
+// sets are Android TV (Chromecast built-in) or DLNA-only Linux stacks — the
+// protocol fixes (mDNS :5353 bind, query waves, TCP port tiers) are what
+// actually REACH them; this table makes the RESULT read "IRIS TV" /
+// "Stream System TV" instead of "Smart TV @ ip" and fills manufacturer.
+const TV_BRANDS = [
+  // Algerian / Maghreb market brands
+  'iris', 'stream system', 'stream', 'condor', 'enie', 'thomson', 'nasco',
+  'histar', 'cemax', 'saturn', 'newstar',
+  // Global brands commonly sold locally
+  'skyworth', 'haier', 'hisense', 'tcl', 'vestel', 'telefunken',
+  'schneider', 'polaroid', 'saba', 'logik', 'vitron', 'toshiba',
+]
+// Generic platform keywords — LOWER priority than real brands: a TV named
+// "Condor Android TV" must read "Condor", not "Android TV".
+const TV_PLATFORM_KEYWORDS = ['android tv', 'google tv', 'chromecast', 'xiaomi tv', 'mi tv']
+
+/** Display-casing exceptions (brands that read best in fixed casing). */
+const TV_BRAND_DISPLAY: Record<string, string> = {
+  iris: 'IRIS', tcl: 'TCL', saba: 'SABA', enie: 'Enie',
+  'android tv': 'Android TV', 'google tv': 'Google TV',
+  'xiaomi tv': 'Xiaomi TV', 'mi tv': 'Mi TV', chromecast: 'Chromecast',
+}
+
+/** Match the LONGEST keyword of `list` in `text` (word boundaries for
+ *  single words, substring for multi-word) — or null. */
+function matchTvKeyword(list: string[], s: string): string | null {
+  let best: string | null = null
+  for (const kw of list) {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = kw.includes(' ') ? new RegExp(escaped) : new RegExp(`\\b${escaped}\\b`)
+    if (re.test(s) && (!best || kw.length > best.length)) best = kw
+  }
+  return best
+}
+
+/** Detect the TV brand from any combination of name signals. Real brands
+ *  (Algerian market first) always beat generic platform keywords. */
+function detectTvBrand(text: string | undefined): string | undefined {
+  const s = String(text || '').toLowerCase()
+  if (!s) return undefined
+  const kw = matchTvKeyword(TV_BRANDS, s) || matchTvKeyword(TV_PLATFORM_KEYWORDS, s)
+  if (!kw) return undefined
+  if (TV_BRAND_DISPLAY[kw]) return TV_BRAND_DISPLAY[kw]
+  return kw
+    .split(' ')
+    .map((w) => (w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)))
+    .join(' ')
+}
+
+function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCategory; type: DeviceType; name: string; manufacturer?: string } {
   // ── USB / CUPS local printer — never on the network ──
   if (input.usbSource) {
     const vendor = input.usbManufacturer || input.upnpManufacturer
@@ -3243,6 +3427,12 @@ function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCateg
   // "Device @ IP" / "Printer @ IP" / "TV @ IP" placeholders.
   // Priority: DHCP hostname (phones) > reverse-DNS (router DNS) > NetBIOS.
   const bestSecondaryName = safeDhcpName || safeReverseDnsName || safeNetbiosName
+  // 0.6.108 — brand hint from every name signal (Algerian brands first).
+  const tvBrand = detectTvBrand([
+    safeFriendlyName, bestSecondaryName,
+    input.upnpModelName, input.upnpManufacturer,
+    input.httpTitle, input.model,
+  ].filter(Boolean).join(' ')) || undefined
 
   // Detect a randomized / locally-administered MAC. Since Android 10 and
   // iOS 14, phones randomize their WiFi MAC per network. This means the OUI
@@ -3359,10 +3549,14 @@ function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCateg
         ? (macInfo.vendor ? `${macInfo.vendor} AirPlay` : 'Apple TV/AirPlay')
         : undefined
   if (input.port === 8001 || input.port === 9197 || input.port === 8060) {
-    const name = safeFriendlyName || input.httpTitle || bestSecondaryName || tcpHintName || (macInfo.vendor ? `${macInfo.vendor} TV` : `Smart TV @ ${input.ip}`)
-    return { category: 'NETWORK', type: 'TV', name }
+    const name = safeFriendlyName || input.httpTitle || bestSecondaryName || tcpHintName
+      || (tvBrand ? `${tvBrand} TV` : undefined)
+      || (macInfo.vendor ? `${macInfo.vendor} TV` : `Smart TV @ ${input.ip}`)
+    return { category: 'NETWORK', type: 'TV', name, manufacturer: tvBrand }
   }
   // mDNS cast / media-renderer services → TV or streaming stick
+  // 0.6.108 — `_androidtvremote(2)` joined the list (Android TV 11+ sets);
+  // brand naming + manufacturer from TV_BRANDS (Algerian market first).
   if (
     joined.includes('airplay') ||
     joined.includes('googlecast') ||
@@ -3372,15 +3566,18 @@ function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCateg
     joined.includes('_samsung._tcp') ||
     joined.includes('_lg_dial') ||
     joined.includes('_leap._tcp') ||
-    joined.includes('_spotify-connect')
+    joined.includes('_spotify-connect') ||
+    joined.includes('_androidtvremote')
   ) {
-    const name = safeFriendlyName || bestSecondaryName || (macInfo.vendor ? `${macInfo.vendor} TV` : `Smart TV @ ${input.ip}`)
-    return { category: 'NETWORK', type: 'TV', name }
+    const name = safeFriendlyName || bestSecondaryName
+      || (tvBrand ? `${tvBrand} TV` : undefined)
+      || (macInfo.vendor ? `${macInfo.vendor} TV` : `Smart TV @ ${input.ip}`)
+    return { category: 'NETWORK', type: 'TV', name, manufacturer: tvBrand }
   }
-  // mDNS _androidtvremote → Android TV
+  // mDNS _androidtvremote → Android TV (kept for the Android TV naming)
   if (joined.includes('_androidtvremote') || joined.includes('android tv')) {
-    const name = safeFriendlyName || bestSecondaryName || `Android TV @ ${input.ip}`
-    return { category: 'NETWORK', type: 'TV', name }
+    const name = safeFriendlyName || bestSecondaryName || (tvBrand ? `${tvBrand} TV` : `Android TV @ ${input.ip}`)
+    return { category: 'NETWORK', type: 'TV', name, manufacturer: tvBrand }
   }
 
   // ── 5. Phone detection — mDNS service types that phones advertise ──
@@ -3451,6 +3648,21 @@ function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCateg
     if (tcpServices.includes('roku')) {
       const name = safeFriendlyName || bestSecondaryName || 'Roku TV'
       return { category: 'NETWORK', type: 'TV', name }
+    }
+    // 0.6.108 — Android TV / Samsung / Philips TCP hallmarks. IRIS, Stream
+    // System and Condor sets ship Android TV / Amlogic stacks whose remote
+    // and ADB ports are frequently the ONLY open evidence they expose.
+    if (tcpServices.includes('androidtvremote') || tcpServices.includes('androidtv') || tcpServices.includes('adb')) {
+      const name = safeFriendlyName || bestSecondaryName || (tvBrand ? `${tvBrand} TV` : 'Android TV')
+      return { category: 'NETWORK', type: 'TV', name, manufacturer: tvBrand }
+    }
+    if (tcpServices.includes('samsung-tv')) {
+      const name = safeFriendlyName || bestSecondaryName || (tvBrand ? `${tvBrand} TV` : 'Samsung TV')
+      return { category: 'NETWORK', type: 'TV', name, manufacturer: tvBrand || 'Samsung' }
+    }
+    if (tcpServices.includes('philips-tv')) {
+      const name = safeFriendlyName || bestSecondaryName || (tvBrand ? `${tvBrand} TV` : 'Philips TV')
+      return { category: 'NETWORK', type: 'TV', name, manufacturer: tvBrand || 'Philips' }
     }
     if (tcpServices.includes('jetdirect')) {
       const name = safeFriendlyName || bestSecondaryName || (macInfo.vendor ? `${macInfo.vendor} Printer` : 'Network Printer')
@@ -3662,6 +3874,27 @@ export function fingerprintDevice(input: FingerprintInput): FingerprintResult {
   return { ...cls, confidence, identitySource }
 }
 
+// ─── 0.6.108 — mDNS SERVICE UNION ──────────────────────────────────────────
+
+/**
+ * mDNS services accumulate across merges (PTR/SRV/TXT/A records from the same
+ * device arrive in separate packets). 'A'/'TXT'/'SRV' are raw record-kind
+ * markers, not services — they never shadow a real `_service._proto.local`
+ * name. Returns undefined when neither side carries a real service.
+ */
+function mergeMdnsServices(a?: string, b?: string): string | undefined {
+  const parts = new Set<string>()
+  for (const v of [a, b]) {
+    const s = String(v || '').trim()
+    if (!s) continue
+    for (const part of s.split(',')) {
+      const t = part.trim()
+      if (t && t !== 'A' && t !== 'TXT' && t !== 'SRV') parts.add(t)
+    }
+  }
+  return parts.size > 0 ? Array.from(parts).join(', ') : undefined
+}
+
 // ─── 0.6.99 — SIGNAL-BACKED DEVICE WHITELIST ─────────────────────────────────
 
 /**
@@ -3715,9 +3948,12 @@ export function isSignalBackedDevice(d: {
 
   // ── 2. TVs / displays must have ANSWERED a TV discovery signal ──
   if (type === 'TV' || type === 'DISPLAY') {
-    const mdnsHit = !!mdns && /googlecast|airplay|roku|_rimedia|_samsung|_tcl|_viera|_bravia|_webos|_androidtv|_firetv|_firestick|_dial|_tv\./.test(mdns)
+    // 0.6.108 — `_philips` + `androidtvremote` patterns join the mdns set;
+    // `androidtv` / `adb` / `philips-tv` join the TCP hallmarks (the open
+    // evidence Algerian-market IRIS / Stream System / Condor sets expose).
+    const mdnsHit = !!mdns && /googlecast|airplay|roku|_rimedia|_samsung|_tcl|_viera|_bravia|_webos|_androidtv|_firetv|_firestick|_dial|_philips|_tv\./.test(mdns)
     const ssdpHit = !!ssdpSt && /(media|avtransport|dial|screen|tv|display)/.test(ssdpSt)
-    const tcpHit = tcp.some((s) => /googlecast|airplay|roku|samsung-tv/.test(s))
+    const tcpHit = tcp.some((s) => /googlecast|airplay|roku|samsung-tv|androidtv|philips-tv|adb/.test(s))
     // An HTTP response is also a signal (the TV answered our probe) — but an
     // OUI-only guess with zero responses never reaches the manager.
     const httpHit = !!(d.httpTitle || d.httpServer || d.httpUrl || d.ssdpLocation)
@@ -3821,6 +4057,10 @@ export async function runDiscoveryScan(
         // Union the TCP-sweep services — later merges (HTTP probe, names)
         // don't carry them and must never erase a confirmed service.
         tcpServices: Array.from(new Set([...(existing.tcpServices || []), ...(patch.tcpServices || [])])),
+        // 0.6.108 — UNION mDNS services (never overwrite): the old single-slot
+        // field let a later TXT/A record ('TXT'/'A') erase `_googlecast…` —
+        // the TV then lost its only mdns evidence before classification.
+        mdnsService: mergeMdnsServices(existing.mdnsService, patch.mdnsService),
       }
       // Re-fingerprint with merged signals. Use the preserved raw friendlyName
       // (NOT merged.name, which may be a placeholder or HTTP title) so the
@@ -3848,6 +4088,9 @@ export async function runDiscoveryScan(
       // so they're always replaced by any real name (even a placeholder).
       // Use >= so a fingerprint refresh can fix capitalisation / cleanup.
       merged.name = nameQuality(fp.name) >= nameQuality(existing.name) ? fp.name : existing.name
+      // 0.6.108 — brand detection (IRIS / Stream / Condor …) fills an empty
+      // manufacturer from the fingerprint pass without overwriting real data.
+      merged.manufacturer = merged.manufacturer || fp.manufacturer || undefined
       devicesByIp.set(ip, merged)
       cb.onDevice(merged)
     } else {
@@ -3912,6 +4155,8 @@ export async function runDiscoveryScan(
       device.identitySourcePriority = fp.confidence
       // Use the fingerprint's name if it's higher quality than the patch name.
       if (nameQuality(fp.name) > nameQuality(device.name)) device.name = fp.name
+      // 0.6.108 — same brand fill as the merge path (manufacturer never downgraded).
+      device.manufacturer = device.manufacturer || fp.manufacturer || undefined
       devicesByIp.set(ip, device)
       cb.onDevice(device)
     }

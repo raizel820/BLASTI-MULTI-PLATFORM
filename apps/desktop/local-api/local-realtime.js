@@ -46,6 +46,10 @@ let _io = null
 let _getSession = null // () => ({ token, user } | null)
 let _getDb = null // () => local Prisma client | null (device room joins)
 let _getPreviousSessionToken = null // Task 41 — () => previous-token | null (rotation grace)
+// 0.6.110 — (token) => lan-authority device record | null. Lets a socket
+// presenting a follower's `blan-` per-device token authenticate as a scoped
+// synthetic user (multi-counter on one shared queue list, offline).
+let _verifyLanToken = null
 let _relayAgencyId = null // agency room the cloud relay targets
 let _startedAt = null
 
@@ -149,6 +153,25 @@ function authenticateToken(token) {
     const prev = _getPreviousSessionToken && _getPreviousSessionToken()
     if (prev && timingSafeTokenCompare(token, prev)) return session.user
   } catch { /* grace lookup is best-effort */ }
+  // 0.6.110 — LAN-follower device tokens (`blan-…`): a counter PC / tablet
+  // JOINED to this node as a LAN-authority follower is not THIS node's
+  // session, so the session compares above always failed and every room
+  // join was rejected — offline follower counters got NO queue pushes.
+  // Verify the token against the authority's device registry and resolve a
+  // synthetic user carrying the scope recorded at join time.
+  try {
+    const rec = _verifyLanToken && _verifyLanToken(token)
+    if (rec) {
+      return {
+        id: rec.userId || 'lan-device:' + rec.deviceId,
+        username: rec.username || rec.name || null,
+        role: rec.role || 'STAFF',
+        agencyId: rec.agencyId || null,
+        branchId: rec.branchId || null,
+        lanDeviceId: rec.deviceId,
+      }
+    }
+  } catch { /* fall through to rejection */ }
   return null
 }
 
@@ -401,6 +424,7 @@ function initLocalRealtime(httpServer, options) {
   _getSession = (options && options.getSession) || null
   _getDb = (options && options.getDb) || null
   _getPreviousSessionToken = (options && options.getPreviousSessionToken) || null
+  _verifyLanToken = (options && options.verifyLanToken) || null
 
   let ServerCtor
   try {
@@ -469,6 +493,8 @@ function closeLocalRealtime() {
   }
   _getSession = null
   _getDb = null
+  _getPreviousSessionToken = null
+  _verifyLanToken = null
   _relayAgencyId = null
 }
 

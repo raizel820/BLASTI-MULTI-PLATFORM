@@ -23,7 +23,7 @@
 const { Hono } = require('hono')
 const { cors } = require('hono/cors')
 const { createServer } = require('http')
-const { randomBytes, timingSafeEqual, createHash, scryptSync } = require('crypto')
+const { randomBytes, timingSafeEqual, createHash, scryptSync, createHmac } = require('crypto')
 const os = require('os')
 const { localDb, setupPragmas, ensureDatabaseReady } = require('./lib/db')
 const { adoptChildrenThenDelete } = require('./lib/stale-unique')
@@ -577,6 +577,8 @@ async function resolveAuthorityContext(explicitAgencyId) {
     userId: sessionUser.id,
     staffRow,
     staffId: staffRow ? staffRow.id : null,
+    // 0.6.105 — the staff's assigned branch (device-manager Paired-PC scope).
+    branchId: staffRow ? (staffRow.branchId || null) : null,
     role: isOwner ? 'OWNER' : (staffRow ? staffRow.role : null),
     permissions: isOwner ? allPermissionsTrue() : permissionsFromStaffRow(staffRow),
   }
@@ -1409,6 +1411,43 @@ function assignSession(token, user, source) {
 /**
  * Middleware that validates the session token and attaches user + db to context.
  */
+// ─── 0.6.108 — OFFLINE customer session verification (QR walk-in import) ────
+// A CUSTOMER phone on the branch WiFi imports a kiosk walk-in ticket by
+// POSTing its CLOUD session JWT to POST /api/reservations/import-walk-in on
+// this local API. The local requireAuth() only knows the desktop's own
+// session token + LAN device tokens, so without this helper the phone could
+// NEVER authenticate locally and the offline import was impossible (a hard
+// violation of the offline-first directive for kiosk flows).
+//
+// The cloud session JWT is HS256-signed with NEXTAUTH_SECRET (apps/api
+// lib/auth.ts — createSessionToken), and the desktop process already holds
+// that secret (it mints the QR import tokens with it), so we can verify the
+// customer's token FULLY OFFLINE with plain Node crypto — no cloud hop, no
+// new dependency. Only accepts HS256 (algorithm-confusion safe, mirroring the
+// cloud's `algorithms: ['HS256']` guard) and a non-expired `exp`.
+const CLOUD_JWT_FALLBACK_SECRET = 'blast1-d3v-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly'
+
+function verifyCustomerSessionJwtOffline(token) {
+  try {
+    const parts = String(token || '').split('.')
+    if (parts.length !== 3) return null
+    const [h64, p64, s64] = parts
+    const header = JSON.parse(Buffer.from(h64, 'base64url').toString('utf8'))
+    if (!header || header.alg !== 'HS256') return null
+    const secret = Buffer.from(process.env.NEXTAUTH_SECRET || CLOUD_JWT_FALLBACK_SECRET, 'utf8')
+    const expected = createHmac('sha256', secret).update(h64 + '.' + p64).digest('base64url')
+    const a = Buffer.from(expected, 'utf8')
+    const b = Buffer.from(String(s64), 'utf8')
+    if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+    const claims = JSON.parse(Buffer.from(p64, 'base64url').toString('utf8'))
+    if (!claims || !claims.id || !claims.exp) return null
+    if (Math.floor(Date.now() / 1000) >= claims.exp) return null
+    return claims
+  } catch {
+    return null
+  }
+}
+
 function requireAuth() {
   return async (c, next) => {
     const token =
@@ -2892,6 +2931,27 @@ function createApp() {
       const identity = typeof scanner.getBlastiMdnsIdentity === 'function' ? scanner.getBlastiMdnsIdentity() : null
       uid = identity && typeof identity.uid === 'string' ? identity.uid : null
     } catch { /* non-fatal */ }
+    // 0.6.110 — PAIRING-STATE SIGNAL (offline reconcile): which agency THIS
+    // machine's own device row is bound to (row matched by this machine's own
+    // fingerprint — the same identity scanners probe with). LAN device
+    // managers use it to settle orphan rows whose accept-callback was missed
+    // (manager briefly down at accept time) — fully device-to-device, no
+    // cloud pairing-state poll needed. uid may be absent on plain desktops;
+    // fall back to the LAN-authority instanceId (the discovery scanner's
+    // fingerprint derivation is uid → instanceId, mirrored here).
+    let pairing = null
+    try {
+      const ownFp = uid || (lanAuth && typeof lanAuth.instanceId === 'string' ? lanAuth.instanceId : null)
+      if (ownFp && db) {
+        const own = await db.agencyDevice.findFirst({
+          where: { deviceFingerprint: ownFp },
+          select: { agencyId: true, branchId: true, status: true, name: true },
+        })
+        if (own && own.agencyId) {
+          pairing = { paired: true, agencyId: own.agencyId, branchId: own.branchId || null, status: own.status, name: own.name || null }
+        }
+      }
+    } catch { /* non-fatal */ }
     return c.json({
       service: 'blasti-local',
       version,
@@ -2908,6 +2968,7 @@ function createApp() {
       syncReady: true,
       ...(lanAuth || {}),
       uid: uid || undefined,
+      pairing,
       peripherals,
       capabilities: [
         'auth',
@@ -6413,6 +6474,7 @@ function createApp() {
           isOwner: false,
           role: null,
           staffId: null,
+          branchId: null,
           permissions: noPermissions,
         })
       }
@@ -6422,6 +6484,7 @@ function createApp() {
         isOwner: ctx.isOwner,
         role: ctx.role,
         staffId: ctx.staffId,
+        branchId: ctx.branchId || null,
         permissions: ctx.permissions,
       })
     } catch (error) {
@@ -7124,6 +7187,209 @@ function createApp() {
     }
   })
 
+  // ─── 0.6.108 — POST /api/reservations/import-walk-in (OFFLINE QR import) ───
+  // LAN-direct counterpart of the cloud POST /api/reservations/import-walk-in:
+  // a customer phone on the branch WiFi scans the kiosk ticket QR
+  // (?claim=<importToken>) and imports the walk-in ticket into THEIR account
+  // WITHOUT any cloud dependency — the write lands in the local SQLite mirror
+  // and reaches the cloud through the deterministic outbox when online.
+  //
+  // Auth: the phone presents its CLOUD session JWT (apiClient Bearer header).
+  // It is verified FULLY OFFLINE with verifyCustomerSessionJwtOffline()
+  // (HS256 + NEXTAUTH_SECRET — the desktop already holds that secret). The
+  // desktop's own session token also works (staff-assisted import).
+  //
+  // Import-token acceptance ladder (parity with the cloud route):
+  //   a) strict HMAC QR token + not expired → reservation by payload id;
+  //   b) otherwise EXACT STORED-TOKEN match (covers expired-but-stored HMAC
+  //      tokens and legacy raw tokens) → reservation by importToken.
+  // Guards mirror the cloud: isWalkIn, exact token match, not already linked,
+  // status still WAITING.
+  //
+  // Realtime: queue:updated { action: 'walk_in_imported' } +
+  // reservation:updated are broadcast on the LOCAL realtime layer so the
+  // desktop full-screen display refreshes INSTANTLY (sub-second, LAN-direct).
+  app.post('/api/reservations/import-walk-in', async (c) => {
+    try {
+      // ── Auth: offline customer JWT first, then the desktop session token ──
+      const presented =
+        c.req.header('Authorization')?.replace('Bearer ', '') ||
+        c.req.header('X-Local-Token') ||
+        c.req.query('token') ||
+        ''
+      if (!presented) {
+        return c.json({ success: false, error: 'Authentication required', code: 'AUTH_NO_TOKEN' }, 401)
+      }
+
+      let importer = null
+      const jwtClaims = verifyCustomerSessionJwtOffline(presented)
+      if (jwtClaims) {
+        importer = {
+          id: jwtClaims.id,
+          username: jwtClaims.username || '',
+          fullName: jwtClaims.fullName || jwtClaims.username || 'Customer',
+          role: jwtClaims.role || 'CUSTOMER',
+        }
+      } else if (sessionToken && sessionUser) {
+        // Desktop session fallback (timing-safe, same as requireAuth)
+        const expectedBuf = Buffer.from(sessionToken, 'utf-8')
+        const providedBuf = Buffer.from(presented, 'utf-8')
+        const ok =
+          expectedBuf.length === providedBuf.length &&
+          timingSafeEqual(expectedBuf, providedBuf)
+        if (ok) {
+          importer = {
+            id: sessionUser.id,
+            username: sessionUser.username || '',
+            fullName: sessionUser.fullName || sessionUser.username || 'Staff',
+            role: sessionUser.role || 'STAFF',
+          }
+        }
+      }
+      if (!importer) {
+        return c.json({ success: false, error: 'Authentication required', code: 'AUTH_TOKEN_MISMATCH' }, 401)
+      }
+
+      const body = await c.req.json().catch(() => ({}))
+      const token = typeof body?.token === 'string' ? body.token.trim() : ''
+      if (!token) {
+        return c.json({ success: false, error: 'Token is required' }, 400)
+      }
+
+      if (!db) {
+        return c.json({ success: false, error: 'Local database not ready', code: 'DB_NOT_READY' }, 503)
+      }
+
+      // ── Import-token acceptance ladder (cloud parity, offline) ───────────
+      const verifyImportTokenHmac = (t) => {
+        try {
+          const [encodedPayload, signature] = String(t).split('.')
+          if (!encodedPayload || !signature) return null
+          const payloadStr = Buffer.from(encodedPayload, 'base64url').toString('utf8')
+          const secret = process.env.NEXTAUTH_SECRET || 'blast1-qr-dev-key'
+          const expectedSig = createHmac('sha256', secret).update(payloadStr).digest('hex')
+          const a = Buffer.from(expectedSig, 'utf8')
+          const b = Buffer.from(signature, 'utf8')
+          if (a.length !== b.length || !timingSafeEqual(a, b)) return null
+          return JSON.parse(payloadStr)
+        } catch {
+          return null
+        }
+      }
+      const hmacPayload = verifyImportTokenHmac(token)
+
+      const reservation = hmacPayload
+        ? await db.reservation.findUnique({ where: { id: hmacPayload.reservationId } })
+        : await db.reservation.findFirst({ where: { importToken: token } })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Invalid or expired QR token' }, 400)
+      }
+      if (!reservation.isWalkIn) {
+        return c.json({ success: false, error: 'This QR is not for a walk-in reservation' }, 400)
+      }
+      if (reservation.importToken !== token) {
+        return c.json({ success: false, error: 'Token does not match this reservation' }, 400)
+      }
+      if (reservation.userId) {
+        return c.json({
+          success: false,
+          error: 'already_linked',
+          message: 'This ticket is already linked to an account',
+          reservation: {
+            id: reservation.id,
+            displayNumber: reservation.displayNumber,
+            status: reservation.status,
+            queueNumber: reservation.queueNumber,
+          },
+        }, 409)
+      }
+      if (reservation.status !== 'WAITING') {
+        return c.json({ success: false, error: `Reservation status '${reservation.status}' cannot be imported` }, 400)
+      }
+
+      // ── Link the ticket to the importer's account (outbox-atomic) ────────
+      const nowDate = new Date()
+      const updateData = {
+        userId: importer.id,
+        walkInCustomerName: importer.fullName,
+        qrClaimedAt: nowDate,
+      }
+      const updatedReservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id: reservation.id },
+          data: updateData,
+        })
+        // Deterministic outcome row is atomic with the state change — the
+        // sync engine replays this update to the cloud when online.
+        await logDeterministicOutcome('Reservation', reservation.id, 'update', { ...reservation, ...updateData }, null, { tx })
+        return row
+      })
+
+      // ── INSTANT local realtime → desktop full-screen refreshes sub-second ──
+      const importEvent = {
+        agencyId: reservation.agencyId,
+        reservationId: reservation.id,
+        userId: importer.id,
+        displayNumber: reservation.displayNumber,
+        customerName: importer.fullName,
+        action: 'walk_in_imported',
+        reservation: updatedReservation,
+      }
+      emitEvent('queue:updated', importEvent)
+      localRealtime.broadcastLocalRealtime('queue:updated', importEvent)
+      emitEvent('reservation:updated', {
+        agencyId: reservation.agencyId,
+        reservationId: reservation.id,
+        status: reservation.status,
+        importedByUser: true,
+        userId: importer.id,
+      })
+      localRealtime.broadcastLocalRealtime('reservation:updated', {
+        agencyId: reservation.agencyId,
+        reservationId: reservation.id,
+        status: reservation.status,
+        importedByUser: true,
+        userId: importer.id,
+      })
+
+      // Queue event trail — local import (the cloud logs its own copy when
+      // the outbox update lands there).
+      try {
+        require('./lib/queue-event').queueEvent(
+          'ticket_imported',
+          'Walk-in ticket ' + (reservation.displayNumber || '?') + ' imported to customer account (LAN)',
+          {
+            agencyId: reservation.agencyId,
+            serviceId: reservation.serviceId,
+            ticketId: reservation.id,
+            ticketNumber: reservation.displayNumber,
+            source: 'import',
+            status: reservation.status,
+            userId: importer.id,
+          },
+        )
+      } catch { /* logging must never break the import */ }
+
+      return c.json({
+        success: true,
+        message: 'Walk-in reservation imported to your queue',
+        reservation: {
+          id: updatedReservation.id,
+          displayNumber: updatedReservation.displayNumber,
+          status: updatedReservation.status,
+          queueNumber: updatedReservation.queueNumber,
+          isWalkIn: true,
+          walkInCustomerName: updatedReservation.walkInCustomerName,
+          joinedAt: updatedReservation.joinedAt,
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] import-walk-in error:', error)
+      return c.json({ success: false, error: 'Failed to import walk-in reservation' }, 500)
+    }
+  })
+
   // POST /api/reservations — create reservation with auto queue number
   app.post('/api/reservations', authMiddleware, async (c) => {
     try {
@@ -7614,7 +7880,19 @@ function createApp() {
       // updateMany (status must still be WAITING/CALLED when the write lands)
       // under the branch queue write lock — the racing loser gets 409, never
       // a silent double-call.
-      const updated = await withQueueWriteLock(() => withOutboxTransaction(async (tx) => {
+      // 0.6.110 — OWNERSHIP GUARD (double-call prevention): the old where
+      // clause allowed CALLED→CALLED for ANY caller, silently REBINDING
+      // counterId to the second desk — a cross-counter steal with no conflict
+      // signal. The authoritative re-read now happens INSIDE the lock: a
+      // ticket already CALLED and owned by ANOTHER counter is refused (409);
+      // same-desk re-clicks and unbound tickets still rebind normally.
+      const claimOutcome = await withQueueWriteLock(() => withOutboxTransaction(async (tx) => {
+        const cur = await tx.reservation.findUnique({ where: { id } })
+        if (!cur || cur.agencyId !== agencyId) return { kind: 'missing' }
+        if (!['WAITING', 'CALLED'].includes(cur.status)) return { kind: 'terminal' }
+        if (cur.status === 'CALLED' && cur.counterId && cur.counterId !== effectiveCounterId) {
+          return { kind: 'owned-elsewhere', owner: cur.counterId }
+        }
         const occ = await tx.reservation.updateMany({
           where: { id, agencyId, status: { in: ['WAITING', 'CALLED'] } },
           data: {
@@ -7624,14 +7902,30 @@ function createApp() {
             counterId: effectiveCounterId || null,
           },
         })
-        if (occ.count === 0) return null // served/cancelled/completed mid-race
+        if (occ.count === 0) return { kind: 'conflict' } // served/cancelled/completed mid-race
         const row = await tx.reservation.findUnique({ where: { id } })
         await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
-        return row
+        return { kind: 'claimed', row }
       }))
-      if (!updated) {
+      if (claimOutcome.kind === 'missing') {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+      if (claimOutcome.kind === 'terminal') {
+        return c.json({ success: false, error: `Cannot call a reservation with status: ${existing.status}` }, 400)
+      }
+      if (claimOutcome.kind === 'owned-elsewhere') {
+        // 0.6.110 — double-call prevention: tell the caller WHO owns it.
+        return c.json({
+          success: false,
+          error: 'This ticket is already being served at another counter. Complete or no-show it there first, or use Recall on your own ticket.',
+          code: 'TICKET_OWNED_ELSEWHERE',
+          ownedByCounterId: claimOutcome.owner,
+        }, 409)
+      }
+      if (claimOutcome.kind === 'conflict') {
         return c.json({ success: false, error: 'Ticket is no longer callable — its status just changed (served, cancelled or completed)' }, 409)
       }
+      const updated = claimOutcome.row
 
       emitEvent('queue:called', { agencyId, reservation: updated })
       // 0.6.89 — QUEUE event: local claim of a specific ticket.
@@ -8588,7 +8882,10 @@ function createApp() {
           position: r.status === 'WAITING' ? (entries.length - entries.filter((e) => e.status === 'WAITING').length + 1) : 0,
           isWalkIn: r.isWalkIn || false,
           walkInCustomerName: r.walkInCustomerName || null,
-          importToken: null,
+          // 0.6.108 — return the REAL import token. The old hardcoded null
+          // killed the full-screen "show QR" affordance for walk-ins in LAN
+          // mode (the cloud GET /queue returns res.importToken — parity).
+          importToken: r.importToken || null,
           preferredTime: r.preferredTime || null,
           fixedTimeEnabled: r.fixedTimeEnabled || false,
           postponeCount: r.postponeCount || 0,
@@ -8702,24 +8999,35 @@ function createApp() {
       // 0.6.89 — QUEUE event: LOCAL (offline) queue action only — the central
       // fast path above returns early, so reaching this line means the write
       // happened on the local outbox path (no cloud-side log yet).
-      require('./lib/queue-event').queueEvent(
-        action === 'complete' ? 'ticket_completed'
-          : action === 'no_show' ? 'ticket_no_show'
-            : action === 'cancel' ? 'ticket_cancelled'
-              : action === 'recall' ? 'ticket_recalled'
-                : 'ticket_claimed',
-        'LAN queue action ' + action + ': ' + (updatedReservation.displayNumber || reservationId) + ' → ' + (updatedReservation.status || '?'),
-        {
-          agencyId: updatedReservation.agencyId,
-          ticketId: reservationId,
-          ticketNumber: updatedReservation.displayNumber,
-          serviceId: updatedReservation.serviceId,
-          counterId: updatedReservation.counterId || undefined,
-          status: updatedReservation.status,
-          waitMs: (action === 'serve' || action === 'recall') && existing.joinedAt ? Date.now() - new Date(existing.joinedAt).getTime() : undefined,
-          serviceMs: action === 'complete' && existing.calledAt ? Date.now() - new Date(existing.calledAt).getTime() : undefined,
-        },
-      )
+      // 0.6.110 — CRASH FIX: this block read `existing.joinedAt`/`existing.calledAt`
+      // but `existing` was never in scope (the pre-read row is `reservation`),
+      // so complete/serve/recall THREW after the DB write had already
+      // committed — the client got 500 "Failed to update reservation" although
+      // the ticket actually changed. Use the pre-read row (joinedAt/calledAt
+      // are never modified by queueActionUpdateData) and wrap the whole log
+      // call so a logging failure can never turn a committed write into a 500.
+      try {
+        require('./lib/queue-event').queueEvent(
+          action === 'complete' ? 'ticket_completed'
+            : action === 'no_show' ? 'ticket_no_show'
+              : action === 'cancel' ? 'ticket_cancelled'
+                : action === 'recall' ? 'ticket_recalled'
+                  : 'ticket_claimed',
+          'LAN queue action ' + action + ': ' + (updatedReservation.displayNumber || reservationId) + ' → ' + (updatedReservation.status || '?'),
+          {
+            agencyId: updatedReservation.agencyId,
+            ticketId: reservationId,
+            ticketNumber: updatedReservation.displayNumber,
+            serviceId: updatedReservation.serviceId,
+            counterId: updatedReservation.counterId || undefined,
+            status: updatedReservation.status,
+            waitMs: (action === 'serve' || action === 'recall') && reservation.joinedAt ? Date.now() - new Date(reservation.joinedAt).getTime() : undefined,
+            serviceMs: action === 'complete' && reservation.calledAt ? Date.now() - new Date(reservation.calledAt).getTime() : undefined,
+          },
+        )
+      } catch (logErr) {
+        console.warn('[LocalAPI] queue/:id PATCH queue-event log failed (write already committed):', logErr && logErr.message)
+      }
       return c.json({ success: true, reservation: updatedReservation })
     } catch (error) {
       if (error && error.code === 'QUEUE_ACTION_CONFLICT') {
@@ -12384,79 +12692,98 @@ function createApp() {
       // P2-10 — shared loader: binding filter + priority ordering, mirroring
       // the cloud claim (the central-first path above stays authoritative; the
       // local outbox path below uses the SAME selection when offline).
-      const loaded = await loadLocalCallCandidates(agencyId, serviceId, effectiveCounterId)
-      const candidates = loaded.candidates
-      const where = loaded.where
+      // 0.6.110 — SERIALIZATION FIX: the whole offline claim (candidate READ +
+      // pick + OCC flip) now runs under the branch queue write lock — the
+      // same FIFO mutex /api/queue/call-next (kiosk-era) and /api/queue/call/:id
+      // use. The candidate read used to happen OUTSIDE both the lock and the
+      // outbox transaction, so two desks calling next simultaneously could
+      // both select the same head-of-line ticket from the same pre-read
+      // snapshot; OCC still prevented a double-CALL, but the serialization
+      // discipline documented for this branch (0.6.97) was not actually
+      // enforced on this route. Read and claim now share one lock section.
+      const claimOutcome = await withQueueWriteLock(async () => {
+        const loaded = await loadLocalCallCandidates(agencyId, serviceId, effectiveCounterId)
+        const candidates = loaded.candidates
+        const where = loaded.where
 
-      const now = new Date()
+        const now = new Date()
 
-      const next = pickNextLocalCustomer(candidates, now)
+        const next = pickNextLocalCustomer(candidates, now)
 
-      if (!next) {
-        const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
-        if (!anyWaiting) {
-          return c.json({ success: false, error: 'No customers in queue' }, 404)
+        if (!next) {
+          const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
+          if (!anyWaiting) return { kind: 'empty' }
+          return { kind: 'future-only' }
         }
+
+        // ── Call the customer + OUTBOX (field report: "the turn notification
+        // never reaches the customer when the agency uses the desktop app").
+        // This alias route updated the LOCAL row only — no outbox entry — so
+        // the CALLED status never reached the cloud: sync-side-effects never
+        // fired, the customer's phone never rang and the webapp queue never
+        // moved. Route the flip through withOutboxTransaction + deterministic
+        // outcomes exactly like PATCH /api/agency/queue/:id does.
+        const calledData = {
+          status: 'CALLED',
+          calledAt: now,
+          // calledBy: removed — not a Reservation schema field
+        }
+        if (effectiveCounterId) calledData.counterId = effectiveCounterId
+
+        // UNIFIED QUEUE (offline path): OCC-guarded claim with a next-candidate
+        // loop. The conditional updateMany (WHERE status='WAITING') makes a
+        // double-claim impossible even when the sync pull flips a candidate
+        // between our read and our write — the loser silently moves to the
+        // NEXT candidate instead of double-calling the same ticket.
+        const claimResult = await withOutboxTransaction(async (tx) => {
+          let claimedRow = null
+          for (const cand of candidates) {
+            if (!isCallableNowLocal(cand, now)) continue
+            const occ = await tx.reservation.updateMany({
+              where: { id: cand.id, status: 'WAITING' },
+              data: calledData,
+            })
+            if (occ.count === 0) continue // lost THIS ticket to a concurrent claimant
+            // Part Q: outcome row atomic with the state flip.
+            await logDeterministicOutcome('Reservation', cand.id, 'update', { ...cand, ...calledData }, null, { tx })
+            claimedRow = { ...cand, ...calledData }
+            break
+          }
+          if (!claimedRow) return { claimed: null }
+
+          // Update current serving number in queue settings (synced table —
+          // keeps kiosks / other devices on the same "now serving" number).
+          const qs = await tx.queueSettings.findFirst({ where: { agencyId } })
+          if (qs) {
+            const qsData = { currentServingNumber: claimedRow.queueNumber }
+            await tx.queueSettings.update({ where: { id: qs.id }, data: qsData })
+            await logDeterministicOutcome('QueueSettings', qs.id, 'update', { ...qs, ...qsData }, null, { tx })
+          }
+
+          return { claimed: claimedRow }
+        })
+
+        if (!claimResult.claimed) return { kind: 'conflict' }
+        return { kind: 'claimed', updated: claimResult.claimed }
+      })
+
+      if (claimOutcome.kind === 'empty') {
+        return c.json({ success: false, error: 'No customers in queue' }, 404)
+      }
+      if (claimOutcome.kind === 'future-only') {
         return c.json({
           success: false,
           error: 'All waiting reservations have preferred times in the future. No one to call yet.',
           hasPreferredTimeOnly: true,
         })
       }
-
-      // ── Call the customer + OUTBOX (field report: "the turn notification
-      // never reaches the customer when the agency uses the desktop app").
-      // This alias route updated the LOCAL row only — no outbox entry — so
-      // the CALLED status never reached the cloud: sync-side-effects never
-      // fired, the customer's phone never rang and the webapp queue never
-      // moved. Route the flip through withOutboxTransaction + deterministic
-      // outcomes exactly like PATCH /api/agency/queue/:id does.
-      const calledData = {
-        status: 'CALLED',
-        calledAt: now,
-        // calledBy: removed — not a Reservation schema field
-      }
-      if (effectiveCounterId) calledData.counterId = effectiveCounterId
-
-      // UNIFIED QUEUE (offline path): OCC-guarded claim with a next-candidate
-      // loop. The conditional updateMany (WHERE status='WAITING') makes a
-      // double-claim impossible even when the sync pull flips a candidate
-      // between our read and our write — the loser silently moves to the
-      // NEXT candidate instead of double-calling the same ticket.
-      const claimResult = await withOutboxTransaction(async (tx) => {
-        let claimedRow = null
-        for (const cand of candidates) {
-          if (!isCallableNowLocal(cand, now)) continue
-          const occ = await tx.reservation.updateMany({
-            where: { id: cand.id, status: 'WAITING' },
-            data: calledData,
-          })
-          if (occ.count === 0) continue // lost THIS ticket to a concurrent claimant
-          // Part Q: outcome row atomic with the state flip.
-          await logDeterministicOutcome('Reservation', cand.id, 'update', { ...cand, ...calledData }, null, { tx })
-          claimedRow = { ...cand, ...calledData }
-          break
-        }
-        if (!claimedRow) return { claimed: null }
-
-        // Update current serving number in queue settings (synced table —
-        // keeps kiosks / other devices on the same "now serving" number).
-        const qs = await tx.queueSettings.findFirst({ where: { agencyId } })
-        if (qs) {
-          const qsData = { currentServingNumber: claimedRow.queueNumber }
-          await tx.queueSettings.update({ where: { id: qs.id }, data: qsData })
-          await logDeterministicOutcome('QueueSettings', qs.id, 'update', { ...qs, ...qsData }, null, { tx })
-        }
-
-        return { claimed: claimedRow }
-      })
-
-      const updated = claimResult.claimed
-      if (!updated) {
+      if (claimOutcome.kind === 'conflict') {
         // Every candidate was claimed concurrently between the read and the
         // write — the client retry re-evaluates the whole queue.
         return c.json({ success: false, error: 'Concurrent call detected. Please try again.', shouldRetry: true }, 409)
       }
+
+      const updated = claimOutcome.updated
 
       emitEvent('queue:called', { agencyId, reservation: updated })
       // 0.6.89 — QUEUE event: the unified call-next LOCAL fallback (offline)
@@ -12484,69 +12811,70 @@ function createApp() {
     }
   })
 
-  // POST /api/agency/queue/walk-in-token — QR-based walk-in
+  // POST /api/agency/queue/walk-in-token — mint an import token for an
+  // EXISTING walk-in reservation (0.6.108 cloud parity rewrite).
+  //
+  // The old local route CREATED A NEW walk-in reservation on every call —
+  // a guaranteed duplicate ticket whenever the full-screen token fallback
+  // fired — and returned `{ data: { tokenCode } }` while the full-screen
+  // reads `tokenData.token`, so the fallback never produced a usable token
+  // in LAN mode. The cloud route (apps/api agency.ts POST /queue/walk-in-token)
+  // takes { reservationId }, mints a cloud-verifiable HMAC token for THAT
+  // reservation and returns `{ success, token }` — this local route now does
+  // exactly the same (same secret, same format → the printed QR imports
+  // against either backend).
   app.post('/api/agency/queue/walk-in-token', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
       const body = await c.req.json().catch(() => ({}))
-      const { serviceId, customerName, phone } = body
-      if (!serviceId) return c.json({ success: false, error: 'serviceId required' }, 400)
-      const service = await db.service.findUnique({ where: { id: serviceId } })
-      if (!service || service.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
-      // Task 37-d: open/paused/full gates (mirror of the cloud walk-in path).
-      const tokenIssuanceGate = await checkQueueIssuanceGates(agencyId)
-      if (tokenIssuanceGate) return c.json(tokenIssuanceGate.body, tokenIssuanceGate.status)
-      // Task 37-d fix: queueNumber is an INT column — keep the 6-digit token
-      // as the DISPLAY number only and take the Int from the issued-number
-      // cursor (the old string-into-Int write 500'd every token walk-in).
-      const qsToken = await db.queueSettings.findFirst({ where: { agencyId } })
-      const newTokenNumber = (qsToken?.lastIssuedNumber || 0) + 1
-      // Generate a 6-digit token code
-      const tokenCode = String(Math.floor(100000 + Math.random() * 900000))
-      const now = new Date()
-      const reservation = await db.reservation.create({
-        data: {
-          agencyId,
-          serviceId,
-          userId: sessionUser.id,
-          queueNumber: newTokenNumber,
-          displayNumber: tokenCode,
-          status: 'WAITING',
-          walkInCustomerName: customerName || 'Token',
-          isWalkIn: true,
-          joinedAt: now,
-          estimatedWait: 0,
-        },
+      const { reservationId } = body
+      if (!reservationId) return c.json({ success: false, error: 'reservationId required' }, 400)
+
+      const reservation = await db.reservation.findUnique({ where: { id: reservationId } })
+      if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
+      if (reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation belongs to another agency' }, 403)
+      }
+      if (!reservation.isWalkIn) {
+        return c.json({ success: false, error: 'This endpoint is only for walk-in reservations' }, 400)
+      }
+
+      // Mint the HMAC import token (identical format + secret to the cloud
+      // route and the local kiosk join-queue) and persist it.
+      const exp = Math.floor(Date.now() / 1000) + 30 * 60
+      const payload = JSON.stringify({
+        reservationId: reservation.id,
+        agencyId,
+        customerId: reservation.walkInCustomerName || '',
+        exp,
       })
+      const secret = process.env.NEXTAUTH_SECRET || 'blast1-qr-dev-key'
+      const sig = createHmac('sha256', secret).update(payload).digest('hex')
+      const token = Buffer.from(payload).toString('base64url') + '.' + sig
+      await db.reservation.update({ where: { id: reservation.id }, data: { importToken: token } })
+
+      // 0.6.89 — QUEUE event: LAN walk-in import-token issuance.
       try {
-        if (qsToken) {
-          await db.queueSettings.update({ where: { id: qsToken.id }, data: { lastIssuedNumber: newTokenNumber } })
-        } else {
-          await db.queueSettings.create({
-            data: { agencyId, lastIssuedNumber: newTokenNumber, currentServingNumber: 0, isPaused: false },
-          })
-        }
-      } catch { /* cursor is best-effort for the token flow */ }
-      emitEvent('reservation:created', { agencyId, reservation })
-      // 0.6.89 — QUEUE event: LAN QR-token walk-in (local create).
-      require('./lib/queue-event').queueEvent(
-        'ticket_created_walkin',
-        'LAN token walk-in created: ' + (reservation.displayNumber || '?') + ' (queued for cloud push)',
-        {
-          agencyId,
-          ticketId: reservation.id,
-          ticketNumber: reservation.displayNumber,
-          serviceId,
-          serviceName: service.name,
-          source: 'walkin',
-          status: 'WAITING',
-        },
-      )
-      return c.json({ success: true, data: { ...reservation, tokenCode } }, 201)
+        require('./lib/queue-event').queueEvent(
+          'ticket_created_walkin',
+          'Walk-in import token issued for ' + (reservation.displayNumber || '?') + ' (QR claim path, LAN)',
+          {
+            agencyId,
+            ticketId: reservation.id,
+            ticketNumber: reservation.displayNumber,
+            serviceId: reservation.serviceId,
+            source: 'walkin',
+            status: reservation.status,
+            data: { tokenIssued: true },
+          },
+        )
+      } catch { /* logging must never break the token issuance */ }
+
+      return c.json({ success: true, token })
     } catch (error) {
       console.error('[LocalAPI] walk-in-token error:', error)
-      return c.json({ success: false, error: 'Failed to create token walk-in' }, 500)
+      return c.json({ success: false, error: 'Failed to create walk-in import token' }, 500)
     }
   })
 
@@ -13056,7 +13384,54 @@ function createApp() {
     sessionToken,
     // 0.6.100 — incoming pairing offer for a DESKTOP target: this PC's
     // operator must ACCEPT (native dialog) before the pairing completes.
+    // 0.6.110 — MANAGER-BOUND RECONCILE (the "pair accepted but the PC never
+    // appears in the paired list" root-cause fix): the accept used to update
+    // ONLY this machine's own row — the manager's orphan row stayed
+    // agencyId=null/PAIRING forever, so the pair was invisible in the device
+    // manager on the manager side, aged out of the unpaired strip after 90s,
+    // and a re-pair got 409 "already paired". After the local accept we now
+    // call the MANAGER back over the LAN (offer carries managerIp/managerPort
+    // + the manager-minted deviceToken) on /device/accept-pairing, which
+    // binds the manager's orphan row — the pair is then SAVED on BOTH ends,
+    // fully offline (device-to-device HTTP, no cloud hop).
     onPairingOffer: (offer) => {
+      // Manager callback helper — best-effort with retries; never blocks the
+      // dialog flow. Auth: the manager-minted token (Bearer) so the manager
+      // resolves its own orphan row by token.
+      const notifyManager = async (verb) => {
+        const managerIp = offer.managerIp
+        const managerPort = offer.managerPort || 3080
+        const managerToken = offer.deviceToken
+        if (!managerIp || !managerToken) return { ok: false, reason: 'no-manager-address' }
+        const url = `http://${managerIp}:${managerPort}/api/agency-devices/device/${verb === 'accept' ? 'accept-pairing' : 'reject-pairing'}`
+        const body = verb === 'accept'
+          ? {
+              commandId: offer.managerCommandId || undefined,
+              agencyId: offer.agencyId || undefined,
+              branchId: offer.branchId || null,
+              fingerprint: offer.fingerprint || undefined,
+            }
+          : { commandId: offer.managerCommandId || undefined }
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const ctl = new AbortController()
+          const timer = setTimeout(() => ctl.abort(), 2500)
+          try {
+            const res = await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + managerToken },
+              body: JSON.stringify(body),
+              signal: ctl.signal,
+            })
+            clearTimeout(timer)
+            if (res.ok) return { ok: true }
+            // 4xx the manager understood (already settled, auth mismatch) —
+            // retrying will not change the answer.
+            if (res.status >= 400 && res.status < 500) return { ok: false, reason: 'http-' + res.status }
+          } catch { /* retry */ } finally { clearTimeout(timer) }
+          await new Promise((r) => setTimeout(r, 500 * attempt))
+        }
+        return { ok: false, reason: 'manager-unreachable' }
+      }
       try {
         const { dialog, BrowserWindow } = require('electron')
         const win = BrowserWindow.getFocusedWindow() || null
@@ -13098,7 +13473,11 @@ function createApp() {
                 emitEvent('agency-device:connected', { agencyId: offer.agencyId, deviceId: offer.deviceId, deviceName: offer.deviceName })
                 localRealtime.broadcastLocalRealtime('agency-device:connected', { agencyId: offer.agencyId, deviceId: offer.deviceId, deviceName: offer.deviceName })
               } catch { /* non-fatal */ }
-              try { require('./lib/device-event').deviceEvent('pairing_accepted', `Desktop shell accepted pairing from ${offer.agencyName || 'manager'} (native dialog)`, { deviceId: offer.deviceId, deviceName: offer.deviceName, status: 'ONLINE' }) } catch { /* log only */ }
+              // 0.6.110 — BIND THE MANAGER'S ROW TOO (device-to-device, LAN).
+              const managerAck = await notifyManager('accept').catch(() => ({ ok: false, reason: 'error' }))
+              try {
+                require('./lib/device-event').deviceEvent('pairing_accepted', `Desktop shell accepted pairing from ${offer.agencyName || 'manager'} (native dialog)${managerAck.ok ? ' — manager row bound' : ' — manager ack failed: ' + (managerAck.reason || '?')}`, { deviceId: offer.deviceId, deviceName: offer.deviceName, status: 'ONLINE', managerAck: managerAck.ok })
+              } catch { /* log only */ }
             } catch (acceptErr) {
               console.warn('[LocalAPI] pairing dialog accept failed:', acceptErr && acceptErr.message)
             }
@@ -13110,6 +13489,9 @@ function createApp() {
                   data: { status: 'FAILED', error: 'Rejected by PC operator (native dialog)' },
                 }).catch(() => {})
               }
+              // 0.6.110 — tell the manager so its PAIRING_REQUEST command does
+              // not stay PENDING forever.
+              await notifyManager('reject').catch(() => ({ ok: false }))
               try { require('./lib/device-event').deviceEvent('pairing_rejected', `Desktop shell rejected pairing from ${offer.agencyName || 'manager'} (native dialog)`, { deviceId: offer.deviceId, deviceName: offer.deviceName }) } catch { /* log only */ }
             } catch { /* non-fatal */ }
           }
@@ -13676,6 +14058,17 @@ async function startLocalApi(dbPath, port, options) {
       // "auth event rejected — token does not match the current local session".
       getPreviousSessionToken: () =>
         previousSessionTokenValid() ? previousSessionToken : null,
+      // 0.6.110 — LAN-FOLLOWER SOCKET AUTH (multi-counter on one shared
+      // queue): a device JOINED to this node as a LAN-authority follower
+      // (another counter PC / tablet) presents its `blan-` per-device token.
+      // Without this hook its socket connected but every room join was
+      // rejected (the token is not THIS node's session), so follower counters
+      // never received queue:called pushes while offline and depended on
+      // periodic sync pulls. The token resolves to a scoped synthetic user
+      // (agency/branch recorded at join time) so join:agency works.
+      verifyLanToken: (token) => {
+        try { return require('./lib/lan-authority').verifyDeviceToken(token) } catch { return null }
+      },
     })
     // Bridge the in-process event stream (emitEvent) onto the socket server —
     // every local business mutation becomes a live UI event, OFFLINE included.

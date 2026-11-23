@@ -31,7 +31,7 @@ import { claimNextTicket } from '../lib/queue-claim'
 import { withTxRetry } from '../lib/tx-retry'
 // Task 4-a — authoritative queue mutations land in the unified queue event
 // stream (appendQueueEvent never throws; additive logging only).
-import { appendQueueEvent } from '../lib/queue-event-log'
+import { appendQueueEvent, readQueueEntries } from '../lib/queue-event-log'
 // r21-7 — counter CONTROL engine: atomic claim / heartbeat / release /
 // transfer + takeover-request lifecycle (lib encodes the state machine;
 // these routes are its HTTP surface).
@@ -729,6 +729,9 @@ app.get('/counters', async (c) => {
       include: {
         staff: { include: { user: { select: { fullName: true, username: true } } } },
         currentReservation: { select: { id: true, displayNumber: true, status: true } },
+        // 0.6.105 — branch object rides along so the owner/staff device-manager
+        // "Paired PC devices" section can group counters per branch in ONE call.
+        branch: { select: { id: true, name: true, nameAr: true, nameFr: true } },
         // r21-7 — the counter's assigned (specialty) services + CONTROL state
         // (controlledByUserId/controlHeartbeatAt ride along as scalar columns).
         counterServices: {
@@ -7574,15 +7577,62 @@ app.post('/enterprise-request', async (c) => {
 // always won and this one never executed. Deleted to avoid drift between the
 // two copies.
 
+// ─── 0.6.105 — LIVE COUNTER-OPERATIONS LOG (AGENCY OWNER ONLY) ──────────────
+// GET /agency/counter-log?agencyId=&branchId=&limit=
+//
+// The owner's "Branches & Counters → Live Log" tab. Reads the UNIFIED queue
+// event stream (logs/_queue/<date>.ndjson — the same store the Logs Manager
+// "Queue" tab reads) scoped to THIS agency (+ optional branch) and returns
+// the newest counter-operation entries: counter claim/release/control
+// request/approve/reject/assign/CRUD, claim contention, and the ticket-serving
+// lifecycle those counters drove (claimed/recalled/completed/no-show/
+// cancelled/postponed).
+//
+// ACCESS: deliberately STRICT — the agency OWNER (Agency.ownerId match) or a
+// SUPER_ADMIN. Staff accounts get 403 (counter ops are management telemetry;
+// staff already see their own counter state in the dashboards).
+//
+// Transport note: server-side events are written directly at every mutation
+// point; desktop-LAN events arrive through the local /api/logs ingest →
+// cloud forward, so this log stays complete across offline periods.
+app.get('/counter-log', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const agencyId = c.req.query('agencyId') || user.agencyId || await resolveUserAgencyId(user)
+    if (!agencyId) {
+      return c.json({ success: false, error: 'agencyId is required' }, 400)
+    }
+    if (user.role !== 'SUPER_ADMIN') {
+      const owned = await db.agency.findFirst({ where: { id: agencyId, ownerId: user.id }, select: { id: true } })
+      if (!owned) {
+        return c.json({ success: false, error: 'FORBIDDEN_OWNER_ONLY' }, 403)
+      }
+    }
+    const branchId = (c.req.query('branchId') || '').trim() || undefined
+    const limit = Math.max(1, Math.min(Number(c.req.query('limit')) || 150, 500))
+    const read = readQueueEntries({ agencyId, branchId, limit })
+    return c.json({
+      success: true,
+      entries: read.entries,
+      scanned: read.scanned,
+      truncated: read.truncated,
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ─── agency/my-authority (Task 37-c) ─────────────────────────────────────────
 //
 // Self-inspection endpoint for the 2-tier staff authority model. The UI calls
 // this after login to decide which sections to render (staff tabs, branch
 // buttons, subscription section, counter occupation prompts).
 //
-// Response: { success, isOwner, role, staffId, permissions } where role is
-// 'OWNER' | 'MANAGER' | 'STAFF' | null, staffId is the caller's ACTIVE
-// AgencyStaff row id (null for owners), and permissions is the FULL
+// Response: { success, isOwner, role, staffId, branchId, permissions } where
+// role is 'OWNER' | 'MANAGER' | 'STAFF' | null, staffId is the caller's ACTIVE
+// AgencyStaff row id (null for owners), branchId is the staff's assigned
+// branch (0.6.105 — owners report null), and permissions is the FULL
 // Record<StaffPermission, boolean> map. SUPER_ADMIN reports isOwner=true /
 // role 'OWNER' / all permissions true. A caller with no agency reports the
 // consistent all-empty shape (isOwner false, role null, all permissions false).
@@ -7594,14 +7644,14 @@ app.get('/my-authority', async (c) => {
     if (user.role === 'SUPER_ADMIN') {
       const allTrue = {} as Record<StaffPermission, boolean>
       for (const key of STAFF_PERMISSION_KEYS) allTrue[key] = true
-      return c.json({ success: true, isOwner: true, role: 'OWNER', staffId: null, permissions: allTrue })
+      return c.json({ success: true, isOwner: true, role: 'OWNER', staffId: null, branchId: null, permissions: allTrue })
     }
 
     const agencyId = user.agencyId || await resolveUserAgencyId(user)
     if (!agencyId) {
       const allFalse = {} as Record<StaffPermission, boolean>
       for (const key of STAFF_PERMISSION_KEYS) allFalse[key] = false
-      return c.json({ success: true, isOwner: false, role: null, staffId: null, permissions: allFalse })
+      return c.json({ success: true, isOwner: false, role: null, staffId: null, branchId: null, permissions: allFalse })
     }
 
     const authority = await getAgencyAuthority(user.id, agencyId)

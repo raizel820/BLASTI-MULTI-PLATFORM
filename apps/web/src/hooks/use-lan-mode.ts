@@ -293,6 +293,21 @@ export function useLanMode() {
 
     // Periodic health check every 30s — also re-discovers if server was lost
     const interval = setInterval(() => {
+      // 0.6.110 — OVERRIDE SELF-HEAL: when a LAN-authority override is
+      // active, probe the OVERRIDE's master (not just globalLanServer —
+      // for an Electron follower globalLanServer is THIS machine, which is
+      // always alive and would keep a DEAD master's override fresh forever,
+      // wedging the renderer away from its own API after it wins failover).
+      // A master that stopped answering → clear the join; api-client then
+      // falls back (follower → cloud / re-discovery, local master → itself).
+      const snap = getLanAuthoritySnapshot();
+      if (snap.active && snap.master) {
+        healthCheck(snap.master.ip, snap.master.port || 3080).then((ok) => {
+          if (!ok && getLanAuthoritySnapshot().active) {
+            clearLanAuthority('override-master-unreachable');
+          }
+        });
+      }
       if (globalLanServer) {
         healthCheck(globalLanServer.ip, globalLanServer.port).then(ok => {
           if (ok) {

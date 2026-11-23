@@ -1764,24 +1764,39 @@ app.post('/import-walk-in', async (c) => {
 
     const { token } = validation.data
 
-    // Verify the QR token
+    // Verify the QR token — 0.6.108 ACCEPTANCE LADDER. The ticket QR is
+    // PRINTED on paper, so the customer may scan it HOURS after the kiosk
+    // issued it. The old strict 30-minute check rejected every legitimate
+    // printed ticket ("Invalid or expired QR token") and any legacy raw-hex
+    // token minted by the old /api/kiosk/join route. Acceptance order:
+    //   a) strict HMAC + not expired (app-generated tokens, scanned fresh);
+    //   b) everything else resolves by EXACT STORED-TOKEN match — an expired
+    //      HMAC token or a legacy raw token is accepted iff the reservation's
+    //      persisted importToken equals the presented token. The stored token
+    //      was minted by a trusted issuer, so the match is the authenticity
+    //      proof and it stays valid for the ticket's whole waiting lifetime.
+    //      A regenerated token naturally voids the old one (old QR stops
+    //      working the moment a new token is issued).
     const { verifyQRToken } = await import('../lib/qr-token-service')
     const payload = verifyQRToken(token)
-    if (!payload) {
-      return c.json({ success: false, error: 'Invalid or expired QR token' }, 400)
-    }
 
-    // Find the reservation
-    const reservation = await db.reservation.findUnique({
-      where: { id: payload.reservationId },
-      include: {
-        agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
-        service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
-      },
-    })
+    const RESERVATION_INCLUDE = {
+      agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
+      service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
+    } as const
+
+    const reservation = payload
+      ? await db.reservation.findUnique({
+          where: { id: payload.reservationId },
+          include: RESERVATION_INCLUDE,
+        })
+      : await db.reservation.findFirst({
+          where: { importToken: token },
+          include: RESERVATION_INCLUDE,
+        })
 
     if (!reservation) {
-      return c.json({ success: false, error: 'Reservation not found' }, 404)
+      return c.json({ success: false, error: 'Invalid or expired QR token' }, 400)
     }
 
     // Must be a walk-in
@@ -1789,7 +1804,8 @@ app.post('/import-walk-in', async (c) => {
       return c.json({ success: false, error: 'This QR is not for a walk-in reservation' }, 400)
     }
 
-    // Must already have the import token saved
+    // Must already have the import token saved (exact stored match — the
+    // presented QR must be the CURRENT token of THIS reservation)
     if (reservation.importToken !== token) {
       return c.json({ success: false, error: 'Token does not match this reservation' }, 400)
     }

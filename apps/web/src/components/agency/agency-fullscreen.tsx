@@ -71,6 +71,10 @@ import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { unwrapListPayload } from '@/lib/list-payload';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+// 0.6.110 — shared QR claim deep-link base (identical ladder the kiosk uses:
+// /api/discover LAN IP → non-loopback origin → cloud; fixes the desktop
+// window's 127.0.0.1:3080 dead-QR class on ALL walk-in surfaces).
+import { buildClaimUrl } from '@/lib/claim-base';
 import { logQueue } from '@/lib/remote-logger';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
 import { useAgencyAuthority } from '@/hooks/use-agency-authority';
@@ -748,6 +752,21 @@ export function AgencyFullscreen() {
 
   // ─── Show QR Dialog for walk-in entry ──────────────────────────────────
 
+  // 0.6.108 — PHONE-REACHABLE claim base. The old code hardcoded
+  // NEXT_PUBLIC_APP_URL / blastidz.online for every ticket QR, so OFFLINE
+  // customers on the branch WiFi could never open the claim link (no
+  // internet → no blastidz.online). Resolution order (cached in a ref):
+  //   1. The local API's own /api/discover beacon (same-origin call — in the
+  //      desktop window the UI is served by the embedded local API) reports
+  //      its LAN IP → http://<lanIp>:<port> is reachable by any phone on the
+  //      same WiFi, offline included.
+  //   2. A non-loopback current origin (the UI is already served on the LAN
+  //      or on the cloud domain) → use it as-is.
+  //   3. Loopback origin (desktop window without LAN beacon) or beacon
+  //      failure (cloud-hosted fullscreen → /api/discover 404s) → fall back
+  //      to the cloud URL for the online case.
+  // 0.6.110 — claim-base resolution moved to the shared lib/claim-base.ts
+  // (same ladder: /api/discover LAN IP → non-loopback origin → cloud URL).
   const openWalkInQrDialog = async (entry: QueueEntry | WalkInResult) => {
     if (!entry.importToken) {
       toast.error('No QR token available for this walk-in customer');
@@ -757,15 +776,14 @@ export function AgencyFullscreen() {
     setWalkInQrOpen(true);
     setWalkInQrUrl(null); // loading state
 
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
-    const url = await generateQRDataURL(`${baseUrl}/?claim=${entry.importToken}`, { width: 300 });
-    setWalkInQrUrl(url);
+    const url = await buildClaimUrl(entry.importToken);
+    const qr = await generateQRDataURL(url, { width: 300 });
+    setWalkInQrUrl(qr);
   };
 
   // ─── Reprint ticket from a waiting list entry ───────────────────────────
 
   const handleReprintFromQueue = async (entry: QueueEntry) => {
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
     const result: WalkInResult = {
       id: entry.id,
       queueNumber: entry.queueNumber,
@@ -780,8 +798,9 @@ export function AgencyFullscreen() {
     setTicketData(result);
 
     if (entry.importToken) {
-      const url = await generateQRDataURL(`${baseUrl}/?claim=${entry.importToken}`, { width: 200 });
-      setTicketQrUrl(url || '');
+      const url = await buildClaimUrl(entry.importToken);
+      const qr = await generateQRDataURL(url, { width: 200 });
+      setTicketQrUrl(qr || '');
     } else {
       setTicketQrUrl('');
     }
@@ -1366,11 +1385,12 @@ export function AgencyFullscreen() {
   const handlePrintTicket = async (result: WalkInResult) => {
     setTicketData(result);
 
-    // Generate QR for the ticket
+    // Generate QR for the ticket — 0.6.108 phone-reachable claim base
+    // (offline customers open the desktop's LAN address, not the cloud).
     if (result.importToken) {
-      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
-      const url = await generateQRDataURL(`${baseUrl}/?claim=${result.importToken}`, { width: 200 });
-      setTicketQrUrl(url || '');
+      const url = await buildClaimUrl(result.importToken);
+      const qr = await generateQRDataURL(url, { width: 200 });
+      setTicketQrUrl(qr || '');
     } else {
       setTicketQrUrl('');
     }

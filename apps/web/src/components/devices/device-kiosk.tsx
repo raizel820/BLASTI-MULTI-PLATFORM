@@ -16,6 +16,11 @@ import {
   pinKioskLanBaseFromIp,
 } from '@/lib/kiosk-lan-base';
 import { apiFetch } from '@/lib/api-fetch';
+// 0.6.110 — QR claim deep-link base: the QR must encode an address the
+// customer's PHONE can open on the same WiFi — NOT the kiosk window's own
+// origin (inside the desktop shell that is http://127.0.0.1:3080, a loopback
+// no phone can reach, so the printed/displayed QR was silently dead).
+import { buildClaimUrl } from '@/lib/claim-base';
 import { APP_VERSION } from '@/lib/version';
 // 0.6.92 — the phone ANNOUNCES itself over the LAN while in the pairing-ready
 // state (user request: the desktop Device Manager scan must see the active
@@ -1029,8 +1034,10 @@ export function DeviceKiosk() {
             setInactivitySeconds(0);
             setShowQrDetail(false);
             if (rd.reservation?.importToken) {
-              const baseUrl = window.location.origin;
-              const claimUrl = `${baseUrl}/?claim=${rd.reservation.importToken}`;
+              // 0.6.110 — resolve a phone-reachable claim base (desktop LAN IP
+              // via the /api/discover beacon, else the current origin, else
+              // the cloud URL) instead of the kiosk window's loopback origin.
+              const claimUrl = await buildClaimUrl(rd.reservation.importToken);
               const qrUrl = await generateQRDataURL(claimUrl, { width: 200 });
               setTicketQrUrl(qrUrl);
             } else { setTicketQrUrl(null); }
@@ -1061,8 +1068,8 @@ export function DeviceKiosk() {
       setInactivitySeconds(0);
       setShowQrDetail(false);
       if (data.reservation?.importToken) {
-        const baseUrl = window.location.origin;
-        const claimUrl = `${baseUrl}/?claim=${data.reservation.importToken}`;
+        // 0.6.110 — phone-reachable claim base (see buildClaimUrl).
+        const claimUrl = await buildClaimUrl(data.reservation.importToken);
         const qrUrl = await generateQRDataURL(claimUrl, { width: 200 });
         setTicketQrUrl(qrUrl);
       } else { setTicketQrUrl(null); }
@@ -1136,9 +1143,8 @@ export function DeviceKiosk() {
               ticket.joinedAt ? new Date(ticket.joinedAt).toLocaleString('en-GB') : '',
               `Wait: ~${ticket.estimatedWaitMinutes} min`,
             ].filter(Boolean),
-            qrData: ticket.importToken && typeof window !== 'undefined'
-              ? `${window.location.origin}/?claim=${ticket.importToken}`
-              : undefined,
+            // 0.6.110 — phone-reachable claim base on the ESC-POS receipt QR.
+            qrData: ticket.importToken ? await buildClaimUrl(ticket.importToken) : undefined,
             footer: 'BLASTI',
           },
         }),
@@ -1155,8 +1161,8 @@ export function DeviceKiosk() {
     let qrImage = ticketQrUrl;
     if (!qrImage && ticket.importToken) {
       try {
-        const baseUrl = window.location.origin;
-        const claimUrl = `${baseUrl}/?claim=${ticket.importToken}`;
+        // 0.6.110 — phone-reachable claim base (see buildClaimUrl).
+        const claimUrl = await buildClaimUrl(ticket.importToken);
         qrImage = await generateQRDataURL(claimUrl, { width: 200 });
         if (qrImage) setTicketQrUrl(qrImage);
       } catch { /* proceed without QR */ }

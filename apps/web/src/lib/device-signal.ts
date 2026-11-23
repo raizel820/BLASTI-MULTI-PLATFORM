@@ -59,9 +59,12 @@ export function isSignalBackedDevice(d: SignalDeviceInput | null | undefined): b
 
   // ── 2. TVs / displays must have ANSWERED a TV discovery signal ──
   if (type === 'TV' || type === 'DISPLAY') {
-    const mdnsHit = !!mdns && /googlecast|airplay|roku|_rimedia|_samsung|_tcl|_viera|_bravia|_webos|_androidtv|_firetv|_firestick|_dial|_tv\./.test(mdns);
+    // 0.6.108 — `_philips` + `androidtvremote` patterns join the mdns set;
+    // `androidtv` / `adb` / `philips-tv` join the TCP hallmarks (the open
+    // evidence Algerian-market IRIS / Stream System / Condor sets expose).
+    const mdnsHit = !!mdns && /googlecast|airplay|roku|_rimedia|_samsung|_tcl|_viera|_bravia|_webos|_androidtv|_firetv|_firestick|_dial|_philips|_tv\./.test(mdns);
     const ssdpHit = !!ssdpSt && /(media|avtransport|dial|screen|tv|display)/.test(ssdpSt);
-    const tcpHit = tcp.some((s) => /googlecast|airplay|roku|samsung-tv/.test(s));
+    const tcpHit = tcp.some((s) => /googlecast|airplay|roku|samsung-tv|androidtv|philips-tv|adb/.test(s));
     const httpHit = !!(d.httpTitle || d.httpServer || d.httpUrl || d.ssdpLocation);
     const wsdHit = !!d.wsdType && /display|tv|media/i.test(String(d.wsdType));
     return Boolean(mdnsHit || ssdpHit || tcpHit || httpHit || wsdHit);

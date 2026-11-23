@@ -1,6 +1,5 @@
 import { todayLocalDateString } from '../lib/queue-waiting'
 import { Hono } from 'hono'
-import { randomBytes } from 'crypto'
 import { db } from '@blasti/db'
 import { validateBody, kioskJoinSchema } from '../lib/validations'
 import { emitQueueEvent, emitKioskEvent } from '../lib/realtime-emit'
@@ -13,6 +12,12 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 // Task 4-a — authoritative queue mutations land in the unified queue event
 // stream (appendQueueEvent never throws; additive logging only).
 import { appendQueueEvent } from '../lib/queue-event-log'
+// 0.6.108 — the import token MUST use the cloud-verifiable HMAC format
+// (base64url payload + hex sig, NEXTAUTH_SECRET) — the same format minted by
+// /api/agency-devices/public/join-queue and verified by /import-walk-in and
+// the desktop local API. The old raw randomBytes(24).hex token could NEVER
+// be verified by any import endpoint, so those ticket QRs were dead weight.
+import { generateImportToken } from '../lib/qr-token-service'
 
 const app = new Hono()
 
@@ -109,7 +114,7 @@ app.post('/join', async (c) => {
         await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: agency.queueSettings[0].id, operation: 'update' })
       }
 
-      const importToken = randomBytes(24).toString('hex')
+      const importToken = generateImportToken(res.id, agencyId, customerName?.trim() || 'Anonymous')
       await tx.reservation.update({
         where: { id: res.id },
         data: { importToken },

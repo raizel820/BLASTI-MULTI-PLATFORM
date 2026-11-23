@@ -156,6 +156,33 @@ let restored = false;
 /** Set by api-client when cloud requests fail with network errors. */
 let cloudUnreachable = false;
 
+// ─── Authority-change listeners (0.6.110 — realtime socket repoint) ─────────
+
+/** Subscribers notified whenever the override ACTIVATES / REPOINTS / CLEARS. */
+type LanAuthorityListener = () => void;
+const authorityListeners: LanAuthorityListener[] = [];
+
+/**
+ * Subscribe to LAN-authority lifecycle changes (join success, 409 repoint,
+ * clear). Returns an unsubscribe function. Use-realtime consumes this to
+ * repoint the Socket.IO singleton to/from the master so follower counters
+ * receive queue pushes while offline.
+ */
+export function onLanAuthorityChange(cb: LanAuthorityListener): () => void {
+  ensureRestored();
+  authorityListeners.push(cb);
+  return () => {
+    const i = authorityListeners.indexOf(cb);
+    if (i >= 0) authorityListeners.splice(i, 1);
+  };
+}
+
+function notifyAuthorityChange(): void {
+  for (const cb of authorityListeners) {
+    try { cb(); } catch { /* a listener must never break the authority */ }
+  }
+}
+
 function safeLocalStorage(): Storage | null {
   try {
     if (typeof window === 'undefined' || !window.localStorage) return null;
@@ -325,6 +352,7 @@ export function clearLanAuthority(reason: string): void {
   } catch { /* ignore */ }
   if (prev?.active) {
     safeLog('lan-master-lost', `cleared — ${reason} (was ${prev.master.name ?? 'master'} ${prev.master.ip}:${prev.master.port}, instance ${prev.master.instanceId ?? '?'}, term ${prev.master.term ?? '?'}, role ${prev.role ?? '?'})`, { reason, master: prev.master });
+    notifyAuthorityChange();
   }
 }
 
@@ -365,6 +393,7 @@ export function handleNotMasterResponse(master: LanMasterHint): void {
   };
   persist();
   safeLog('lan-repoint', `409 NOT_MASTER — API base repointed to ${master.name ?? 'master'} ${master.ip}:${master.port} (term ${master.term ?? '?'}, instance ${master.instanceId ?? '?'})`, { master: { ...state.master } });
+  notifyAuthorityChange();
 }
 
 /**
@@ -480,6 +509,7 @@ export async function joinMaster(
     };
     persist();
     safeLog('lan-join', `joined master ${state.master.name ?? ''} ${state.master.ip}:${state.master.port} — term ${state.master.term ?? '?'}, instance ${state.master.instanceId ?? '?'}, expiresAt ${state.expiresAt ?? 'n/a'}, fingerprint ${deviceFingerprint.slice(0, 12)}…`, { master: { ...state.master }, term: state.master.term, expiresAt: state.expiresAt });
+    notifyAuthorityChange();
     return { joined: true };
   };
 

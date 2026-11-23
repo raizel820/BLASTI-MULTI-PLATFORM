@@ -840,7 +840,25 @@ function registerDeviceBoardRoutes(app, ctx) {
         return c.json({ success: false, error: 'No waiting device found on this machine' }, 404)
       }
       if (device.agencyId) {
-        return c.json({ success: false, error: 'Device is already paired' }, 409)
+        // 0.6.110 — ALREADY-PAIRED RECONCILE (not a bare 409 dead end): tell
+        // the manager WHO this device is bound to. A manager whose own orphan
+        // row never settled (missed accept-callback — the historic "pair
+        // accepted but never saved" bug) settles its row from this response
+        // instantly; re-pairing the same PC no longer hits a wall.
+        return c.json({
+          success: false,
+          error: 'Device is already paired',
+          alreadyPaired: true,
+          pairing: {
+            paired: true,
+            agencyId: device.agencyId,
+            branchId: device.branchId || null,
+            status: device.status,
+            name: device.name || null,
+          },
+          deviceId: device.id,
+          fingerprint: device.deviceFingerprint || fingerprint || undefined,
+        }, 409)
       }
 
       // ── Land the PAIRING_REQUEST in the store the kiosk POLLS ──
@@ -870,6 +888,13 @@ function registerDeviceBoardRoutes(app, ctx) {
             branchName: typeof body.branchName === 'string' ? body.branchName : undefined,
             customCode: typeof body.customCode === 'string' ? body.customCode : undefined,
             sentByName: typeof body.sentByName === 'string' ? body.sentByName.slice(0, 100) : undefined,
+            // 0.6.110 — manager address + command id ride the payload so ANY
+            // accept surface (native dialog, kiosk card, socket consumer) can
+            // call the manager back device-to-device and bind its orphan row.
+            managerIp: typeof body.managerIp === 'string' ? body.managerIp.slice(0, 50) : undefined,
+            managerPort: Number.isFinite(Number(body.managerPort)) ? Number(body.managerPort) : undefined,
+            managerCommandId: typeof body.commandId === 'string' ? body.commandId : undefined,
+            fingerprint: fingerprint || undefined,
             deviceToken: managerToken || device.deviceToken || undefined,
             source: 'lan-offer',
           }),
@@ -879,13 +904,13 @@ function registerDeviceBoardRoutes(app, ctx) {
       })
 
       // Refresh the orphan's presence so the unpaired strip stays accurate.
+      // 0.6.110 — do NOT store the MANAGER's IP as this device's own
+      // ipAddress (the row describes THIS machine; the old write corrupted
+      // it with the sender's address).
       try {
         await db.agencyDevice.update({
           where: { id: device.id },
-          data: {
-            lastHeartbeatAt: new Date(),
-            ...(body.managerIp ? { ipAddress: String(body.managerIp).slice(0, 50) } : {}),
-          },
+          data: { lastHeartbeatAt: new Date() },
         })
       } catch { /* non-fatal */ }
 
@@ -916,6 +941,10 @@ function registerDeviceBoardRoutes(app, ctx) {
           deviceId: device.id,
           fingerprint: device.deviceFingerprint || fingerprint || undefined,
           deviceToken: managerToken || device.deviceToken || undefined,
+          // 0.6.110 — manager callback coordinates on the socket path too.
+          managerIp: typeof body.managerIp === 'string' ? body.managerIp : undefined,
+          managerPort: Number.isFinite(Number(body.managerPort)) ? Number(body.managerPort) : undefined,
+          managerCommandId: typeof body.commandId === 'string' ? body.commandId : undefined,
           sentAt: command.createdAt,
         })
       } catch { /* non-fatal */ }
@@ -941,6 +970,17 @@ function registerDeviceBoardRoutes(app, ctx) {
             branchId: typeof body.branchId === 'string' ? body.branchId : null,
             agencyName,
             sentByName: typeof body.sentByName === 'string' ? body.sentByName : '',
+            // 0.6.110 — MANAGER CALLBACK COORDINATES: the accept/reject
+            // handler needs the manager's LAN address + port, the MANAGER's
+            // command id, the manager-minted device token (Bearer for the
+            // callback) and the fingerprint — without them the accept only
+            // ever updated THIS machine's row and the pair was never saved
+            // on the manager side.
+            managerIp: typeof body.managerIp === 'string' && body.managerIp ? body.managerIp : null,
+            managerPort: Number.isFinite(Number(body.managerPort)) ? Number(body.managerPort) : null,
+            managerCommandId: typeof body.commandId === 'string' && body.commandId ? body.commandId : null,
+            deviceToken: managerToken || device.deviceToken || null,
+            fingerprint: device.deviceFingerprint || fingerprint || null,
           })
         } catch { /* dialog must never break the offer */ }
       }
