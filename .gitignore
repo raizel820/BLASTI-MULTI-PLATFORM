@@ -133,3 +133,7 @@ installer/**/*.exe
 backups/
 apps/api/logs/
 audit-shots/
+
+# delivery handoff artifacts (never commit)
+*.bundle
+delivery/

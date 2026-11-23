@@ -1713,6 +1713,7 @@ const fr: Record<TranslationKeys, string> = {
   kioskWaitingForManager: "En attente que le gestionnaire d'appareils trouve cet appareil...",
   kioskDiscovered: 'Appareil découvert ! Connexion en cours...',
   kioskAutoConnecting: "Connexion automatique à l'agence...",
+  kioskVerifyingRegistration: "Vérification finale : validation de l'enregistrement…",
   kioskPairingRequest: "Demande d'association",
   kioskAcceptPairing: 'Accepter',
   kioskPairingProcessing: 'Connexion…',
@@ -1756,6 +1757,17 @@ const fr: Record<TranslationKeys, string> = {
 
   // 0.6.104 — kiosk ticket action row (receipt choice + auto-return flow)
   kioskPrintReceipt: 'Imprimer le reçu',
+  kioskNoPrinterConfigured: "aucune imprimante par défaut n'est définie pour ce kiosque — ouvrez le Gestionnaire d'appareils sur le PC de l'agence, ouvrez la carte de ce kiosque et choisissez une imprimante par défaut (ou enregistrez une imprimante par défaut pour l'agence)",
+  kioskPrinterUnreachable: "Service d'impression inaccessible — vérifiez que le PC de l'agence exécute BLASTI sur le même réseau",
+  kioskPrinterSettings: "Paramètres d'impression",
+  kioskPrinterSettingsHint: "Les reçus s'impriment sur l'imprimante choisie ici",
+  kioskPrinterDefaultSaved: 'Imprimante par défaut enregistrée pour ce kiosque',
+  kioskPrinterDefaultSaveFailed: "Échec de l'enregistrement de l'imprimante par défaut",
+  kioskPrinterNeedsPairing: "Connectez d'abord ce kiosque à une agence — le jumelage lui donne accès aux imprimantes enregistrées.",
+  kioskPrinterCurrent: 'Les reçus s\'impriment sur',
+  kioskPrinterAgencyDefaultHint: "L'imprimante enregistrée comme valeur par défaut de l'agence",
+  kioskPrinterRegisterHint: "enregistrez d'abord les imprimantes depuis le Gestionnaire d'appareils sur le PC de l'agence",
+  kioskPrinterDirectPrintNote: "Toucher une imprimante l'enregistre et imprime les reçus directement — sans fenêtre ni popup.",
   kioskNextCustomer: 'Terminé — client suivant',
 
   // ─── Kiosk Login ──────

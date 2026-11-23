@@ -46,11 +46,15 @@ import {
   Monitor,
   ArrowLeft,
   FileUp,
+  Printer,
 } from 'lucide-react';
 
 import {
   KioskStepIndicator,
 } from './kiosk/kiosk-step-indicator';
+// 0.6.114 — the default-printer setting ON the kiosk (among the agency's
+// REGISTERED printers). Pairs with the direct-print-only receipt button.
+import { KioskPrinterSettings } from './kiosk/kiosk-printer-settings';
 import {
   KioskDiscoveryLogin,
   KioskMethodSelect,
@@ -58,7 +62,7 @@ import {
   DiscoveryStartButton,
   type DiscoveryStatus,
 } from './kiosk/kiosk-discovery-login';
-import type { PairingRequest, KioskViewportSize } from './kiosk/kiosk-types';
+import type { PairingRequest, PairingRegistrationProof, KioskViewportSize } from './kiosk/kiosk-types';
 import { KioskOfflineBanner } from './kiosk/kiosk-offline-banner';
 import { KioskServiceSelector } from './kiosk/kiosk-service-selector';
 import { KioskTicketDisplay } from './kiosk/kiosk-ticket-display';
@@ -174,6 +178,9 @@ export function DeviceKiosk() {
   const [error, setError] = useState<string | null>(null);
   const [showConfetti, setShowConfetti] = useState(false);
   const [printError, setPrintError] = useState<string | null>(null);
+  // 0.6.114 — kiosk-side default-printer sheet (visible on the setup screens
+  // once the kiosk is paired — the operator surface, never on customer steps).
+  const [printerSettingsOpen, setPrinterSettingsOpen] = useState(false);
   const [ticketQrUrl, setTicketQrUrl] = useState<string | null>(null);
   const [showQrDetail, setShowQrDetail] = useState(false);
 
@@ -241,6 +248,21 @@ export function DeviceKiosk() {
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [pairingRequests, setPairingRequests] = useState<PairingRequest[]>([]);
   const discoveryPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 0.6.112 — silent background re-register loop: when the cloud discover-
+  // register keeps failing (slow/absent internet), the kiosk STILL waits on
+  // the LAN (beacon + UDP offers + socket rooms) while this loop retries the
+  // cloud identity every 10s. Cleared on adoption / back / reset / unmount.
+  const discoveryRegisterRetryRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 0.6.112 — the retry loop must never yank the kiosk out of a later flow
+  // step (accept → services): every exit path flips this off.
+  const discoveryFlowActiveRef = useRef(false);
+  // 0.6.113 — HARDENED PAIRING PROTOCOL: the LAN base the orphan row was
+  // created on (captured the moment discover-register succeeded). After a
+  // verified pairing the kiosk binds THAT store's orphan row too, so the
+  // pair exists on BOTH ends (the historic "pairing is done but the kiosk
+  // never shows as a paired device" fault — the kiosk's own store kept the
+  // orphan in PAIRING forever).
+  const orphanStoreBaseRef = useRef('');
   // 0.6.103 — IN-FLIGHT GUARD: accept/reject must be a single-flight action.
   // During a connectivity flap every failed call just disappears into the
   // apiFetch failover chain (no visual change on the card), so operators
@@ -783,7 +805,10 @@ export function DeviceKiosk() {
       step !== 'services' &&
       step !== 'ticket' &&
       discoveryStatus !== 'discovered' &&
-      discoveryStatus !== 'connecting';
+      discoveryStatus !== 'connecting' &&
+      // 0.6.113 — the final registration check is mid-pairing: this device
+      // must NOT advertise "ready-for-pairing" while the verification runs.
+      discoveryStatus !== 'verifying';
     if (!announcing) return;
     void startPairingBeacon({
       name: 'BLASTI App',
@@ -1116,11 +1141,19 @@ export function DeviceKiosk() {
         return;
       } catch { toast.error(t('printerError')); setPrintError('Failed to communicate with printer'); return; }
     }
-    // 0.6.78 — LAN printer path: ask the BLASTI local API to push this ticket
-    // to the agency's saved default printer over raw TCP/ESC-POS (port 9100).
-    // Works from a browser kiosk (tablet) with no OS printer driver — the
-    // master PC on the same network does the socket work. Falls back to the
-    // browser print popup when the local API or printer is unreachable.
+    // 0.6.78 → 0.6.114 — DIRECT PRINT ONLY (user requirement: "print receipt
+    // button in kiosk should not open the receipt — directly print the
+    // receipt using the selected printer as default option for kiosk
+    // printing"). The old browser popup fallback (window.open + a printable
+    // receipt page) is REMOVED: a kiosk never OPENS the receipt, it PRINTS
+    // it. The desktop local API resolves the target printer in order:
+    //   1. the printer ASSIGNED to this kiosk (printerConfig
+    //      .defaultPrinterDeviceId — the "Default printer" select on this
+    //      kiosk's card in the Device Manager),
+    //   2. the agency's saved default printer (last resort),
+    // and delivers by host-forward (USB printer on a branch PC), os-print
+    // (locally attached) or raw TCP/ESC-POS (network printer).
+    let serverError = '';
     try {
       const printRes = await apiFetch('/api/agency-devices/discovery/print', {
         method: 'POST',
@@ -1156,55 +1189,20 @@ export function DeviceKiosk() {
         schedulePostPrintReset();
         return;
       }
-      // Non-success — continue to the browser popup fallback below.
-    } catch { /* local API unreachable — fall back to browser print */ }
-    let qrImage = ticketQrUrl;
-    if (!qrImage && ticket.importToken) {
-      try {
-        // 0.6.110 — phone-reachable claim base (see buildClaimUrl).
-        const claimUrl = await buildClaimUrl(ticket.importToken);
-        qrImage = await generateQRDataURL(claimUrl, { width: 200 });
-        if (qrImage) setTicketQrUrl(qrImage);
-      } catch { /* proceed without QR */ }
+      serverError = (printData && typeof printData.error === 'string' && printData.error)
+        || `Print failed (server ${printRes.status})`;
+    } catch {
+      serverError = t('kioskPrinterUnreachable') || 'Printer service unreachable — check that the branch PC is running BLASTI on the same network';
     }
-    try {
-      const agencyDisplayName = ticket.agencyNameAr && lang === 'ar' ? ticket.agencyNameAr : ticket.agencyNameFr && lang === 'fr' ? ticket.agencyNameFr : ticket.agencyName;
-      const serviceDisplayName = ticket.serviceNameAr && lang === 'ar' ? ticket.serviceNameAr : ticket.serviceNameFr && lang === 'fr' ? ticket.serviceNameFr : ticket.serviceName;
-      const qrHtml = qrImage ? `<div class="qr"><img src="${qrImage}" alt="QR" /></div>\n<div class="center small">${t('scanToTrackQueue') || 'Scan QR to track your queue'}</div>` : '';
-      const methodLabel = ticket.method === 'WALK_IN' ? (t('walkIn') || 'Walk-in') : (ticket.method || (t('walkIn') || 'Walk-in'));
-      const branchDisplayName = ticket.branchNameAr && lang === 'ar' ? ticket.branchNameAr : ticket.branchNameFr && lang === 'fr' ? ticket.branchNameFr : ticket.branchName || '';
-      const receiptHtml = `
-        <div class="center bold large">${agencyDisplayName}</div>
-        <hr />
-        <div class="center medium" style="margin-top:4px">
-          <span class="bold" style="font-size:32px">${ticket.ticketNumber}</span>
-        </div>
-        <hr />
-        <div class="small" style="margin-top:4px">
-          <div class="bold">${ticket.customerName}</div>
-          <div>${serviceDisplayName}</div>
-          ${branchDisplayName ? `<div>${branchDisplayName}</div>` : ''}
-          <div>${t('reservationMethod') || 'Method'}: ${methodLabel}</div>
-          <div>${ticket.joinedAt ? new Date(ticket.joinedAt).toLocaleString() : ''}</div>
-          <div>${t('estimatedWait') || 'Estimated Wait'}: ~${ticket.estimatedWaitMinutes} ${t('minutesKiosk') || 'min'}</div>
-        </div>
-        <hr />
-        ${qrHtml}
-        <hr />
-        <div class="center small" style="margin-top:4px">${t('kioskThankYou') || 'Thank you'}</div>
-      `;
-      const win = window.open('', '_blank', 'width=400,height=600');
-      if (win) {
-        win.document.write(`<html><head><title>${t('printTicket') || 'Print Ticket'}</title>
-          <style>* { margin: 0; padding: 0; box-sizing: border-box; } body { font-family: 'Courier New', monospace; width: 80mm; padding: 4mm; } .center { text-align: center; } .bold { font-weight: bold; } .large { font-size: 28px; font-weight: bold; } .medium { font-size: 14px; } .small { font-size: 11px; } hr { border: none; border-top: 1px dashed #333; margin: 6px 0; } .qr { text-align: center; margin: 8px 0; } .qr img { width: 180px; height: 180px; }</style></head><body>
-          ${receiptHtml}
-          <script>window.onload=function(){window.print();window.close();}</script>
-          </body></html>`);
-        win.document.close();
-        // 0.6.104 — popup print initiated successfully → auto-return.
-        schedulePostPrintReset();
-      } else { setPrintError('Popup blocked — please allow popups for this site'); }
-    } catch { setPrintError('Failed to print ticket'); }
+    // 0.6.114 — FAILURE: NO popup, NO receipt window. An explicit,
+    // actionable error instead — the "No printer target" answer means the
+    // kiosk has no assigned printer AND the agency has no default printer.
+    const noPrinter = /No printer target|default printer/i.test(serverError);
+    const finalMsg = noPrinter
+      ? `${serverError} — ${t('kioskNoPrinterConfigured') || 'no default printer is set for this kiosk — open the Device Manager on the branch PC, open this kiosk card and pick a Default printer (or save an agency default printer)'}`
+      : serverError;
+    toast.error(t('printerError'));
+    setPrintError(finalMsg);
   };
 
   // ─── Code Submit ───────────────────────────────────────────
@@ -1277,10 +1275,108 @@ export function DeviceKiosk() {
 
   const handleStartDiscovery = useCallback(async () => {
     userChoseStep.current = true;
+    discoveryFlowActiveRef.current = true;
     setDiscoveryLoading(true);
     setDiscoveryError(null);
     setDiscoveryStatus('registering');
     setPairingRequests([]);
+
+    // ── 0.6.112 — shared adoption path (direct register OR background retry).
+    // 0.6.112 — WAITING MODE IS NEVER DEAD (field fault 2026-11-23): on a slow
+    // cloud the register surfaced a caller-cancel as a fake "500 Request was
+    // cancelled" and the kiosk bounced to an error dead-end — WITH the
+    // pairing-offer listeners switched OFF (pairingWaitActive only turns on
+    // for 'waiting'/discovery), so the manager's request "never reached the
+    // kiosk" while the beacon was announcing the whole time. Register failure
+    // now ALWAYS lands in the token-less waiting screen: the beacon keeps
+    // announcing, the LAN UDP offer listener and pairing-wait socket rooms
+    // stay live, and a silent 10s loop retries the cloud register until it
+    // succeeds.
+    const adoptDiscoveryRegistration = (data: { success?: boolean; deviceToken?: string; device?: { id: string }; error?: string }) => {
+      if (!(data && data.success && data.deviceToken && data.device && typeof data.device.id === 'string')) return false;
+      setDiscoveryToken(data.deviceToken);
+      discoveryTokenRef.current = data.deviceToken;
+      setDeviceToken(data.deviceToken);
+      setDeviceId(data.device.id);
+      saveDeviceToken(data.deviceToken);
+      saveDeviceId(data.device.id);
+      // 0.6.113 — remember WHICH store this orphan row lives on (the base
+      // discover-register just used). The hardened accept binds it after the
+      // registration is verified, so the pair persists on this end as well.
+      orphanStoreBaseRef.current = getKioskLanBase() || '';
+      setDiscoveryStatus('waiting');
+      setStep('discovery');
+      startDeviceHeartbeat(data.deviceToken);
+      // The cloud identity is live — stop the silent re-register loop.
+      if (discoveryRegisterRetryRef.current) { clearInterval(discoveryRegisterRetryRef.current); discoveryRegisterRetryRef.current = null; }
+      // Poll device-status for pairing requests (0.6.106 — 2s fallback:
+      // the LAN UDP offer + the socket rooms deliver instantly; this poll
+      // is only for the rare case where both channels missed).
+      if (discoveryPollRef.current) clearInterval(discoveryPollRef.current);
+      discoveryPollRef.current = setInterval(async () => {
+        try {
+          const statusRes = await apiFetch('/api/agency-devices/public/device-status', {
+            headers: { 'Authorization': `Bearer ${data.deviceToken}` },
+          });
+          if (statusRes.ok) {
+            const statusData = await statusRes.json();
+            if (statusData.success && statusData.pairingRequests?.length > 0) {
+              setPairingRequests(statusData.pairingRequests);
+            }
+            // If device was paired via another mechanism (e.g. auto-register), load agency
+            if (statusData.status === 'ONLINE' && statusData.agency) {
+              setDiscoveryStatus('discovered');
+              if (discoveryPollRef.current) { clearInterval(discoveryPollRef.current); discoveryPollRef.current = null; }
+              setTimeout(async () => {
+                setDiscoveryStatus('connecting');
+                try {
+                  const agencyRes = await apiFetch(`/api/agency-devices/public/agency?code=${encodeURIComponent(statusData.agency.customCode || '')}`, {
+                    headers: { 'Authorization': `Bearer ${data.deviceToken}` },
+                  });
+                  const agencyData = await agencyRes.json();
+                  if (agencyData.success) {
+                    setAgency(agencyData.agency);
+                    setServices(agencyData.services || []);
+                    setQueueStats(agencyData.queueStats);
+                    if (agencyData.agency.customCode) setAgencyCode(agencyData.agency.customCode);
+                    setIsDeviceRegistered(true);
+                    if (agencyData.agency.isQueueOpen && !agencyData.agency.isPaused) setStep('services');
+                  }
+                } catch { setDiscoveryStatus('waiting'); }
+              }, 1500);
+            }
+          }
+        } catch { /* polling continues */ }
+      }, 2000);
+      return true;
+    };
+
+    // Token-less degraded waiting: everything except the cloud identity.
+    const enterWaitingFallback = (reason: string) => {
+      setDiscoveryError(reason);
+      setDiscoveryStatus('waiting');
+      setStep('discovery');
+      try { logDevice('discovery_register_degraded', 'discover-register failed — waiting mode stays LIVE (beacon + LAN offers + socket rooms); cloud register retries every 10s', { deviceType: 'KIOSK', status: 'PENDING' }, 'warn'); } catch { /* never block */ }
+      if (discoveryRegisterRetryRef.current) clearInterval(discoveryRegisterRetryRef.current);
+      discoveryRegisterRetryRef.current = setInterval(async () => {
+        if (!discoveryFlowActiveRef.current) {
+          if (discoveryRegisterRetryRef.current) { clearInterval(discoveryRegisterRetryRef.current); discoveryRegisterRetryRef.current = null; }
+          return;
+        }
+        try {
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 20_000);
+          const retryRes = await discoverRegisterOnce(ctl.signal).finally(() => clearTimeout(timer));
+          if (!retryRes.ok) return;
+          const retryData = await retryRes.json().catch(() => null);
+          if (retryData && retryData.success && retryData.deviceToken) {
+            try { logDevice('discovery_register_recovered', 'background re-register succeeded — cloud identity adopted', { deviceType: 'KIOSK', status: 'PENDING' }); } catch { /* never block */ }
+            adoptDiscoveryRegistration(retryData);
+          }
+        } catch { /* silent — the next tick retries */ }
+      }, 10_000);
+    };
+
     try {
       // 30s window + ONE automatic retry (0.6.105 — was a bare 15s abort).
       const attemptRegister = async (): Promise<ApiFetchResponse> => {
@@ -1311,6 +1407,8 @@ export function DeviceKiosk() {
         // The API returns { success:false, error:"..." } on failures, but
         // a 500 can also come from Next.js dev rewrites when the API server
         // (port 3003) is down — in which case the body is an HTML error page.
+        // 0.6.112 — a 499 here is a CLIENT cancel (slow failover chain), not
+        // a server fault; either way this is NOT a dead end.
         let detail = '';
         try {
           const contentType = res.headers.get('content-type') || '';
@@ -1324,82 +1422,55 @@ export function DeviceKiosk() {
         } catch { detail = `(could not read response body, status ${res.status})`; }
         const message = `Server returned ${res.status}${detail ? `: ${detail}` : ''}`;
         console.error('[Kiosk Discovery] discover-register failed:', res.status, detail);
-        throw new Error(message);
+        // 0.6.112 — token-less waiting mode: the device stays pairable over
+        // the LAN while the background loop retries the cloud register.
+        enterWaitingFallback(message);
+        return;
       }
       const data = await res.json();
-      if (data.success && data.deviceToken) {
-        setDiscoveryToken(data.deviceToken);
-        discoveryTokenRef.current = data.deviceToken;
-        setDeviceToken(data.deviceToken);
-        setDeviceId(data.device.id);
-        saveDeviceToken(data.deviceToken);
-        saveDeviceId(data.device.id);
-        setDiscoveryStatus('waiting');
-        setStep('discovery');
-        startDeviceHeartbeat(data.deviceToken);
-        // Poll device-status for pairing requests (0.6.106 — 2s fallback:
-        // the LAN UDP offer + the socket rooms deliver instantly; this poll
-        // is only for the rare case where both channels missed).
-        if (discoveryPollRef.current) clearInterval(discoveryPollRef.current);
-        discoveryPollRef.current = setInterval(async () => {
-          try {
-            const statusRes = await apiFetch('/api/agency-devices/public/device-status', {
-              headers: { 'Authorization': `Bearer ${data.deviceToken}` },
-            });
-            if (statusRes.ok) {
-              const statusData = await statusRes.json();
-              if (statusData.success && statusData.pairingRequests?.length > 0) {
-                setPairingRequests(statusData.pairingRequests);
-              }
-              // If device was paired via another mechanism (e.g. auto-register), load agency
-              if (statusData.status === 'ONLINE' && statusData.agency) {
-                setDiscoveryStatus('discovered');
-                if (discoveryPollRef.current) { clearInterval(discoveryPollRef.current); discoveryPollRef.current = null; }
-                setTimeout(async () => {
-                  setDiscoveryStatus('connecting');
-                  try {
-                    const agencyRes = await apiFetch(`/api/agency-devices/public/agency?code=${encodeURIComponent(statusData.agency.customCode || '')}`, {
-                      headers: { 'Authorization': `Bearer ${data.deviceToken}` },
-                    });
-                    const agencyData = await agencyRes.json();
-                    if (agencyData.success) {
-                      setAgency(agencyData.agency);
-                      setServices(agencyData.services || []);
-                      setQueueStats(agencyData.queueStats);
-                      if (agencyData.agency.customCode) setAgencyCode(agencyData.agency.customCode);
-                      setIsDeviceRegistered(true);
-                      if (agencyData.agency.isQueueOpen && !agencyData.agency.isPaused) setStep('services');
-                    }
-                  } catch { setDiscoveryStatus('waiting'); }
-                }, 1500);
-              }
-            }
-          } catch { /* polling continues */ }
-        }, 2000);
-      } else {
-        setDiscoveryStatus('idle');
-        setDiscoveryError(data.error || 'Discovery registration failed');
-        toast.error(data.error || 'Discovery registration failed');
+      if (!adoptDiscoveryRegistration(data)) {
+        // Server answered but did not mint an identity (success:false etc.).
+        enterWaitingFallback(data?.error || 'Discovery registration failed');
       }
     } catch (err: unknown) {
-      setDiscoveryStatus('idle');
       const message = err instanceof Error
         ? (err.name === 'AbortError' ? 'Connection timed out. Please check your network and try again.' : err.message)
         : 'Network error — could not reach the server';
-      setDiscoveryError(message);
-      toast.error(message);
+      console.warn('[Kiosk Discovery] discover-register threw — entering waiting mode:', message);
+      // 0.6.112 — never dead-end: waiting mode + background re-register.
+      enterWaitingFallback(message);
     } finally {
       setDiscoveryLoading(false);
     }
   }, [discoverRegisterOnce, startDeviceHeartbeat]);
   // ─── Accept Pairing Request ───────────────────────────────
-  // 0.6.106 — DEVICE-TO-DEVICE accept: when the request arrived as a LAN UDP
-  // offer it carries the MANAGER DESKTOP's address (managerIp:managerPort).
-  // The accept then posts DIRECTLY to that desktop over the Wi-Fi/LAN — the
-  // pairing completes against the store the manager is actually watching,
-  // in one round-trip, with no cloud hop and no store-split reconcile wait.
-  // Falls back to the pinned-store accept (apiFetch) when the direct POST
-  // fails (AP isolation, firewall, desktop gone).
+  // 0.6.113 — HARDENED PAIRING PROTOCOL (user requirement: "kiosk do not
+  // immediately get the token and right to access but first a final checking
+  // if the kiosk got registered first, only then give access token and
+  // navigate to service selector"). Three strictly ordered phases:
+  //
+  //   PHASE A — ACCEPT (a registration REQUEST, never access):
+  //     the accept POST goes LAN-direct to the offering manager desktop when
+  //     the request carries managerIp, else to the pinned store. A response
+  //     that explicitly reports registered:false is a HARD FAIL — no token,
+  //     no navigation. The manager store itself now read-back-verifies the
+  //     write before answering (0.6.113).
+  //
+  //   PHASE B — FINAL CHECK (the kiosk independently verifies registration):
+  //     the card switches to the 'verifying' state ("Final check: verifying
+  //     registration…") and the kiosk re-reads the registration from the
+  //     manager store through GET /public/pairing-verify — a SECOND, read-only
+  //     view — until the row PROVES agency bound + ONLINE (+ the pairing
+  //     command completed when known). Up to 6 attempts, 700ms apart.
+  //     While this phase runs: NO token adoption, NO heartbeat switch, NO
+  //     navigation. If the check never passes → pairing cancelled, the token
+  //     is NOT granted, the kiosk returns to the waiting screen.
+  //
+  //   PHASE C — GRANT + PERSIST (only after a VERIFIED registration):
+  //     adopt the manager-minted token, persist the device id, bind the
+  //     kiosk's OWN orphan row (the store discover-register created it on —
+  //     the historic "pairing done but kiosk never registered as a paired
+  //     device" fault) and ONLY THEN navigate to the service selector.
   const handleAcceptPairing = useCallback(async (request: PairingRequest) => {
     // 0.6.103 — single-flight: ignore extra taps while one accept runs.
     if (pairingActionRef.current) return;
@@ -1407,8 +1478,13 @@ export function DeviceKiosk() {
     // state yet when the user clicks Accept (it was set by handleStartDiscovery
     // in a prior render cycle but the callback captures the old '' value).
     const token = discoveryTokenRef.current || discoveryToken;
-    if (!token) {
-      console.warn('[Kiosk] Accept pairing called but no discovery token available');
+    // 0.6.112 — a LAN UDP offer / socket push / poll request carries the
+    // MANAGER-MINTED deviceToken: the accept can run even when this kiosk
+    // never managed a cloud register (token-less waiting mode). Only a
+    // request that carries NO token at all cannot proceed.
+    const acceptTokenAvailable = request.deviceToken || token;
+    if (!acceptTokenAvailable) {
+      console.warn('[Kiosk] Accept pairing called but no device token available (neither local nor manager-minted)');
       toast.error('No device token — please try discovery again');
       setDiscoveryStatus('waiting');
       return;
@@ -1418,12 +1494,20 @@ export function DeviceKiosk() {
     setDiscoveryStatus('connecting');
     // Stop discovery polling immediately to avoid race conditions
     if (discoveryPollRef.current) { clearInterval(discoveryPollRef.current); discoveryPollRef.current = null; }
-    const adoptAndFinish = (data: { success?: boolean; error?: string; agency?: any; services?: any[] }) => {
-      if (!(data && data.success && data.agency)) return false;
-      // 0.6.100 — ADOPT the manager-issued device token when the pairing
-      // request carries one: from now on the manager store and THIS device
-      // share ONE canonical token (this is what authorizes shared-printer
-      // jobs and other cross-store commands).
+    const pairingDeclined = (message: string) => {
+      // 0.6.113 — every refusal path lands back in waiting mode with the
+      // token WITHHELD: the kiosk never enters the service selector unverified.
+      setDiscoveryStatus('waiting');
+      toast.error(message);
+    };
+    // 0.6.100 — PHASE C helper: grant access + enter the service selector.
+    // Runs ONLY after the final registration check passed.
+    const grantAccessAndEnter = (data: { agency?: any; services?: any[] }) => {
+      if (!(data && data.agency)) return false;
+      // ADOPT the manager-issued device token when the pairing request
+      // carries one: from now on the manager store and THIS device share
+      // ONE canonical token (this is what authorizes shared-printer jobs
+      // and other cross-store commands).
       const adoptedToken = request.deviceToken;
       if (adoptedToken && adoptedToken !== token) {
         try {
@@ -1431,10 +1515,9 @@ export function DeviceKiosk() {
           discoveryTokenRef.current = adoptedToken;
           setDiscoveryToken(adoptedToken);
           setDeviceToken(adoptedToken);
-          logDevice('kiosk_token_adopted', 'Adopted the manager-issued device token after pairing', { deviceType: 'KIOSK', status: 'ONLINE' });
+          logDevice('kiosk_token_adopted', 'Adopted the manager-issued device token AFTER the registration was verified', { deviceType: 'KIOSK', status: 'ONLINE' });
         } catch { /* keep the old token — pairing still works */ }
       }
-      // Use agency + services directly from the accept-pairing response
       setAgency({
         id: data.agency.id,
         name: data.agency.name,
@@ -1459,16 +1542,22 @@ export function DeviceKiosk() {
       if (data.agency.customCode) setAgencyCode(data.agency.customCode);
       setIsDeviceRegistered(true);
       setPairingRequests([]);
+      // pairing done (VERIFIED): stop the background re-register loop and close
+      // the discovery flow so a late cloud adoption cannot yank the kiosk back
+      // from 'services' to the waiting screen.
+      if (discoveryRegisterRetryRef.current) { clearInterval(discoveryRegisterRetryRef.current); discoveryRegisterRetryRef.current = null; }
+      discoveryFlowActiveRef.current = false;
       // Restart heartbeat to ensure it uses the correct token post-pairing
-      // (0.6.100 — the ADOPTED manager-issued token when one was carried).
+      // (the ADOPTED manager-issued token when one was carried).
       startDeviceHeartbeat(discoveryTokenRef.current || token);
       setStep('services');
       toast.success(t('kioskPairedSuccessfully') || 'Successfully connected!');
       return true;
     };
     try {
-      // ── 0.6.106 → 0.6.107 — LAN-DIRECT accept against the offering desktop ──
+      // ── PHASE A — ACCEPT (registration request; LAN-direct → pinned store) ──
       const offerToken = request.deviceToken || token;
+      let acceptData: { success?: boolean; error?: string; registered?: boolean; registration?: PairingRegistrationProof; agency?: any; services?: any[]; device?: any } | null = null;
       if (request.managerIp && typeof request.managerIp === 'string') {
         try {
           const base = `http://${request.managerIp}:${request.managerPort || 3080}`;
@@ -1483,6 +1572,7 @@ export function DeviceKiosk() {
           clearTimeout(timer);
           const directData = await directRes.json().catch(() => null);
           if (directData && directData.success && directData.agency) {
+            acceptData = directData;
             // 0.6.107 — the accepting desktop becomes this kiosk's permanent
             // device-to-device base: heartbeat/services/tickets/printing and
             // the realtime queue channel all run against it, offline-first.
@@ -1493,28 +1583,135 @@ export function DeviceKiosk() {
               }
             } catch { /* pin best-effort */ }
             try { logDevice('kiosk_accept_lan', 'Pairing accepted DIRECTLY against the manager desktop over the LAN', { deviceType: 'KIOSK', agencyId: request.agencyId, status: 'ONLINE' }); } catch { /* never block */ }
-            if (adoptAndFinish(directData)) return;
           }
           // Direct failed (401/404/409/network) — fall through to the
           // pinned-store accept below.
         } catch { /* LAN unreachable — pinned-store accept still runs */ }
       }
-      const res = await apiFetch('/api/agency-devices/device/accept-pairing', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
-        timeout: 8000,
-      });
-      const data = await res.json();
-      if (data.success && data.agency) {
-        adoptAndFinish(data);
-      } else {
-        setDiscoveryStatus('waiting');
-        toast.error(data.error || 'Pairing failed');
+      if (!acceptData) {
+        const res = await apiFetch('/api/agency-devices/device/accept-pairing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${offerToken}` },
+          body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+          timeout: 8000,
+        });
+        const data = await res.json();
+        if (data.success && data.agency) {
+          acceptData = data;
+        } else {
+          pairingDeclined(data.error || 'Pairing failed');
+          return;
+        }
+      }
+      // 0.6.113 — an accept response that explicitly reports the registration
+      // did NOT persist is a hard fail: the store itself withheld the
+      // registration, so this kiosk gets NO token and NO access.
+      if (acceptData && acceptData.registered === false) {
+        try { logDevice('kiosk_accept_unregistered', 'accept-pairing reported registered:false — token withheld, kiosk stays waiting', { deviceType: 'KIOSK', status: 'PAIRING' }, 'warn'); } catch { /* never block */ }
+        pairingDeclined(acceptData.error || 'Registration failed — access not granted');
+        return;
+      }
+
+      // ── PHASE B — FINAL CHECK: verify the kiosk IS REGISTERED ──
+      // Independent read-back through /public/pairing-verify. The token the
+      // request carries is still only a CANDIDATE — access is granted when
+      // the manager store's row proves the registration.
+      setDiscoveryStatus('verifying');
+      setPairingRequests([]);
+      const managerBase = (request.managerIp && typeof request.managerIp === 'string'
+        ? `http://${request.managerIp}:${request.managerPort || 3080}`
+        : getKioskLanBase()) || '';
+      const VERIFY_ATTEMPTS = 6;
+      const VERIFY_GAP_MS = 700;
+      let verified: { registered?: boolean; registration?: PairingRegistrationProof; device?: { id?: string; agencyId?: string; status?: string }; agency?: any; services?: any[] } | null = null;
+      const verifyRegistration = async (): Promise<void> => {
+        const params = new URLSearchParams();
+        params.set('agencyId', request.agencyId);
+        if (request.id) params.set('commandId', request.id);
+        if (managerBase) {
+          // LAN-direct verification against the manager desktop (offline OK).
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 4000);
+          try {
+            const vRes = await fetch(`${managerBase}/api/agency-devices/public/pairing-verify?${params.toString()}`, {
+              headers: { 'Authorization': `Bearer ${offerToken}` },
+              signal: ctl.signal,
+            });
+            const vData = await vRes.json().catch(() => null);
+            if (vData && vData.success && vData.registered === true && vData.device && vData.device.agencyId === request.agencyId && vData.device.status === 'ONLINE') {
+              verified = vData;
+            }
+          } finally {
+            clearTimeout(timer);
+          }
+        } else {
+          // Cloud store verification (kiosk never pinned a LAN desktop).
+          const vRes = await apiFetch(`/api/agency-devices/public/pairing-verify?${params.toString()}`, {
+            headers: { 'Authorization': `Bearer ${offerToken}` },
+            timeout: 4000,
+          });
+          const vData = await vRes.json().catch(() => null);
+          if (vData && vData.success && vData.registered === true && vData.device && vData.device.agencyId === request.agencyId && vData.device.status === 'ONLINE') {
+            verified = vData;
+          }
+        }
+      };
+      for (let attempt = 0; attempt < VERIFY_ATTEMPTS && !verified; attempt++) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, VERIFY_GAP_MS));
+        try {
+          await verifyRegistration();
+        } catch { /* retry — the manager write may still be settling */ }
+      }
+      if (!verified) {
+        // Registration could NOT be confirmed on the manager store → the
+        // access token is NOT granted and the kiosk NEVER reaches the
+        // service selector. Back to waiting; the operator can retry.
+        try { logDevice('kiosk_pairing_verify_failed', 'Final registration check FAILED — access token withheld, kiosk returned to waiting', { deviceType: 'KIOSK', agencyId: request.agencyId, status: 'PAIRING' }, 'warn'); } catch { /* never block */ }
+        pairingDeclined('Registration could not be verified — pairing cancelled, access not granted');
+        return;
+      }
+      try { logDevice('kiosk_pairing_verified', 'Final registration check PASSED — token granted, entering the service selector', { deviceType: 'KIOSK', agencyId: request.agencyId, status: 'ONLINE' }); } catch { /* never block */ }
+
+      // ── PHASE C — GRANT: persist the pair on the KIOSK's own store too ──
+      // The verified registration lives on the MANAGER store. The orphan row
+      // THIS kiosk created when it entered waiting mode (on its own pinned
+      // store) must be bound as well — otherwise the kiosk machine never
+      // shows the device as paired (the "kiosk does not get registered as a
+      // paired device" fault). Best-effort: it must never block the grant.
+      try {
+        const verifiedRegistration = (verified as { registration?: PairingRegistrationProof }).registration;
+        if (verifiedRegistration && verifiedRegistration.deviceId) {
+          saveDeviceId(verifiedRegistration.deviceId);
+          setDeviceId(verifiedRegistration.deviceId);
+        }
+        const orphanBase = orphanStoreBaseRef.current;
+        if (orphanBase && managerBase && orphanBase !== managerBase && token && token !== offerToken) {
+          const bindCtl = new AbortController();
+          const bindTimer = setTimeout(() => bindCtl.abort(), 4000);
+          try {
+            await fetch(`${orphanBase}/api/agency-devices/device/accept-pairing`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+              body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+              signal: bindCtl.signal,
+            });
+            try { logDevice('kiosk_orphan_bound', 'Kiosk-side orphan row bound after verified pairing — the pair now exists on BOTH stores', { deviceType: 'KIOSK', status: 'ONLINE' }); } catch { /* never block */ }
+          } finally {
+            clearTimeout(bindTimer);
+          }
+        }
+      } catch { /* best-effort bind — the grant never depends on it */ }
+
+      // ── PHASE C — GRANT + NAVIGATE: token adopted, service selector entered ──
+      const verifiedPayload = verified as { agency?: any; services?: any[] } | null;
+      if (!grantAccessAndEnter({
+        agency: (verifiedPayload && verifiedPayload.agency) || (acceptData ? acceptData.agency : null),
+        services: (verifiedPayload && verifiedPayload.services) || (acceptData ? acceptData.services : []),
+      })) {
+        pairingDeclined('Paired, but the agency configuration is unavailable — please retry');
       }
     } catch {
-      setDiscoveryStatus('waiting');
-      toast.error('Network error during pairing');
+      pairingDeclined('Network error during pairing');
     } finally {
       pairingActionRef.current = false;
       setPairingActionId(null);
@@ -1526,13 +1723,15 @@ export function DeviceKiosk() {
     // 0.6.103 — single-flight guard (same rationale as Accept).
     if (pairingActionRef.current) return;
     const token = discoveryTokenRef.current || discoveryToken;
-    if (!token) return;
+    // 0.6.112 — the manager-minted token rides the request; a token-less
+    // waiting kiosk can still reject politely.
+    if (!token && !request.deviceToken) return;
     pairingActionRef.current = true;
     setPairingActionId(request.id);
     try {
       await apiFetch('/api/agency-devices/device/reject-pairing', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${request.deviceToken || token}` },
         body: JSON.stringify({ commandId: request.id }),
         timeout: 8000,
       });
@@ -1559,7 +1758,12 @@ export function DeviceKiosk() {
 
   // Cleanup discovery poll on unmount
   useEffect(() => {
-    return () => { if (discoveryPollRef.current) clearInterval(discoveryPollRef.current); };
+    return () => {
+      if (discoveryPollRef.current) clearInterval(discoveryPollRef.current);
+      // 0.6.112 — the silent background re-register loop dies with the screen.
+      if (discoveryRegisterRetryRef.current) { clearInterval(discoveryRegisterRetryRef.current); discoveryRegisterRetryRef.current = null; }
+      discoveryFlowActiveRef.current = false;
+    };
   }, []);
 
   // ─── Auto-Connect for Already-Paired Devices ───────────────
@@ -1954,6 +2158,9 @@ export function DeviceKiosk() {
               onBack={() => {
                 if (discoveryPollRef.current) clearInterval(discoveryPollRef.current);
                 discoveryPollRef.current = null;
+                // 0.6.112 — leaving discovery also stops the re-register loop.
+                if (discoveryRegisterRetryRef.current) { clearInterval(discoveryRegisterRetryRef.current); discoveryRegisterRetryRef.current = null; }
+                discoveryFlowActiveRef.current = false;
                 setDiscoveryStatus('idle');
                 setPairingRequests([]);
                 setStep('code');
@@ -2083,6 +2290,33 @@ export function DeviceKiosk() {
           )}
         </div>
       )}
+
+      {/* 0.6.114 — KIOSK DEFAULT-PRINTER SETTING (operator surface). Visible
+          ONLY on the setup screens (connect / waiting-for-pairing) once the
+          kiosk holds a device token — never on the customer-facing service
+          selector or ticket screens. Opens the sheet listing the agency's
+          REGISTERED printers; the pick persists on this kiosk's own row and
+          the receipt button prints directly on it. */}
+      {(step === 'code' || step === 'discovery') && deviceToken && (
+        <button
+          type="button"
+          onClick={() => setPrinterSettingsOpen(true)}
+          aria-label={t('kioskPrinterSettings') || 'Printer settings'}
+          className="fixed bottom-4 start-4 z-40 inline-flex items-center gap-2 min-h-[44px] px-3.5 rounded-2xl bg-white/10 backdrop-blur-sm text-white/80 hover:text-white hover:bg-white/20 border border-white/15 text-xs font-medium transition-colors"
+        >
+          <Printer className="h-4 w-4" />
+          <span className="hidden sm:inline">{t('kioskPrinterSettings') || 'Printer settings'}</span>
+        </button>
+      )}
+
+      {/* 0.6.114 — the sheet itself (renders nothing while closed) */}
+      <KioskPrinterSettings
+        open={printerSettingsOpen}
+        onOpenChange={setPrinterSettingsOpen}
+        deviceToken={deviceToken}
+        t={t}
+        lang={lang}
+      />
     </div>
   );
 }

@@ -1725,6 +1725,7 @@ const ar = {
   kioskWaitingForManager: 'في انتظار مدير الأجهزة للعثور على هذا الجهاز...',
   kioskDiscovered: 'تم اكتشاف الجهاز! جاري الاتصال...',
   kioskAutoConnecting: 'جاري الاتصال التلقائي بالوكالة...',
+  kioskVerifyingRegistration: 'التحقق النهائي: جاري التحقق من التسجيل…',
   kioskPairingRequest: 'طلب الربط',
   kioskAcceptPairing: 'قبول',
   kioskPairingProcessing: 'جارٍ الاتصال…',
@@ -1768,6 +1769,17 @@ const ar = {
 
   // 0.6.104 — kiosk ticket action row (receipt choice + auto-return flow)
   kioskPrintReceipt: 'طباعة الوصل',
+  kioskNoPrinterConfigured: 'لا توجد طابعة افتراضية لهذا الكيوسك — افتح مدير الأجهزة على حاسوب الفرع، ثم افتح بطاقة هذا الكيوسك واختر الطابعة الافتراضية (أو احفظ طابعة افتراضية للوكالة)',
+  kioskPrinterUnreachable: 'خدمة الطباعة غير متاحة — تأكد من تشغيل تطبيق BLASTI على حاسوب الفرع في نفس الشبكة',
+  kioskPrinterSettings: 'إعدادات الطابعة',
+  kioskPrinterSettingsHint: 'تُطبع الوصلات على الطابعة المختارة هنا',
+  kioskPrinterDefaultSaved: 'تم حفظ الطابعة الافتراضية لهذا الكيوسك',
+  kioskPrinterDefaultSaveFailed: 'فشل حفظ الطابعة الافتراضية',
+  kioskPrinterNeedsPairing: 'اربط هذا الكيوسك بوكالة أولاً — الربط يمنحه الوصول إلى الطابعات المسجلة.',
+  kioskPrinterCurrent: 'تُطبع الوصلات على',
+  kioskPrinterAgencyDefaultHint: 'الطابعة المحفوظة كافتراضية للوكالة',
+  kioskPrinterRegisterHint: 'سجّل الطابعات من مدير الأجهزة على حاسوب الفرع أولاً',
+  kioskPrinterDirectPrintNote: 'اختيار الطابعة يحفظها ويطبع الوصلات عليها مباشرة — بدون نوافذ أو شاشة وصل.',
   kioskNextCustomer: 'تم — الزبون التالي',
 
   // ─── Kiosk Login ──────

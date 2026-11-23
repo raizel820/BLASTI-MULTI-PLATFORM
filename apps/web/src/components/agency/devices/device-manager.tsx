@@ -723,7 +723,7 @@ export function DeviceManager() {
     setBusyDeviceId(device.id);
     try {
       const fingerprint = device.fingerprint || device.blastiInfo?.fingerprint || device.blastiInfo?.instanceId || '';
-      const res = await apiFetch(deviceApi('/discovery/pairing-request-by-identity'), {
+      const sendOnce = () => apiFetch(deviceApi('/discovery/pairing-request-by-identity'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fingerprint: fingerprint || undefined,
@@ -733,8 +733,18 @@ export function DeviceManager() {
           deviceType: device.type,
         }),
       });
-      const data = await res.json();
-      if (data.success) {
+      // 0.6.112 — ONE bounded retry on 5xx/499: the local store can reject
+      // the first write transiently (SQLITE_BUSY under the busy desktop main
+      // process — the 2026-11-23 export showed a 19ms 500 that killed the
+      // whole LAN delivery and pushed the flow onto the slow cloud relay).
+      // A fast second attempt rides that out before anything else happens.
+      let res = await sendOnce();
+      if (!res.ok && (res.status >= 500 || res.status === 499)) {
+        await new Promise((r) => setTimeout(r, 600));
+        res = await sendOnce();
+      }
+      const data = await res.json().catch(() => null);
+      if (data?.success) {
         setPairRequestedIds((prev) => new Set(prev).add(device.id));
         if (data.autoConnected) {
           toast.success(getLocalizedString(
@@ -765,7 +775,10 @@ export function DeviceManager() {
         fetchDevices(true);
         fetchUnpaired();
       } else {
-        toast.error(data.error || getLocalizedString('فشل إرسال طلب الربط', "Échec de l'envoi", 'Pairing request failed', lang));
+        // 0.6.112 — surface the server's safe detail (SQLITE_BUSY, schema gap,
+        // …) so a failed pairing request is diagnosable from the toast alone.
+        const failMsg = [data?.error, data?.detail].filter(Boolean).join(' — ');
+        toast.error(failMsg || getLocalizedString('فشل إرسال طلب الربط', "Échec de l'envoi", 'Pairing request failed', lang));
       }
     } catch {
       toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));

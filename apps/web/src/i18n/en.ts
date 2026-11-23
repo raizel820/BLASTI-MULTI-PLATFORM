@@ -1723,6 +1723,7 @@ const en: Record<TranslationKeys, string> = {
   kioskWaitingForManager: 'Waiting for device manager to find this device...',
   kioskDiscovered: 'Device discovered! Connecting...',
   kioskAutoConnecting: 'Auto-connecting to agency...',
+  kioskVerifyingRegistration: 'Final check: verifying registration…',
   kioskPairingRequest: 'Pairing Request',
   kioskAcceptPairing: 'Accept',
   kioskPairingProcessing: 'Connecting…',
@@ -1766,6 +1767,17 @@ const en: Record<TranslationKeys, string> = {
 
   // 0.6.104 — kiosk ticket action row (receipt choice + auto-return flow)
   kioskPrintReceipt: 'Print receipt',
+  kioskNoPrinterConfigured: 'no default printer is set for this kiosk — open the Device Manager on the branch PC, open this kiosk card and pick a Default printer (or save an agency default printer)',
+  kioskPrinterUnreachable: 'Printer service unreachable — check that the branch PC is running BLASTI on the same network',
+  kioskPrinterSettings: 'Printer settings',
+  kioskPrinterSettingsHint: 'Receipts print on the printer chosen here',
+  kioskPrinterDefaultSaved: 'Default printer saved for this kiosk',
+  kioskPrinterDefaultSaveFailed: 'Failed to save the default printer',
+  kioskPrinterNeedsPairing: 'Connect this kiosk to an agency first — pairing gives it access to the registered printers.',
+  kioskPrinterCurrent: 'Receipts print on',
+  kioskPrinterAgencyDefaultHint: 'The printer saved as the agency default',
+  kioskPrinterRegisterHint: 'register printers from the Device Manager on the branch PC first',
+  kioskPrinterDirectPrintNote: 'Tapping a printer saves it and prints receipts directly — no popup, no receipt window.',
   kioskNextCustomer: 'Done — next customer',
 
   // ─── Kiosk Login ──────

@@ -163,13 +163,20 @@ export async function apiFetch(
       const errBody = error.body ?? { error: error.message };
       const errText = typeof errBody === 'string' ? errBody : JSON.stringify(errBody);
       noteRateLimit(error.status || 0);
+      // 0.6.112 — CALLER-CANCEL IS NOT A SERVER 500 (field fault 2026-11-23):
+      // the kiosk's discover-register abort surfaced as "500 {error: Request
+      // was cancelled}" in the log vault and the UI treated it as a server
+      // fault. A cancel (status 0 + that exact message from the abort paths
+      // in api-client) now reports 499 (client closed request) so callers and
+      // the Logs Manager can tell "we gave up / were slow" from "server broke".
+      const isCallerCancel = error.status === 0 && error.message === 'Request was cancelled';
       return {
         ok: false,
-        status: error.status || 500,
+        status: isCallerCancel ? 499 : (error.status || 500),
         statusText: error.message,
-        json: async () => errBody,
-        text: async () => errText,
-        blob: async () => new Blob([errText], { type: 'text/plain' }),
+        json: async () => (isCallerCancel ? { error: error.message, clientCancelled: true } : errBody),
+        text: async () => (isCallerCancel ? JSON.stringify({ error: error.message, clientCancelled: true }) : errText),
+        blob: async () => new Blob([isCallerCancel ? JSON.stringify({ error: error.message, clientCancelled: true }) : errText], { type: 'text/plain' }),
         headers: new Headers(),
       };
     }

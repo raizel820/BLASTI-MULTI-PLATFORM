@@ -22,7 +22,12 @@ import {
 } from 'lucide-react';
 import type { PairingRequest } from './kiosk-types';
 
-export type DiscoveryStatus = 'idle' | 'registering' | 'waiting' | 'discovered' | 'connecting';
+// 0.6.113 — 'verifying' is the HARDENED PAIRING PROTOCOL final check: the
+// kiosk accepted a pairing request and is independently confirming the
+// registration on the manager store BEFORE any access token is granted and
+// BEFORE the service selector is entered. No token, no navigation in this
+// state — only the read-back verification loop.
+export type DiscoveryStatus = 'idle' | 'registering' | 'waiting' | 'discovered' | 'connecting' | 'verifying';
 
 interface KioskDiscoveryLoginProps {
   status: DiscoveryStatus;
@@ -138,6 +143,8 @@ export function KioskDiscoveryLogin({
   const isWaiting = status === 'waiting';
   const isConnecting = status === 'connecting';
   const isDiscovered = status === 'discovered';
+  // 0.6.113 — the final registration check (hardened pairing protocol).
+  const isVerifying = status === 'verifying';
 
   return (
     <motion.div
@@ -166,7 +173,7 @@ export function KioskDiscoveryLogin({
 
             {/* Scanning sweep */}
             <AnimatePresence mode="wait">
-              {!hasPairingRequests && !isDiscovered && !isConnecting && (
+              {!hasPairingRequests && !isDiscovered && !isConnecting && !isVerifying && (
                 <motion.div
                   key="sweep"
                   className="absolute inset-0"
@@ -201,8 +208,8 @@ export function KioskDiscoveryLogin({
               </>
             )}
 
-            {/* Success pulse for discovered/connecting/paired */}
-            {(isDiscovered || isConnecting || hasPairingRequests) && (
+            {/* Success pulse for discovered/connecting/verifying/paired */}
+            {(isDiscovered || isConnecting || isVerifying || hasPairingRequests) && (
               <motion.div
                 initial={{ scale: 0.8, opacity: 0 }}
                 animate={{ scale: [1, 1.8, 1], opacity: [0.6, 0, 0.6] }}
@@ -214,7 +221,7 @@ export function KioskDiscoveryLogin({
             {/* Center icon */}
             <motion.div
               animate={{
-                scale: hasPairingRequests || isDiscovered || isConnecting
+                scale: hasPairingRequests || isDiscovered || isConnecting || isVerifying
                   ? [1, 1.15, 1]
                   : isRegistering
                     ? 1
@@ -228,7 +235,7 @@ export function KioskDiscoveryLogin({
               className="absolute inset-0 flex items-center justify-center"
             >
               <div className={`h-20 w-20 rounded-full flex items-center justify-center shadow-lg ring-4 ${
-                hasPairingRequests || isDiscovered || isConnecting
+                hasPairingRequests || isDiscovered || isConnecting || isVerifying
                   ? 'bg-emerald-100 ring-emerald-200'
                   : isRegistering
                     ? 'bg-teal-100 ring-teal-200'
@@ -236,6 +243,8 @@ export function KioskDiscoveryLogin({
               }`}>
                 {isRegistering ? (
                   <Loader2 className="h-9 w-9 text-teal-600 animate-spin" />
+                ) : isVerifying ? (
+                  <ShieldCheck className="h-10 w-10 text-emerald-600" />
                 ) : hasPairingRequests || isDiscovered || isConnecting ? (
                   <CheckCircle className="h-10 w-10 text-emerald-600" />
                 ) : (
@@ -250,6 +259,7 @@ export function KioskDiscoveryLogin({
             {hasPairingRequests && t('kioskPairingRequest')}
             {!hasPairingRequests && isDiscovered && t('kioskDiscovered')}
             {!hasPairingRequests && isConnecting && t('kioskAutoConnecting')}
+            {!hasPairingRequests && isVerifying && (t('kioskVerifyingRegistration') || 'Final check: verifying registration…')}
             {!hasPairingRequests && isRegistering && t('kioskWaitingForManager')}
             {!hasPairingRequests && isWaiting && t('kioskWaitingForManager')}
           </h2>
@@ -273,6 +283,12 @@ export function KioskDiscoveryLogin({
             )}
             {isDiscovered && 'Device manager has found this kiosk!'}
             {isConnecting && 'Loading agency configuration...'}
+            {isVerifying && (
+              <span className="flex items-center justify-center gap-2">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Confirming the device is registered before access is granted…
+              </span>
+            )}
             {hasPairingRequests && (
               <span className="text-emerald-600 font-medium">
                 {pairingRequests.length === 1
@@ -289,8 +305,8 @@ export function KioskDiscoveryLogin({
             </div>
           )}
 
-          {/* Kiosk IP Address — shown during waiting / registering / discovered / connecting */}
-          {kioskIp && (isWaiting || isRegistering || isDiscovered || isConnecting || hasPairingRequests) && (
+          {/* Kiosk IP Address — shown during waiting / registering / discovered / connecting / verifying */}
+          {kioskIp && (isWaiting || isRegistering || isDiscovered || isConnecting || isVerifying || hasPairingRequests) && (
             <KioskIpAddress ip={kioskIp} />
           )}
 
@@ -390,15 +406,20 @@ export function KioskDiscoveryLogin({
 
         {/* Footer with back button */}
         <div className="px-8 pb-6">
-          <motion.button
-            whileHover={{ scale: 1.01 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={onBack}
-            className="w-full min-h-[48px] rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            {t('kioskBack')}
-          </motion.button>
+          {/* 0.6.113 — NO back button while the final registration check runs:
+              the accept is in flight and the outcome (token granted or
+              withheld) must settle before the operator can leave the screen. */}
+          {!isVerifying && (
+            <motion.button
+              whileHover={{ scale: 1.01 }}
+              whileTap={{ scale: 0.98 }}
+              onClick={onBack}
+              className="w-full min-h-[48px] rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              {t('kioskBack')}
+            </motion.button>
+          )}
         </div>
       </div>
     </motion.div>
@@ -414,7 +435,7 @@ interface DiscoveryStartButtonProps {
 }
 
 export function DiscoveryStartButton({ status, t, onClick }: DiscoveryStartButtonProps) {
-  const isActive = status === 'waiting' || status === 'discovered' || status === 'connecting';
+  const isActive = status === 'waiting' || status === 'discovered' || status === 'connecting' || status === 'verifying';
   const isDisabled = status === 'registering' || isActive;
 
   return (

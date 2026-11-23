@@ -110,6 +110,8 @@ const DEVICE_STATUSES = ['ONLINE', 'OFFLINE', 'PAIRING', 'DISABLED', 'UPDATING']
 let _lastPairingStateCheckAt = 0
 // 0.6.110 — LAN pairing-state probe throttle (shares the 15s cadence).
 let _lastLanPairingStateCheckAt = 0
+// 0.6.112 — registered-list reconcile throttle (cloud-paired mirrors, 15s).
+let _lastRegisteredReconcileAt = 0
 
 // Hand-rolled validators (zod is not available in the local API). They accept
 // exactly the same values as the cloud zod schemas and return
@@ -848,6 +850,45 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     } catch { /* realtime must never break a route */ }
   }
 
+  // ─── 0.6.112 — transient-SQLite resilience for the pairing path ──────────
+  // Field log 2026-11-23: pairing-request-by-identity 500'd within 19ms — the
+  // pairing flow then never created the orphan row NOR fired the LAN offers,
+  // and the manager fell back to the slow cloud relay (the store-split class
+  // again: "pairing request does not reach the kiosk", "kiosk never shows as
+  // paired"). SQLite under the busy Electron main process can reject a
+  // statement instantly (SQLITE_BUSY / pool fetch timeout) — those failures
+  // are transient, so the DB operations retry with a short backoff, and the
+  // 500 responses carry a SAFE detail (message only — never the stack) so the
+  // next log export diagnoses the true cause instead of a bare string.
+  const TRANSIENT_DB_PATTERNS = [
+    'SQLITE_BUSY',
+    'database is locked',
+    'database table is locked',
+    'Timed out fetching connection',
+    'Connection closed',
+    'Cannot fetch data from server',
+    'connection idle timeout',
+  ]
+  const isTransientDbError = (err) => {
+    const msg = String((err && err.message) || '')
+    return TRANSIENT_DB_PATTERNS.some((p) => msg.includes(p))
+  }
+  const withDbRetry = async (fn, retries = 2, gapMs = 250) => {
+    let lastErr = null
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await fn()
+      } catch (err) {
+        lastErr = err
+        if (attempt >= retries || !isTransientDbError(err)) throw err
+        if (diagLog) diagLog('AGENCY-DEVICE transient DB error (retry ' + (attempt + 1) + '/' + retries + '): ' + (err && err.message))
+        await new Promise((r) => setTimeout(r, gapMs))
+      }
+    }
+    throw lastErr
+  }
+  const safeDbDetail = (err) => String((err && err.message) || 'unknown error').slice(0, 180)
+
   // ─── 0.6.104 — device-surface helpers (kiosk public routes) ──────────────
 
   // Device auth WITHOUT a staff session: resolves the Bearer token or the
@@ -1026,6 +1067,9 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const user = c.get('user')
     const agencyId = requireAgencyId(c)
     if (!agencyId) return
+    // 0.6.112 — an absent DB must answer 503 (retryable) instead of crashing
+    // into the 500 catch below.
+    if (!db) return c.json({ success: false, error: 'Local database not ready', code: 'DB_NOT_READY' }, 503)
     try {
       const body = await c.req.json().catch(() => ({}))
       const fingerprint = typeof body.fingerprint === 'string' ? body.fingerprint.slice(0, 200) : ''
@@ -1047,10 +1091,10 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       }
 
       let device = fingerprint
-        ? await db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } })
+        ? await withDbRetry(() => db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } }))
         : null
       if (!device && ip && fingerprint) {
-        device = await db.agencyDevice.findFirst({ where: { ipAddress: ip, status: 'PAIRING' } })
+        device = await withDbRetry(() => db.agencyDevice.findFirst({ where: { ipAddress: ip, status: 'PAIRING' } }))
       }
 
       if (device && device.agencyId && device.agencyId !== agencyId) {
@@ -1059,7 +1103,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
 
       let created = false
       if (!device) {
-        device = await db.agencyDevice.create({
+        device = await withDbRetry(() => db.agencyDevice.create({
           data: {
             agencyId: null,
             name: rawName || 'BLASTI Device',
@@ -1076,7 +1120,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
             lastHeartbeatAt: new Date(),
             statusChangedAt: new Date(),
           },
-        })
+        }))
         created = true
       }
 
@@ -1084,7 +1128,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         // Already ours → auto-connect (it was detected on the LAN again).
         const now = new Date()
         const wasOffline = device.status !== 'ONLINE'
-        const updated = await db.agencyDevice.update({
+        const updated = await withDbRetry(() => db.agencyDevice.update({
           where: { id: device.id },
           data: {
             status: 'ONLINE',
@@ -1095,7 +1139,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
             ...(port && device.port !== port ? { port } : {}),
           },
           select: DEVICE_SELECT_FIELDS,
-        })
+        }))
         broadcastSafe('agency-device:connected', { agencyId, deviceId: device.id, deviceName: device.name })
         broadcastSafe('device:online', { agencyId, deviceId: device.id })
         deviceEvents.deviceEvent('connect_success', `Auto-connected detected device: ${device.name || device.id}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId, status: 'ONLINE' })
@@ -1104,16 +1148,16 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
 
       // Orphan (existing or just created) → refresh presence + pairing request.
       const now = new Date()
-      await db.agencyDevice.update({
+      await withDbRetry(() => db.agencyDevice.update({
         where: { id: device.id },
         data: { status: 'PAIRING', lastHeartbeatAt: now, ...(ip ? { ipAddress: ip } : {}), ...(port ? { port } : {}) },
-      })
-      const agency = await db.agency.findUnique({
+      }))
+      const agency = await withDbRetry(() => db.agency.findUnique({
         where: { id: agencyId },
         select: { id: true, name: true, nameAr: true, nameFr: true, customCode: true },
-      })
+      }))
       if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
-      const command = await db.deviceCommand.create({
+      const command = await withDbRetry(() => db.deviceCommand.create({
         data: {
           deviceId: device.id,
           type: 'PAIRING_REQUEST',
@@ -1129,7 +1173,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
           status: 'PENDING',
           ttl: 600,
         },
-      })
+      }))
       broadcastSafe('agency-device:pairing-request', {
         agencyId: agency.id,
         deviceId: device.id,
@@ -1290,8 +1334,11 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         message: `Pairing request sent to ${device.name}`,
       })
     } catch (err) {
+      // 0.6.112 — the 500 now carries a SAFE detail (message + Prisma code) so
+      // the manager toast and the log vault show the true cause instead of a
+      // bare string that could be anything from SQLITE_BUSY to a schema gap.
       if (diagLog) diagLog('AGENCY-DEVICE pairing-by-identity error: ' + (err && err.message))
-      return c.json({ success: false, error: 'Failed to send pairing request' }, 500)
+      return c.json({ success: false, error: 'Failed to send pairing request', detail: safeDbDetail(err), code: (err && err.code) || undefined }, 500)
     }
   })
 
@@ -2329,6 +2376,96 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const agencyId = requireAgencyId(c)
     if (!agencyId) return
     try {
+      // ── 0.6.112 — REGISTERED-LIST RECONCILE (paired-device visibility) ────
+      // Field fault 2026-11-23: a kiosk whose discover-register landed in the
+      // CLOUD store completed its pairing accept against the cloud as well;
+      // the desktop's local store never learned about it, so the paired
+      // device NEVER appeared in the Device Manager ("pairing is done but
+      // the kiosk is not registered as a paired device"). The /unpaired
+      // backstops only settle rows the local store already tracks — this
+      // reconcile closes the last gap: throttled (once / 15s, best-effort),
+      // pull the agency's cloud registry and (1) CREATE local rows for
+      // paired fingerprints the local store misses, (2) SETTLE local orphan
+      // rows whose fingerprint the cloud shows paired with THIS agency.
+      // Skipped entirely when offline — the LAN accept path already binds
+      // both ends locally; this only heals cloud-completed pairs.
+      try {
+        const reconcileToken = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
+        if (reconcileToken && typeof ctx.cloudFetch === 'function' && Date.now() - _lastRegisteredReconcileAt > 15000) {
+          _lastRegisteredReconcileAt = Date.now()
+          const cloudListRes = await ctx.cloudFetch('/api/agency-devices', {
+            headers: { Accept: 'application/json', Authorization: 'Bearer ' + reconcileToken },
+          }, { timeoutMs: 6000, attempts: 1 })
+          if (cloudListRes.ok) {
+            const cloudList = await cloudListRes.json().catch(() => null)
+            const cloudDevices = (cloudList && cloudList.success && Array.isArray(cloudList.devices)) ? cloudList.devices : []
+            const localRows = await db.agencyDevice.findMany({
+              where: { deviceFingerprint: { not: null } },
+              select: { id: true, agencyId: true, status: true, deviceFingerprint: true, deviceToken: true },
+            })
+            const localByFp = new Map(localRows.map((row) => [row.deviceFingerprint, row]))
+            for (const cd of cloudDevices) {
+              const fp = typeof cd.deviceFingerprint === 'string' && cd.deviceFingerprint ? cd.deviceFingerprint : null
+              if (!fp) continue
+              const local = localByFp.get(fp)
+              const nowR = new Date()
+              if (!local) {
+                // (1) missing locally → mirror the cloud-paired row.
+                try {
+                  const createdRow = await db.agencyDevice.create({
+                    data: {
+                      agencyId,
+                      name: String(cd.name || 'Device').slice(0, 100),
+                      type: DEVICE_TYPES.includes(cd.type) ? cd.type : 'APP',
+                      status: DEVICE_STATUSES.includes(cd.status) ? cd.status : 'ONLINE',
+                      connectionType: CONNECTION_TYPES.includes(cd.connectionType) ? cd.connectionType : 'LAN',
+                      deviceToken: typeof cd.deviceToken === 'string' && cd.deviceToken ? cd.deviceToken : undefined,
+                      deviceFingerprint: fp,
+                      ipAddress: typeof cd.ipAddress === 'string' && cd.ipAddress ? cd.ipAddress : null,
+                      port: Number.isInteger(cd.port) ? cd.port : null,
+                      branchId: typeof cd.branchId === 'string' && cd.branchId ? cd.branchId : null,
+                      appVersion: typeof cd.appVersion === 'string' && cd.appVersion ? cd.appVersion : null,
+                      screenLayout: SCREEN_LAYOUTS.includes(cd.screenLayout) ? cd.screenLayout : undefined,
+                      lastHeartbeatAt: cd.lastHeartbeatAt ? new Date(cd.lastHeartbeatAt) : nowR,
+                      statusChangedAt: nowR,
+                      connectedAt: cd.connectedAt ? new Date(cd.connectedAt) : nowR,
+                    },
+                  })
+                  broadcastSafe('agency-device:connected', { agencyId, deviceId: createdRow.id, deviceName: createdRow.name, deviceType: createdRow.type, reconciled: true, via: 'registered-list-reconcile' })
+                  deviceEvents.deviceEvent('pairing_reconciled', 'Cloud-paired device mirrored into the local registry: ' + (createdRow.name || fp), { deviceId: createdRow.id, deviceName: createdRow.name, deviceType: createdRow.type, status: createdRow.status })
+                } catch (mkErr) {
+                  if (diagLog) diagLog('AGENCY-DEVICE registered-reconcile create skipped: ' + (mkErr && mkErr.message))
+                }
+              } else if (!local.agencyId) {
+                // (2) local orphan the cloud shows paired with THIS agency → settle
+                // (adopt the canonical token so cross-store commands keep working).
+                const settleData = {
+                  agencyId,
+                  status: DEVICE_STATUSES.includes(cd.status) ? cd.status : 'ONLINE',
+                  statusChangedAt: nowR,
+                  lastHeartbeatAt: nowR,
+                }
+                if (typeof cd.deviceToken === 'string' && cd.deviceToken && cd.deviceToken !== local.deviceToken) settleData.deviceToken = cd.deviceToken
+                await db.agencyDevice.update({ where: { id: local.id }, data: settleData }).catch(() => null)
+                broadcastSafe('agency-device:connected', { agencyId, deviceId: local.id, deviceName: cd.name, deviceType: cd.type, reconciled: true, via: 'registered-list-reconcile' })
+                deviceEvents.deviceEvent('pairing_reconciled', 'Cloud-paired orphan settled from the registered-list reconcile: ' + (cd.name || fp), { deviceId: local.id, deviceName: cd.name, status: settleData.status })
+              } else if (local.agencyId === agencyId && cd.status === 'ONLINE' && local.status !== 'ONLINE') {
+                // (3) known device the cloud sees ONLINE but this store shows
+                // stale (PAIRING/OFFLINE) → bring it up. Never downgrade: a
+                // local ONLINE always wins (the heartbeat owns liveness here).
+                await db.agencyDevice.update({
+                  where: { id: local.id },
+                  data: { status: 'ONLINE', statusChangedAt: nowR, lastHeartbeatAt: nowR },
+                }).catch(() => null)
+                deviceEvents.deviceEvent('pairing_reconciled', 'Stale device row brought ONLINE from the cloud registry: ' + (cd.name || fp), { deviceId: local.id, deviceName: cd.name, status: 'ONLINE' })
+              }
+            }
+          }
+        }
+      } catch (reconcileErr) {
+        if (diagLog) diagLog('AGENCY-DEVICE registered-list reconcile skipped: ' + (reconcileErr && reconcileErr.message))
+      }
+
       const status = c.req.query('status')
       const type = c.req.query('type')
       const where = { agencyId }
@@ -2846,14 +2983,16 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const user = c.get('user')
     const agencyId = requireAgencyId(c)
     if (!agencyId) return
+    // 0.6.112 — absent DB answers 503 (retryable), never a bare 500.
+    if (!db) return c.json({ success: false, error: 'Local database not ready', code: 'DB_NOT_READY' }, 503)
     try {
       const deviceId = c.req.param('id')
-      const device = await db.agencyDevice.findUnique({
+      const device = await withDbRetry(() => db.agencyDevice.findUnique({
         where: { id: deviceId },
         // 0.6.101 — deviceFingerprint selected: the socket push and the cloud
         // relay both key the delivery on the device's stable identity.
         select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true, deviceFingerprint: true, deviceToken: true, ipAddress: true, connectionType: true },
-      })
+      }))
       if (!device) {
         return c.json({ success: false, error: 'Device not found' }, 404)
       }
@@ -2870,14 +3009,14 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       if (!device.lastHeartbeatAt || device.lastHeartbeatAt < tenMinAgo) {
         return c.json({ success: false, error: 'Device is not currently online' }, 400)
       }
-      const agency = await db.agency.findUnique({
+      const agency = await withDbRetry(() => db.agency.findUnique({
         where: { id: agencyId },
         select: { id: true, name: true, nameAr: true, nameFr: true },
-      })
+      }))
       if (!agency) {
         return c.json({ success: false, error: 'Agency not found' }, 404)
       }
-      const command = await db.deviceCommand.create({
+      const command = await withDbRetry(() => db.deviceCommand.create({
         data: {
           deviceId,
           type: 'PAIRING_REQUEST',
@@ -2892,7 +3031,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
           status: 'PENDING',
           ttl: 600,
         },
-      })
+      }))
       broadcastSafe('agency-device:pairing-request', {
         agencyId: agency.id,
         deviceId: device.id,
@@ -2943,8 +3082,9 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         commandId: command.id,
       })
     } catch (err) {
+      // 0.6.112 — safe detail in the 500 body (see pairing-request-by-identity).
       if (diagLog) diagLog('AGENCY-DEVICE pairing-request error: ' + (err && err.message))
-      return c.json({ success: false, error: 'Failed to send pairing request' }, 500)
+      return c.json({ success: false, error: 'Failed to send pairing request', detail: safeDbDetail(err), code: (err && err.code) || undefined }, 500)
     }
   })
 
@@ -3950,6 +4090,110 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE kiosk-auth error: ' + (err && err.message))
       return c.json({ success: false, error: 'Kiosk authentication failed' }, 500)
+    }
+  })
+
+  // ─── 0.6.114 — KIOSK PRINTER SETTINGS (the setting ON the kiosk) ──────────
+  // User requirement: "there is no setting for select default printer for
+  // kiosk among registered printers". The Device Manager kiosk card already
+  // carries the Default-printer select (0.6.104), but the operator standing
+  // IN FRONT of the kiosk has no surface — and a kiosk whose pair was saved
+  // only on the cloud store never showed a local card at all. These two
+  // device-token routes give the KIOSK APP ITSELF a printer-settings sheet:
+  //   GET  /device/printer-options  — the agency's REGISTERED printers
+  //                                  (PRINTER AgencyDevice rows) + this
+  //                                  kiosk's current assignment + the
+  //                                  agency DefaultPrinter for context.
+  //   POST /device/printer-default  — persist the choice on the KIOSK's OWN
+  //                                  row (printerConfig
+  //                                  .defaultPrinterDeviceId — the same key
+  //                                  resolveKioskDefaultPrinter reads when
+  //                                  the receipt is printed), so the kiosk
+  //                                  prints on the printer the operator
+  //                                  picked right here.
+  app.get('/api/agency-devices/device/printer-options', async (c) => {
+    const db = getDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      if (!device.agencyId) return c.json({ success: false, error: 'Device is not paired with an agency yet' }, 409)
+      const printers = await db.agencyDevice.findMany({
+        where: { agencyId: device.agencyId, type: 'PRINTER' },
+        select: { id: true, name: true, nameAr: true, nameFr: true, connectionType: true, ipAddress: true, port: true, printerConfig: true },
+        orderBy: { createdAt: 'asc' },
+      })
+      const items = printers.map((p) => {
+        const pCfg = parseJSON(p.printerConfig || '{}') || {}
+        return {
+          id: p.id,
+          name: p.name,
+          nameAr: p.nameAr || null,
+          nameFr: p.nameFr || null,
+          connectionType: p.connectionType || 'LAN',
+          ipAddress: p.ipAddress || null,
+          port: p.port || null,
+          // attachment/hostIp tell the sheet HOW the print would travel
+          // (USB-on-host → forwarded to that PC; LAN → raw/ESC-POS direct).
+          attachment: pCfg.attachment || null,
+          hostIp: pCfg.hostIp || null,
+          cupsName: pCfg.cupsName || pCfg.osPrinterName || null,
+        }
+      })
+      const kioskCfg = parseJSON(device.printerConfig || '{}') || {}
+      const agencyDefault = await db.defaultPrinter.findUnique({ where: { agencyId: device.agencyId } }).catch(() => null)
+      return c.json({
+        success: true,
+        printers: items,
+        assignedPrinterId: typeof kioskCfg.defaultPrinterDeviceId === 'string' ? kioskCfg.defaultPrinterDeviceId : '',
+        agencyDefault: agencyDefault ? { name: agencyDefault.name || null, ip: agencyDefault.ip || null } : null,
+      })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE printer-options error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to load printer options' }, 500)
+    }
+  })
+
+  app.post('/api/agency-devices/device/printer-default', async (c) => {
+    const db = getDb()
+    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await kioskDeviceAuth(db, c)
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      if (!device.agencyId) return c.json({ success: false, error: 'Device is not paired with an agency yet' }, 409)
+      if (device.type !== 'KIOSK') return c.json({ success: false, error: 'Only kiosk devices can set a default printer this way' }, 403)
+      const body = await c.req.json().catch(() => ({}))
+      const printerId = typeof body.printerId === 'string' ? body.printerId.trim() : ''
+      const kioskCfg = parseJSON(device.printerConfig || '{}') || {}
+      const nextCfg = { ...kioskCfg }
+      if (printerId) {
+        // The chosen printer MUST be one of the agency's registered printers —
+        // an id from another store/agency would silently break receipt printing.
+        const printerRow = await db.agencyDevice.findUnique({ where: { id: printerId } })
+        if (!printerRow || printerRow.type !== 'PRINTER' || printerRow.agencyId !== device.agencyId) {
+          return c.json({ success: false, error: 'Selected printer is not a registered printer of this agency' }, 400)
+        }
+        nextCfg.defaultPrinterDeviceId = printerId
+      } else {
+        // Empty printerId clears the assignment → the agency DefaultPrinter
+        // becomes the print target again.
+        delete nextCfg.defaultPrinterDeviceId
+      }
+      await db.agencyDevice.update({
+        where: { id: device.id },
+        data: { printerConfig: JSON.stringify(nextCfg) },
+      })
+      broadcastSafe('agency-device:updated', { agencyId: device.agencyId, deviceId: device.id })
+      try {
+        deviceEvents.deviceEvent('kiosk_printer_default_set', printerId
+          ? `Kiosk "${device.name}" default printer set to a registered printer (set on the kiosk itself)`
+          : `Kiosk "${device.name}" default printer cleared (agency default applies)`,
+          { deviceId: device.id, deviceName: device.name, deviceType: 'KIOSK', agencyId: device.agencyId, printerId: printerId || null })
+      } catch { /* log only */ }
+      return c.json({ success: true, assignedPrinterId: printerId })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE printer-default error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to save the default printer' }, 500)
     }
   })
 

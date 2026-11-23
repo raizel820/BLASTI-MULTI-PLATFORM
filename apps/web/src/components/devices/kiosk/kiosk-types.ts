@@ -33,6 +33,24 @@ export interface PairingRequest {
   managerPort?: number;
 }
 
+/**
+ * 0.6.113 — HARDENED PAIRING PROTOCOL: registration proof.
+ * Both accept-pairing and the new pairing-verify endpoint return this object
+ * ONLY when the registration is confirmed persisted (agency bound + ONLINE).
+ * The kiosk grants the access token and navigates to the service selector
+ * exclusively on this proof — never on a bare accept response.
+ */
+export interface PairingRegistrationProof {
+  verified?: boolean;
+  deviceId?: string;
+  deviceName?: string;
+  agencyId?: string;
+  branchId?: string | null;
+  status?: string;
+  registeredAt?: string;
+  verifiedAt?: string;
+}
+
 export interface OfflineTicket {
   id: string;
   agencyId: string;

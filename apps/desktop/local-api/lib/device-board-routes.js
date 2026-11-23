@@ -1465,6 +1465,34 @@ function registerDeviceBoardRoutes(app, ctx) {
         data: { status: 'FAILED', error: 'Rejected — another pairing was accepted' },
       }).catch(() => { /* non-fatal */ })
 
+      // ── 0.6.113 — HARDENED PROTOCOL: READ-BACK REGISTRATION VERIFICATION ──
+      // The response is NOT access. Before this endpoint reports success the
+      // written row is RE-READ from the store and must PROVE the registration
+      // persisted: agency bound (exactly the requested one) + ONLINE status +
+      // the authenticating token still on the row. Any miss → registered:false
+      // and the kiosk withholds the token and stays on the waiting screen.
+      let registeredRow = null
+      try {
+        registeredRow = await db.agencyDevice.findUnique({
+          where: { id: device.id },
+          select: { id: true, name: true, status: true, agencyId: true, branchId: true, deviceToken: true, connectedAt: true },
+        })
+      } catch { /* read failure = unverified */ }
+      const registrationVerified = !!(
+        registeredRow &&
+        registeredRow.agencyId === agencyId &&
+        registeredRow.status === 'ONLINE' &&
+        (!registeredRow.deviceToken || !device.deviceToken || registeredRow.deviceToken === device.deviceToken)
+      )
+      if (!registrationVerified) {
+        log('accept-pairing: registration NOT persisted for device', device.id, '— access token withheld')
+        return c.json({
+          success: false,
+          registered: false,
+          error: 'Registration could not be persisted — access token not granted',
+        }, 500)
+      }
+
       const services = await db.service.findMany({
         where: { agencyId, isActive: true },
         select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
@@ -1483,6 +1511,17 @@ function registerDeviceBoardRoutes(app, ctx) {
 
       return c.json({
         success: true,
+        registered: true,
+        registration: {
+          verified: true,
+          deviceId: registeredRow.id,
+          deviceName: registeredRow.name,
+          agencyId: registeredRow.agencyId,
+          branchId: registeredRow.branchId || null,
+          status: registeredRow.status,
+          registeredAt: registeredRow.connectedAt || now,
+          verifiedAt: new Date(),
+        },
         device: updatedDevice,
         agency: { ...agency, isPaused: queueSettings ? queueSettings.isPaused : false },
         services,
@@ -1490,6 +1529,103 @@ function registerDeviceBoardRoutes(app, ctx) {
     } catch (err) {
       log('accept-pairing failed:', errorMessage(err))
       return c.json({ success: false, error: errorMessage(err) }, 500)
+    }
+  })
+
+  // ─── GET /public/pairing-verify — FINAL REGISTRATION CHECK (0.6.113) ──────
+  // Hardened pairing protocol, phase B: the kiosk does NOT adopt the access
+  // token or navigate to the service selector on the bare accept response.
+  // It first INDEPENDENTLY re-reads the registration from this endpoint — a
+  // second, read-only view of the same store — and only proceeds when the
+  // device row PROVES: bound to the requested agency + ONLINE (+, when the
+  // caller passes commandId, that specific PAIRING_REQUEST completed).
+  // Query: ?agencyId=<expected>&commandId=<pairing command id>  Auth: Bearer
+  // deviceToken (the candidate token the kiosk would adopt).
+  app.get('/api/agency-devices/public/pairing-verify', async (c) => {
+    const db = getDb()
+    if (!db) return c.json({ success: false, registered: false, error: 'Local database not ready' }, 503)
+    try {
+      const device = await requireDeviceAuth(db, c)
+      if (!device) return c.json({ success: true, registered: false, reason: 'NOT_AUTHENTICATED' })
+
+      const expectedAgencyId = c.req.query('agencyId') || ''
+      const commandId = c.req.query('commandId') || ''
+
+      const row = await db.agencyDevice.findUnique({
+        where: { id: device.id },
+        select: {
+          id: true, name: true, type: true, status: true,
+          agencyId: true, branchId: true, screenLayout: true, deviceToken: true,
+        },
+      })
+      if (!row) return c.json({ success: true, registered: false, reason: 'DEVICE_GONE' })
+
+      const bound = !!row.agencyId && (!expectedAgencyId || row.agencyId === expectedAgencyId)
+      const online = row.status === 'ONLINE'
+      let commandConfirmed = true
+      if (commandId) {
+        try {
+          const cmd = await db.deviceCommand.findFirst({
+            where: { id: commandId, deviceId: row.id, type: 'PAIRING_REQUEST' },
+            select: { status: true },
+          })
+          // A still-PENDING command means the accept never landed on the
+          // pairing itself — not registered. A missing row is tolerated (the
+          // offer may predate the command store on legacy mirrors).
+          if (cmd && cmd.status !== 'COMPLETED') commandConfirmed = false
+        } catch { /* legacy mirror without DeviceCommand — tolerated */ }
+      }
+
+      if (!(bound && online && commandConfirmed)) {
+        return c.json({
+          success: true,
+          registered: false,
+          reason: !bound ? 'NOT_BOUND' : !online ? 'NOT_ONLINE' : 'COMMAND_PENDING',
+          device: { id: row.id, name: row.name, status: row.status, agencyId: row.agencyId || null, branchId: row.branchId || null },
+        })
+      }
+
+      const agency = await db.agency.findUnique({
+        where: { id: row.agencyId, isActive: true },
+        select: {
+          id: true, name: true, nameAr: true, nameFr: true, customCode: true,
+          isQueueOpen: true, logoUrl: true, category: true,
+          workingHoursStart: true, workingHoursEnd: true,
+        },
+      })
+      if (!agency) {
+        return c.json({ success: true, registered: false, reason: 'AGENCY_INACTIVE', device: { id: row.id, name: row.name, status: row.status, agencyId: row.agencyId } })
+      }
+
+      const services = await db.service.findMany({
+        where: { agencyId: row.agencyId, isActive: true },
+        select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
+      })
+      const queueSettings = await db.queueSettings.findFirst({
+        where: { agencyId: row.agencyId },
+        select: { isPaused: true },
+        orderBy: { updatedAt: 'desc' },
+      })
+
+      return c.json({
+        success: true,
+        registered: true,
+        registration: {
+          verified: true,
+          deviceId: row.id,
+          deviceName: row.name,
+          agencyId: row.agencyId,
+          branchId: row.branchId || null,
+          status: row.status,
+          verifiedAt: new Date(),
+        },
+        device: { id: row.id, name: row.name, status: row.status, agencyId: row.agencyId, branchId: row.branchId, screenLayout: row.screenLayout },
+        agency: { ...agency, isPaused: queueSettings ? queueSettings.isPaused : false },
+        services,
+      })
+    } catch (err) {
+      log('pairing-verify failed:', errorMessage(err))
+      return c.json({ success: false, registered: false, error: errorMessage(err) }, 500)
     }
   })
 

@@ -1746,6 +1746,34 @@ app.post('/device/accept-pairing', async (c) => {
       data: { status: 'FAILED', error: 'Rejected — another pairing was accepted' },
     })
 
+    // ── 0.6.113 — HARDENED PROTOCOL: READ-BACK REGISTRATION VERIFICATION ──────
+    // The response is NOT access. Before this endpoint reports success the
+    // written row is RE-READ from the store and must PROVE the registration
+    // persisted: agency bound (exactly the requested one) + ONLINE status +
+    // the authenticating token still on the row. Any miss → registered:false
+    // and the kiosk withholds the token and stays on the waiting screen.
+    let registeredRow: { id: string; name: string; status: string; agencyId: string | null; branchId: string | null; deviceToken: string | null; connectedAt: Date | null } | null = null
+    try {
+      registeredRow = await db.agencyDevice.findUnique({
+        where: { id: device.id },
+        select: { id: true, name: true, status: true, agencyId: true, branchId: true, deviceToken: true, connectedAt: true },
+      })
+    } catch { /* read failure = unverified */ }
+    const registrationVerified = !!(
+      registeredRow &&
+      registeredRow.agencyId === agencyId &&
+      registeredRow.status === 'ONLINE' &&
+      (!registeredRow.deviceToken || !device.deviceToken || registeredRow.deviceToken === device.deviceToken)
+    )
+    if (!registrationVerified) {
+      console.error('[DEVICE/ACCEPT-PAIRING] registration NOT persisted for device', device.id, '— access token withheld')
+      return c.json({
+        success: false as const,
+        registered: false as const,
+        error: 'Registration could not be persisted — access token not granted',
+      }, 500)
+    }
+
     // Fetch services for the kiosk
     const services = await db.service.findMany({
       where: { agencyId, isActive: true },
@@ -1804,6 +1832,17 @@ app.post('/device/accept-pairing', async (c) => {
 
     return c.json({
       success: true,
+      registered: true,
+      registration: {
+        verified: true,
+        deviceId: registeredRow.id,
+        deviceName: registeredRow.name,
+        agencyId: registeredRow.agencyId,
+        branchId: registeredRow.branchId || null,
+        status: registeredRow.status,
+        registeredAt: registeredRow.connectedAt || now,
+        verifiedAt: new Date(),
+      },
       device: updatedDevice,
       agency: {
         ...agency,
@@ -1814,6 +1853,100 @@ app.post('/device/accept-pairing', async (c) => {
   } catch (error: unknown) {
     console.error('[DEVICE/ACCEPT-PAIRING]', error)
     return c.json({ success: false, error: 'Internal server error' }, 500)
+  }
+})
+
+// ─── GET /public/pairing-verify — FINAL REGISTRATION CHECK (0.6.113) ─────────
+// Hardened pairing protocol, phase B: the kiosk does NOT adopt the access
+// token or navigate to the service selector on the bare accept response.
+// It first INDEPENDENTLY re-reads the registration from this endpoint — a
+// second, read-only view of the same store — and only proceeds when the
+// device row PROVES: bound to the requested agency + ONLINE (+, when the
+// caller passes commandId, that specific PAIRING_REQUEST completed).
+// Query: ?agencyId=<expected>&commandId=<pairing command id>  Auth: Bearer
+// deviceToken (the candidate token the kiosk would adopt).
+
+app.get('/public/pairing-verify', async (c) => {
+  try {
+    const device = await requireDeviceAuth(c)
+    if (!device) {
+      return c.json({ success: true, registered: false, reason: 'NOT_AUTHENTICATED' })
+    }
+
+    const expectedAgencyId = c.req.query('agencyId') || ''
+    const commandId = c.req.query('commandId') || ''
+
+    const row = await db.agencyDevice.findUnique({
+      where: { id: device.id },
+      select: {
+        id: true, name: true, type: true, status: true,
+        agencyId: true, branchId: true, screenLayout: true, deviceToken: true,
+      },
+    })
+    if (!row) return c.json({ success: true, registered: false, reason: 'DEVICE_GONE' })
+
+    const bound = !!row.agencyId && (!expectedAgencyId || row.agencyId === expectedAgencyId)
+    const online = row.status === 'ONLINE'
+    let commandConfirmed = true
+    if (commandId) {
+      try {
+        const cmd = await db.deviceCommand.findFirst({
+          where: { id: commandId, deviceId: row.id, type: 'PAIRING_REQUEST' },
+          select: { status: true },
+        })
+        // A still-PENDING command means the accept never landed on the
+        // pairing itself — not registered. A missing row is tolerated (the
+        // offer may predate the command store on legacy paths).
+        if (cmd && cmd.status !== 'COMPLETED') commandConfirmed = false
+      } catch { /* legacy store without DeviceCommand — tolerated */ }
+    }
+
+    if (!(bound && online && commandConfirmed)) {
+      return c.json({
+        success: true,
+        registered: false,
+        reason: !bound ? 'NOT_BOUND' : !online ? 'NOT_ONLINE' : 'COMMAND_PENDING',
+        device: { id: row.id, name: row.name, status: row.status, agencyId: row.agencyId || null, branchId: row.branchId || null },
+      })
+    }
+
+    const agency = await db.agency.findUnique({
+      where: { id: row.agencyId!, isActive: true },
+      select: { id: true, name: true, nameAr: true, nameFr: true, customCode: true, isQueueOpen: true, logoUrl: true, category: true, workingHoursStart: true, workingHoursEnd: true },
+    })
+    if (!agency) {
+      return c.json({ success: true, registered: false, reason: 'AGENCY_INACTIVE', device: { id: row.id, name: row.name, status: row.status, agencyId: row.agencyId } })
+    }
+
+    const services = await db.service.findMany({
+      where: { agencyId: row.agencyId!, isActive: true },
+      select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
+    })
+    const queueSettings = await db.queueSettings.findFirst({
+      where: { agencyId: row.agencyId! },
+      select: { isPaused: true },
+      orderBy: { updatedAt: 'desc' },
+    })
+
+    return c.json({
+      success: true,
+      registered: true,
+      registration: {
+        verified: true,
+        deviceId: row.id,
+        deviceName: row.name,
+        agencyId: row.agencyId,
+        branchId: row.branchId || null,
+        status: row.status,
+        verifiedAt: new Date(),
+      },
+      device: { id: row.id, name: row.name, status: row.status, agencyId: row.agencyId, branchId: row.branchId, screenLayout: row.screenLayout },
+      agency: { ...agency, isPaused: queueSettings?.isPaused ?? false },
+      services,
+    })
+  } catch (error: unknown) {
+    console.error('[DEVICE/PAIRING-VERIFY]', error)
+    return c.json({ success: false, registered: false, error: 'Internal server error' }, 500)
   }
 })
 
@@ -1856,6 +1989,127 @@ app.post('/device/reject-pairing', async (c) => {
   } catch (error: unknown) {
     console.error('[DEVICE/REJECT-PAIRING]', error)
     return c.json({ success: false, error: 'Internal server error' }, 500)
+  }
+})
+
+// ─── 0.6.114 — KIOSK PRINTER SETTINGS (the setting ON the kiosk) ───────────
+// User requirement: "there is no setting for select default printer for kiosk
+// among registered printers". The Device Manager kiosk card already carries
+// the Default-printer select (0.6.104), but the operator standing IN FRONT of
+// the kiosk has no surface. These device-token routes give the KIOSK APP
+// ITSELF a printer-settings sheet over the agency's REGISTERED printers
+// (PRINTER AgencyDevice rows) and persist the choice on the kiosk's OWN row
+// (printerConfig.defaultPrinterDeviceId — the same key the print route's
+// resolveKioskDefaultPrinter reads when a receipt is printed).
+
+interface PrinterOptionItem {
+  id: string
+  name: string
+  nameAr: string | null
+  nameFr: string | null
+  connectionType: string
+  ipAddress: string | null
+  port: number | null
+  attachment: string | null
+  hostIp: string | null
+  cupsName: string | null
+}
+
+function parsePrinterConfigJson(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== 'string' || !raw) return {}
+  try { return JSON.parse(raw) as Record<string, unknown> } catch { return {} }
+}
+
+app.get('/device/printer-options', async (c) => {
+  try {
+    const device = await requireDeviceAuth(c)
+    if (!device) {
+      return c.json({ success: false, error: 'Device not authenticated' }, 401)
+    }
+    if (!device.agencyId) {
+      return c.json({ success: false, error: 'Device is not paired with an agency yet' }, 409)
+    }
+    const printers = await db.agencyDevice.findMany({
+      where: { agencyId: device.agencyId, type: 'PRINTER' },
+      select: { id: true, name: true, nameAr: true, nameFr: true, connectionType: true, ipAddress: true, port: true, printerConfig: true },
+      orderBy: { createdAt: 'asc' },
+    })
+    const items: PrinterOptionItem[] = printers.map((p: { id: string; name: string; nameAr: string | null; nameFr: string | null; connectionType: string | null; ipAddress: string | null; port: number | null; printerConfig: string | null }) => {
+      const pCfg = parsePrinterConfigJson(p.printerConfig)
+      return {
+        id: p.id,
+        name: p.name,
+        nameAr: p.nameAr,
+        nameFr: p.nameFr,
+        connectionType: p.connectionType || 'LAN',
+        ipAddress: p.ipAddress,
+        port: p.port,
+        attachment: typeof pCfg.attachment === 'string' ? pCfg.attachment : null,
+        hostIp: typeof pCfg.hostIp === 'string' ? pCfg.hostIp : null,
+        cupsName: typeof pCfg.cupsName === 'string' ? pCfg.cupsName : (typeof pCfg.osPrinterName === 'string' ? pCfg.osPrinterName : null),
+      }
+    })
+    const kioskCfg = parsePrinterConfigJson(device.printerConfig)
+    const agencyDefault = await db.defaultPrinter.findUnique({ where: { agencyId: device.agencyId } }).catch(() => null)
+    return c.json({
+      success: true,
+      printers: items,
+      assignedPrinterId: typeof kioskCfg.defaultPrinterDeviceId === 'string' ? kioskCfg.defaultPrinterDeviceId : '',
+      agencyDefault: agencyDefault ? { name: agencyDefault.name || null, ip: agencyDefault.ip || null } : null,
+    })
+  } catch (error: unknown) {
+    console.error('[DEVICE/PRINTER-OPTIONS]', error)
+    return c.json({ success: false, error: 'Failed to load printer options' }, 500)
+  }
+})
+
+app.post('/device/printer-default', async (c) => {
+  try {
+    const device = await requireDeviceAuth(c)
+    if (!device) {
+      return c.json({ success: false, error: 'Device not authenticated' }, 401)
+    }
+    if (!device.agencyId) {
+      return c.json({ success: false, error: 'Device is not paired with an agency yet' }, 409)
+    }
+    if (device.type !== 'KIOSK') {
+      return c.json({ success: false, error: 'Only kiosk devices can set a default printer this way' }, 403)
+    }
+    const body = await c.req.json().catch(() => ({})) as { printerId?: unknown }
+    const printerId = typeof body.printerId === 'string' ? body.printerId.trim() : ''
+    const kioskCfg = parsePrinterConfigJson(device.printerConfig)
+    const nextCfg: Record<string, unknown> = { ...kioskCfg }
+    if (printerId) {
+      // The chosen printer MUST be one of the agency's registered printers —
+      // an id from another store/agency would silently break receipt printing.
+      const printerRow = await db.agencyDevice.findUnique({ where: { id: printerId } })
+      if (!printerRow || printerRow.type !== 'PRINTER' || printerRow.agencyId !== device.agencyId) {
+        return c.json({ success: false, error: 'Selected printer is not a registered printer of this agency' }, 400)
+      }
+      nextCfg.defaultPrinterDeviceId = printerId
+    } else {
+      // Empty printerId clears the assignment → the agency DefaultPrinter
+      // becomes the print target again.
+      delete nextCfg.defaultPrinterDeviceId
+    }
+    await db.agencyDevice.update({
+      where: { id: device.id },
+      data: { printerConfig: JSON.stringify(nextCfg) },
+    })
+    emitAgencyDeviceEvent('agency-device:updated', device.agencyId, { deviceId: device.id, deviceName: device.name })
+    appendDeviceEvent({
+      event: 'kiosk_printer_default_set',
+      message: printerId
+        ? `Kiosk "${device.name}" default printer set to a registered printer (set on the kiosk itself)`
+        : `Kiosk "${device.name}" default printer cleared (agency default applies)`,
+      deviceId: device.id,
+      deviceName: device.name,
+      deviceType: device.type,
+    })
+    return c.json({ success: true, assignedPrinterId: printerId })
+  } catch (error: unknown) {
+    console.error('[DEVICE/PRINTER-DEFAULT]', error)
+    return c.json({ success: false, error: 'Failed to save the default printer' }, 500)
   }
 })
 
