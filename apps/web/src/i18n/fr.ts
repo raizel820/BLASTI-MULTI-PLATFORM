@@ -70,7 +70,7 @@ const fr: Record<TranslationKeys, string> = {
   logsUploadSoon: "Vient d'être envoyé — réessayez dans quelques secondes",
   logsUploadFailed: "Échec de l'envoi des journaux",
   logsServerMissingRoute: "Serveur de journaux obsolète",
-  logsServerMissingRouteHint: "Le serveur actuel n'accepte pas encore les journaux (/api/logs manquant). Le déploiement 0.6.16+ est requis — vos journaux sont conservés sur l'appareil et seront envoyés après la mise à jour.",
+  logsServerMissingRouteHint: "Le serveur actuel n'accepte pas encore les journaux (/api/logs manquant). Mettez le serveur à jour vers la dernière version — vos journaux sont conservés sur l'appareil et seront envoyés après la mise à jour.",
   logsLastUpload: "Dernier envoi",
   logsNeverUploaded: "Pas encore d'envoi — synchronisation auto toutes les 30s une fois connecté",
   logEntries: "entrées",
@@ -1769,6 +1769,15 @@ const fr: Record<TranslationKeys, string> = {
   kioskPrinterRegisterHint: "enregistrez d'abord les imprimantes depuis le Gestionnaire d'appareils sur le PC de l'agence",
   kioskPrinterDirectPrintNote: "Toucher une imprimante l'enregistre et imprime les reçus directement — sans fenêtre ni popup.",
   kioskNextCustomer: 'Terminé — client suivant',
+
+  // 0.6.113 — Gestionnaire d'appareils : interrupteur MODE DE CONNEXION
+  dmConnMode: 'Mode de connexion',
+  dmConnModeLocal: 'Local uniquement (LAN/Wi-Fi)',
+  dmConnModeCloud: 'Cloud autorisé',
+  dmConnModeLocalHint: 'Appareil à appareil strictement sur le réseau local — le cloud n\'est jamais utilisé pour la découverte ou l\'appairage et ne peut pas interferer.',
+  dmConnModeCloudHint: 'LAN/Wi-Fi d\'abord ; le cloud peut relayer l\'appairage des appareils distants et fusionner les appareils enregistrés dans le cloud.',
+  dmConnModeSaved: 'Mode de connexion mis à jour',
+  dmConnModeSaveFailed: 'Échec de la mise à jour du mode de connexion',
 
   // ─── Kiosk Login ──────
   kioskLoginTitle: 'Connexion de la borne',

@@ -56,6 +56,12 @@ const lanAuthority = require('./lib/lan-authority')
 // 0.6.88 — DEVICE EVENT STREAM producer (module-level: runEmbeddedScan and
 // stopEmbeddedScan live outside the route-registration closure).
 const deviceEvents = require('./lib/device-event')
+// 0.6.113 — LOCAL-ONLY vs CLOUD connection mode (Device Manager switch).
+// When mode === 'local' the cloud is NEVER part of the discovery/connection
+// protocol: no cloud merges, no cloud relays, no cloud reconciles — a deleted
+// device cannot be resurrected by a cloud mirror and pairing cannot be
+// interrupted by cloud state. See lib/connection-mode.js.
+const connectionMode = require('./lib/connection-mode')
 
 // ─── Helpers (mirror cloud route) ────────────────────────────────────────────
 
@@ -1004,6 +1010,50 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     return c.json(diagnosticsResponse())
   })
 
+  // ═══ 0.6.113 — CONNECTION MODE (Device Manager "Local only / Cloud" switch)
+  // 'local' → strict LAN/Wi-Fi device-to-device: the cloud is NEVER part of
+  //           the discovery/connection/pairing protocol and cannot interrupt
+  //           it (no merges, no relays, no reconciles).
+  // 'cloud' → LAN first, cloud relay/merge paths allowed (historic default).
+  app.get('/api/agency-devices/connection-mode', authMiddleware, async (c) => {
+    const db = c.get('db')
+    try {
+      const mode = await connectionMode.getConnectionMode(db)
+      return c.json({ success: true, mode, cloudAllowed: mode !== 'local' })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE connection-mode GET error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to load connection mode' }, 500)
+    }
+  })
+
+  app.put('/api/agency-devices/connection-mode', authMiddleware, async (c) => {
+    const db = c.get('db')
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const mode = body && (body.mode === 'local' || body.mode === 'cloud') ? body.mode : null
+      if (!mode) {
+        return c.json({ success: false, error: "mode must be 'local' or 'cloud'" }, 400)
+      }
+      const saved = await connectionMode.setConnectionMode(db, mode)
+      // 0.6.113 — device event trail: the protocol switch is an operator action.
+      try {
+        const user = c.get('user')
+        deviceEvents.deviceEvent(
+          saved === 'local' ? 'connection_mode_local' : 'connection_mode_cloud',
+          saved === 'local'
+            ? 'Device connection mode set to LOCAL ONLY (LAN/Wi-Fi) — the cloud is excluded from discovery & pairing'
+            : 'Device connection mode set to CLOUD ALLOWED — cloud relay/merge paths re-enabled',
+          { by: (user && (user.fullName || user.username)) || undefined },
+        )
+      } catch { /* event trail must never break the route */ }
+      if (diagLog) diagLog('AGENCY-DEVICE connection-mode set to ' + saved)
+      return c.json({ success: true, mode: saved, cloudAllowed: saved !== 'local' })
+    } catch (err) {
+      if (diagLog) diagLog('AGENCY-DEVICE connection-mode PUT error: ' + (err && err.message))
+      return c.json({ success: false, error: 'Failed to save connection mode' }, 500)
+    }
+  })
+
   // ═══ 0.6.96 — pair-by-identity + probe + cast snapshot ═══════════════════
 
   // POST /discovery/probe — TCP reachability probe (CLOUD PARITY: this route
@@ -1297,7 +1347,11 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       //   - Device with NO LAN address (genuinely remote / cloud-only
       //     registration) → cloud relay is the only possible channel.
       const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
-      const cloudTask = (!ip && token && typeof ctx.cloudFetch === 'function')
+      // 0.6.113 — LOCAL-ONLY mode: the cloud relay is NEVER fired, even for a
+      // device with no discovered LAN address. The operator pairs it over the
+      // LAN (or flips the mode back to cloud) — the cloud cannot interrupt.
+      const cloudAllowedIdentity = await connectionMode.isCloudAllowed(db).catch(() => true)
+      const cloudTask = (!ip && cloudAllowedIdentity && token && typeof ctx.cloudFetch === 'function')
         ? (async () => {
             try {
               const cloudRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-request-by-identity', {
@@ -2211,6 +2265,10 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const db = c.get('db')
     if (!requireAgencyId(c)) return
     try {
+      // 0.6.113 — LOCAL-ONLY mode: BOTH cloud backstops and the cloud merge
+      // below are skipped. Pairing state is healed by the LAN probe only and
+      // no cloud-registered orphan can appear (or resurrect after a delete).
+      const cloudAllowed = await connectionMode.isCloudAllowed(db).catch(() => true)
       const ninetySecAgo = new Date(Date.now() - 90 * 1000)
       const devices = await db.agencyDevice.findMany({
         where: {
@@ -2239,7 +2297,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       try {
         const orphansWithFp = devices.filter((d) => d.deviceFingerprint)
         const token0 = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
-        if (orphansWithFp.length > 0 && token0 && typeof ctx.cloudFetch === 'function'
+        if (cloudAllowed && orphansWithFp.length > 0 && token0 && typeof ctx.cloudFetch === 'function'
             && Date.now() - _lastPairingStateCheckAt > 15000) {
           _lastPairingStateCheckAt = Date.now()
           const stateRes = await ctx.cloudFetch('/api/agency-devices/discovery/pairing-state', {
@@ -2340,10 +2398,12 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       }
 
       // Cloud merge (best-effort — an offline desktop just sees local orphans).
+      // 0.6.113 — LOCAL-ONLY mode: never merged (no `cloud-` entries can reach
+      // the manager, so no pairing request can be routed to the cloud either).
       let cloudDevices = []
       try {
         const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
-        if (token && typeof ctx.cloudFetch === 'function') {
+        if (cloudAllowed && token && typeof ctx.cloudFetch === 'function') {
           const cloudRes = await ctx.cloudFetch('/api/agency-devices/unpaired', {
             headers: { Accept: 'application/json', Authorization: 'Bearer ' + token },
           }, { timeoutMs: 6000, attempts: 1 })
@@ -3084,7 +3144,9 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       // pairing request DEVICE-TO-DEVICE (it lives on this network, works
       // offline, and a cloud landing would split the request across stores).
       // The relay fires exclusively when the device has no LAN address.
-      if (!device.ipAddress) {
+      // 0.6.113 — LOCAL-ONLY mode: the relay NEVER fires (the cloud is not
+      // part of the pairing protocol in this mode at all).
+      if (!device.ipAddress && (await connectionMode.isCloudAllowed(db).catch(() => true))) {
         try {
           const token = typeof ctx.getSessionToken === 'function' ? ctx.getSessionToken() : null
           if (token && device.deviceFingerprint && typeof ctx.cloudFetch === 'function') {

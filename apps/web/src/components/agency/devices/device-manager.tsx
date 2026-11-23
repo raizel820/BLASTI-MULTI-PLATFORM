@@ -37,12 +37,15 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { TooltipProvider } from '@/components/ui/tooltip';
+// 0.6.113 — connection-mode switch (Local only vs Cloud)
+import { Switch } from '@/components/ui/switch';
 import { motion } from 'framer-motion';
 import {
   Monitor, RefreshCw, Copy, Radio, QrCode, Cast, Cable, ExternalLink,
   Loader2, Tv, Printer, Plus, Settings, Square, CheckCheck, Wifi,
   AlertTriangle, RadioTower, Usb, X, Search, MonitorPlay, Trash2, Unplug,
   Plug, Send, Smartphone, Laptop, Router as RouterIcon, Cpu,
+  Cloud, CloudOff,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useDiscoveryService } from '@/hooks/use-discovery-service';
@@ -233,6 +236,63 @@ export function DeviceManager() {
     fetchUnpaired();
     fetchSavedMeta();
   }, [fetchDevices, fetchBranches, fetchUnpaired, fetchSavedMeta]);
+
+  // ─── 0.6.113 — CONNECTION MODE (Local only vs Cloud switch) ──────────────
+  // 'local' → strict LAN/Wi-Fi device-to-device: the local API never consults
+  // the cloud for discovery/pairing (no merges, no relays, no reconciles) and
+  // the LAN topology reporter pauses — the cloud cannot interrupt anything.
+  // 'cloud' → historic behaviour (LAN first + cloud relay/merge paths).
+  const [connMode, setConnMode] = useState<'local' | 'cloud'>('cloud');
+  const [connModeLoaded, setConnModeLoaded] = useState(false);
+  const [connModeSaving, setConnModeSaving] = useState(false);
+
+  const fetchConnMode = useCallback(async () => {
+    try {
+      const res = await apiFetch(deviceApi('/connection-mode'));
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data && data.success && (data.mode === 'local' || data.mode === 'cloud')) {
+          setConnMode(data.mode);
+        }
+      }
+    } catch { /* keep default 'cloud' */ } finally {
+      setConnModeLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (agencyId) fetchConnMode();
+  }, [agencyId, fetchConnMode]);
+
+  const toggleConnMode = useCallback(async (cloudAllowed: boolean) => {
+    const mode: 'local' | 'cloud' = cloudAllowed ? 'cloud' : 'local';
+    if (mode === connMode || connModeSaving) return;
+    const prev = connMode;
+    setConnModeSaving(true);
+    setConnMode(mode); // optimistic
+    try {
+      const res = await apiFetch(deviceApi('/connection-mode'), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || !data.success) throw new Error((data && data.error) || 'failed');
+      setConnMode(data.mode === 'local' ? 'local' : 'cloud');
+      toast.success(
+        `${t('dmConnModeSaved')} — ${data.mode === 'local' ? t('dmConnModeLocal') : t('dmConnModeCloud')}`,
+      );
+      // The mode instantly changes what the manager lists (cloud merges vanish
+      // in local-only mode) — refresh both surfaces.
+      fetchUnpaired();
+      fetchDevices(true);
+    } catch {
+      setConnMode(prev);
+      toast.error(t('dmConnModeSaveFailed'));
+    } finally {
+      setConnModeSaving(false);
+    }
+  }, [connMode, connModeSaving, fetchUnpaired, fetchDevices, t]);
 
   // Unpaired polling (0.6.105 — 5s: the approval strip must surface a newly
   // registered kiosk fast; the 10s poll made pairing feel "very slow").
@@ -1322,6 +1382,35 @@ export function DeviceManager() {
                 {getLocalizedString('الفحص يعمل عبر الكمبيوتر الرئيسي فقط', 'Le scan nécessite le PC principal', 'Network scan needs the branch PC', lang)}
               </Badge>
             )}
+          </div>
+
+          {/* ── 0.6.113 — CONNECTION MODE switch (Local only / Cloud) ── */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border bg-card p-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              {connMode === 'local'
+                ? <CloudOff className="h-4 w-4 mt-0.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                : <Cloud className="h-4 w-4 mt-0.5 shrink-0 text-teal-600 dark:text-teal-400" />}
+              <div className="min-w-0">
+                <div className="text-sm font-semibold leading-tight">{t('dmConnMode')}</div>
+                <p className="text-xs text-muted-foreground mt-0.5 max-w-xl">
+                  {connMode === 'local' ? t('dmConnModeLocalHint') : t('dmConnModeCloudHint')}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              <span className={`text-xs font-medium ${connMode === 'local' ? 'text-foreground' : 'text-muted-foreground'}`}>
+                {t('dmConnModeLocal')}
+              </span>
+              <Switch
+                checked={connMode === 'cloud'}
+                disabled={!connModeLoaded || connModeSaving}
+                onCheckedChange={(v) => toggleConnMode(v)}
+                aria-label={t('dmConnMode')}
+              />
+              <span className={`text-xs font-medium ${connMode === 'cloud' ? 'text-foreground' : 'text-muted-foreground'}`}>
+                {t('dmConnModeCloud')}
+              </span>
+            </div>
           </div>
         </motion.div>
 

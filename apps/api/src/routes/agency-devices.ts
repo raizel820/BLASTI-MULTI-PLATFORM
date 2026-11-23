@@ -4346,6 +4346,53 @@ app.post('/discovery/register-peripheral', async (c) => {
   }
 })
 
+// ─── 0.6.113 — CONNECTION MODE (Device Manager "Local only / Cloud" switch) ──
+// Cloud parity with the desktop local API (same contract, same
+// SystemSetting key 'device_connection_mode'). The branch desktop is the
+// ENFORCER of this mode for discovery/pairing; this cloud copy exists so the
+// switch also works and persists when the manager is rendered against the
+// cloud API (plain browser) instead of the desktop's local API.
+const CONNECTION_MODE_KEY = 'device_connection_mode'
+
+app.get('/connection-mode', async (c) => {
+  try {
+    await requireAuth(c)
+    const row = await db.systemSetting.findUnique({ where: { key: CONNECTION_MODE_KEY } })
+    const mode = row && row.value === 'local' ? 'local' : 'cloud'
+    return c.json({ success: true, mode, cloudAllowed: mode !== 'local' })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+app.put('/connection-mode', async (c) => {
+  try {
+    await requireAuth(c)
+    const body = await c.req.json().catch(() => ({} as Record<string, unknown>))
+    const mode = body && body.mode === 'local' ? 'local' : body && body.mode === 'cloud' ? 'cloud' : null
+    if (!mode) return c.json({ success: false, error: "mode must be 'local' or 'cloud'" }, 400)
+    const existing = await db.systemSetting.findUnique({ where: { key: CONNECTION_MODE_KEY } })
+    if (existing) {
+      await db.systemSetting.update({ where: { key: CONNECTION_MODE_KEY }, data: { value: mode } })
+    } else {
+      await db.systemSetting.create({
+        data: {
+          key: CONNECTION_MODE_KEY,
+          value: mode,
+          category: 'devices',
+          valueType: 'string',
+          description: 'Device connection & discovery protocol: "cloud" allows the cloud relay/merge paths, "local" is strict LAN/Wi-Fi device-to-device.',
+        },
+      })
+    }
+    return c.json({ success: true, mode, cloudAllowed: mode !== 'local' })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 app.get('/discovery/health', async (c) => {
   try {
     await requireAuth(c)

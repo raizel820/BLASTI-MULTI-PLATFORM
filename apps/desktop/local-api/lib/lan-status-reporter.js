@@ -43,6 +43,11 @@ let opts = {
   applyJoinVerdicts: null, // (verdicts[]) => Promise<number>
   getPeripherals: null,    // () => [{ kind:'printer', name, cupsName, ... }]
   diag: null,              // (msg) => void
+  // 0.6.113 — LOCAL-ONLY connection mode: when the Device Manager switch is
+  // set to "Local only (LAN/Wi-Fi)", the cloud is NEVER part of the device
+  // connection & discovery protocol — the whole report / pin / verdict cycle
+  // pauses (the branch LAN topology stops being published to the cloud).
+  isCloudAllowed: null,    // async () => boolean
 }
 
 function log(msg) {
@@ -96,6 +101,15 @@ async function getJson(url, bearer) {
 
 /** One report pass — never throws. */
 async function reportOnce() {
+  // 0.6.113 — LOCAL-ONLY mode: the cloud must neither see nor influence the
+  // branch LAN. Skip the entire cycle; the next tick re-checks, so flipping
+  // the switch back to "Cloud allowed" re-enables reporting within ~30s.
+  if (typeof opts.isCloudAllowed === 'function') {
+    try {
+      const allowed = await opts.isCloudAllowed()
+      if (!allowed) return
+    } catch { /* check failure → historic behaviour (report) */ }
+  }
   const session = opts.getSession && opts.getSession()
   const snap = opts.statusSnapshot && opts.statusSnapshot()
   if (!session || !session.token || !snap || !snap.agencyId) return // no workspace open yet

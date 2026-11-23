@@ -13758,6 +13758,10 @@ async function startLocalApi(dbPath, port, options) {
             : []
         } catch { return [] }
       },
+      // 0.6.113 — LOCAL-ONLY gate: the whole cloud report/pin/verdict cycle
+      // pauses when the Device Manager switch puts this branch in strict
+      // LAN/Wi-Fi-only mode (the cloud is not part of the device protocol).
+      isCloudAllowed: () => require('./lib/connection-mode').isCloudAllowed(db),
       diag: diagLog,
     })
     // 0.6.100 — the master machine ASKS ITS OPERATOR: when an unknown device

@@ -70,7 +70,7 @@ const en: Record<TranslationKeys, string> = {
   logsUploadSoon: "Just uploaded — try again in a few seconds",
   logsUploadFailed: "Log upload failed",
   logsServerMissingRoute: "Log server is outdated",
-  logsServerMissingRouteHint: "The current server does not accept logs yet (/api/logs missing). The server needs the 0.6.16+ deployment — your logs are kept on-device and will upload automatically after the update.",
+  logsServerMissingRouteHint: "The current server does not accept logs yet (/api/logs missing). Update the server to the latest version — your logs are kept on-device and will upload automatically after the update.",
   logsLastUpload: "Last upload",
   logsNeverUploaded: "No upload yet — logs auto-sync every 30s while signed in",
   logEntries: "entries",
@@ -1779,6 +1779,15 @@ const en: Record<TranslationKeys, string> = {
   kioskPrinterRegisterHint: 'register printers from the Device Manager on the branch PC first',
   kioskPrinterDirectPrintNote: 'Tapping a printer saves it and prints receipts directly — no popup, no receipt window.',
   kioskNextCustomer: 'Done — next customer',
+
+  // 0.6.113 — Device Manager CONNECTION MODE switch (Local only vs Cloud)
+  dmConnMode: 'Connection mode',
+  dmConnModeLocal: 'Local only (LAN/Wi-Fi)',
+  dmConnModeCloud: 'Cloud allowed',
+  dmConnModeLocalHint: 'Strict device-to-device over the branch network — the cloud is never used for discovery or pairing and cannot interfere with it.',
+  dmConnModeCloudHint: 'LAN/Wi-Fi first; the cloud may relay pairing for remote devices and merge cloud-registered devices.',
+  dmConnModeSaved: 'Connection mode updated',
+  dmConnModeSaveFailed: 'Failed to update connection mode',
 
   // ─── Kiosk Login ──────
   kioskLoginTitle: 'Kiosk Device Login',

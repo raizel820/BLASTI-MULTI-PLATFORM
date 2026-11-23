@@ -144,8 +144,8 @@ export function ManualLogUpload({ className = '' }: { className?: string }) {
         // 0.6.17 — name the REAL cause instead of a bare "failed": the
         // deployed server predates the log vault. Field phones kept reading
         // "failed to upload logs: server missing logs route" with no idea
-        // what to do; the hint now says the server needs the 0.6.16+ deploy
-        // and that nothing is lost (entries stay buffered on-device).
+        // what to do; the hint now says to update the server to the latest
+        // version and that nothing is lost (entries stay buffered on-device).
         toast.error(t('logsServerMissingRoute'), {
           description: t('logsServerMissingRouteHint'),
           duration: 8000,
