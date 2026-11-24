@@ -875,6 +875,30 @@ function registerDeviceBoardRoutes(app, ctx) {
           device.deviceToken = managerToken
         } catch { /* non-fatal */ }
       }
+      // 0.6.117 — DELIVERY-LEG DEDUPE: the manager now races the UDP :3082
+      // offer and the LAN HTTP offer in parallel (plus a 3-datagram UDP
+      // burst), and the desktop UDP receiver forwards every datagram into
+      // THIS route. Without this check one manager click produced several
+      // PAIRING_REQUEST commands — duplicate Accept/Reject dialogs on the
+      // target PC. A PENDING PAIRING_REQUEST for the same device younger than
+      // 20s collapses into the original command.
+      try {
+        const dedupeSince = new Date(Date.now() - 20_000)
+        const recent = await db.deviceCommand.findFirst({
+          where: { deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING', createdAt: { gte: dedupeSince } },
+          orderBy: { createdAt: 'desc' },
+        })
+        if (recent) {
+          return c.json({
+            success: true,
+            delivered: true,
+            needsApproval: true,
+            deduped: true,
+            deviceId: device.id,
+            commandId: recent.id,
+          })
+        }
+      } catch { /* dedupe is best-effort — fall through to create */ }
       const command = await db.deviceCommand.create({
         data: {
           deviceId: device.id,
@@ -1870,6 +1894,11 @@ function registerDeviceBoardRoutes(app, ctx) {
 
   // POST /api/agency-devices/host/print-job — print a ticket/receipt/invoice
   // on THIS machine's printer. Body: { printerName?, cupsName?, ticket?, escposBase64? }
+  // 0.6.118 — this compat route now DELEGATES to the dedicated print-relay
+  // handler (lib/print-relay-handler.js): selected-printer resolution (the
+  // caller's pinned printer), the SERIAL job queue, one free retry and the
+  // secondary forward to a printer-host PC — identical behavior to the
+  // dedicated :3083 listener, one pipeline.
   app.post('/api/agency-devices/host/print-job', async (c) => {
     const clientIp = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || c.req.header('x-real-ip') || 'lan'
     if (!hostPrintLimiterCheck(clientIp)) {
@@ -1879,12 +1908,13 @@ function registerDeviceBoardRoutes(app, ctx) {
     const deviceHeader = c.req.header('X-Device-Token') || ''
     const token = bearer || deviceHeader
     const db = getDb()
-    let isDeviceCaller = false
+    let callerRow = null
     if (db && token) {
-      try { isDeviceCaller = !!(await db.agencyDevice.findFirst({ where: { deviceToken: token } })) } catch { /* not a device */ }
+      try { callerRow = await db.agencyDevice.findFirst({ where: { deviceToken: token } }) } catch { /* not a device */ }
     }
+    let isDeviceCaller = !!callerRow
     if (!isDeviceCaller) {
-      try { isDeviceCaller = !!require('./lib/lan-authority').verifyDeviceToken(token) } catch { /* not a lan token */ }
+      try { isDeviceCaller = !!require('./lan-authority').verifyDeviceToken(token) } catch { /* not a lan token */ }
     }
     if (!isDeviceCaller && !!(ctx.sessionToken && token === ctx.sessionToken)) isDeviceCaller = true
     if (!isDeviceCaller) {
@@ -1892,40 +1922,13 @@ function registerDeviceBoardRoutes(app, ctx) {
     }
     try {
       const body = await c.req.json().catch(() => ({}))
-      const printerName = typeof body.printerName === 'string' && body.printerName.trim() ? body.printerName.trim().slice(0, 120) : ''
-      const cupsName = typeof body.cupsName === 'string' && body.cupsName.trim() ? body.cupsName.trim().slice(0, 120) : printerName
-      const escposBase64 = typeof body.escposBase64 === 'string' ? body.escposBase64 : ''
-      const ticket = body.ticket && typeof body.ticket === 'object' ? body.ticket : null
-
-      // 1) Raw ESC/POS when the caller provides the buffer AND a CUPS queue.
-      if (escposBase64 && cupsName && process.platform !== 'win32') {
-        try {
-          const buf = Buffer.from(escposBase64, 'base64')
-          if (buf.length > 0 && buf.length < 1_000_000) {
-            const res = printEscposRaw(buf, cupsName)
-            if (res.ok) {
-              try { require('./device-event').deviceEvent('print_job_done', `Raw ESC/POS print via ${cupsName}`, { deviceType: 'PRINTER', status: 'OK', source: 'host-print-job' }) } catch { /* log only */ }
-              return c.json({ success: true, via: res.via })
-            }
-            log('host print-job lp failed:', res.error, '— falling back to HTML print')
-          }
-        } catch { /* fall through to HTML print */ }
-      }
-
-      // 2) HTML receipt via Electron silent print (cross-platform).
-      if (ticket && (ticket.ticketNumber || ticket.agencyName)) {
-        const html = buildReceiptHtml(ticket)
-        const res = await printHtmlSilent(html, printerName || undefined)
-        try {
-          require('./device-event').deviceEvent(res.ok ? 'print_job_done' : 'print_job_failed',
-            res.ok ? `Ticket ${ticket.ticketNumber || ''} printed on ${printerName || 'default printer'}` : `Host print failed: ${res.error}`,
-            { deviceType: 'PRINTER', status: res.ok ? 'OK' : 'FAILED', source: 'host-print-job', deviceName: printerName || undefined })
-        } catch { /* log only */ }
-        if (res.ok) return c.json({ success: true, via: 'electron-silent' })
-        return c.json({ success: false, error: res.error }, 500)
-      }
-
-      return c.json({ success: false, error: 'Nothing to print — provide ticket or escposBase64' }, 400)
+      const result = await require('./print-relay-handler').handleRelayedPrintJob({
+        db,
+        deviceRow: callerRow,
+        body,
+        source: 'host-print-job',
+      })
+      return c.json(result.payload, result.status && result.status !== 200 ? result.status : 200)
     } catch (err) {
       log('host print-job failed:', errorMessage(err))
       return c.json({ success: false, error: errorMessage(err) }, 500)

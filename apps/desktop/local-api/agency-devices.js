@@ -50,6 +50,12 @@ const castService = require('./lib/cast-service')
 // 0.6.106 — device-to-device pairing delivery: unicast the offer to the
 // discovered phone/tablet's own UDP pairing listener (:3082).
 const { sendPairingOfferUdp } = require('./lib/pairing-offer-udp')
+// 0.6.118 — dedicated print-relay services: the SENDER packages ticket
+// payloads and delivers them to the master/host PC over the predetermined
+// ports (see lib/lan-ports.js); the HANDLER (lib/print-relay-handler.js)
+// receives and prints on the master's connected + selected printer.
+const printRelaySender = require('./lib/print-relay-sender')
+const { BLASTI_LAN_PORTS } = require('./lib/lan-ports')
 // 0.6.96 — live BLASTI beacon registry (lan-authority listener): ACTIVE apps
 // between scans + the auto-connect-on-detection hook.
 const lanAuthority = require('./lib/lan-authority')
@@ -1293,45 +1299,56 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       const udpTask = ip
         ? sendPairingOfferUdp(ip, offerPayload).catch(() => false)
         : Promise.resolve(false)
-      const lanTask = (ip && port && port > 0)
+      // 0.6.117 — port-fallback sweep: a scan card's port can be stale (the
+      // scanner fingerprints unrelated web services on a PC; the beacon may
+      // not carry an HTTP port at all). Try the discovered port FIRST, then
+      // always fall back to 3080 — the BLASTI local API port — so the offer
+      // reaches the target even when the recorded port is wrong.
+      const lanTask = ip
         ? (async () => {
-            try {
-              const offerCtl = new AbortController()
-              const offerTimer = setTimeout(() => offerCtl.abort(), 1500)
-              const offerRes = await fetch(`http://${ip}:${port}/api/agency-devices/public/pairing-offer`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(offerPayload),
-                signal: offerCtl.signal,
-              })
-              clearTimeout(offerTimer)
-              const offerData = await offerRes.json().catch(() => null)
-              // 0.6.110 — ALREADY-PAIRED RECONCILE: the target reports it is
-              // bound to THIS agency → our orphan row missed its accept
-              // callback at some point (manager rebooting at accept time).
-              // Settle it right here so the pair becomes visible without any
-              // re-pairing round-trip — fully offline, device-to-device.
-              if (offerData && offerData.alreadyPaired && offerData.pairing
-                  && String((offerData.pairing.agencyId || '')) === String(agency.id)) {
-                try {
-                  const nowP = new Date()
-                  await db.agencyDevice.update({
-                    where: { id: device.id },
-                    data: {
-                      agencyId: agency.id,
-                      status: 'ONLINE',
-                      statusChangedAt: nowP,
-                      connectedAt: device.createdAt || nowP,
-                      lastHeartbeatAt: nowP,
-                    },
-                  })
-                  broadcastSafe('agency-device:connected', { agencyId: agency.id, deviceId: device.id, deviceName: device.name, deviceType: device.type, reconciled: true, via: 'already-paired-offer-response' })
-                  deviceEvents.deviceEvent('pairing_reconciled', 'Already-paired target reconciled from the pairing-offer response: ' + (device.name || device.id), { deviceId: device.id, deviceName: device.name, deviceType: device.type, status: 'ONLINE' })
-                  return 'reconciled'
-                } catch { /* fall through to the plain result */ }
-              }
-              return !!(offerData && offerData.success)
-            } catch { return false }
+            const portsL = [...new Set([Number(port) > 0 ? Number(port) : 3080, 3080])]
+            for (const p of portsL) {
+              try {
+                const offerCtl = new AbortController()
+                const offerTimer = setTimeout(() => offerCtl.abort(), 1500)
+                const offerRes = await fetch(`http://${ip}:${p}/api/agency-devices/public/pairing-offer`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(offerPayload),
+                  signal: offerCtl.signal,
+                })
+                clearTimeout(offerTimer)
+                const offerData = await offerRes.json().catch(() => null)
+                // 0.6.110 — ALREADY-PAIRED RECONCILE: the target reports it is
+                // bound to THIS agency → our orphan row missed its accept
+                // callback at some point (manager rebooting at accept time).
+                // Settle it right here so the pair becomes visible without any
+                // re-pairing round-trip — fully offline, device-to-device.
+                if (offerData && offerData.alreadyPaired && offerData.pairing
+                    && String((offerData.pairing.agencyId || '')) === String(agency.id)) {
+                  try {
+                    const nowP = new Date()
+                    await db.agencyDevice.update({
+                      where: { id: device.id },
+                      data: {
+                        agencyId: agency.id,
+                        status: 'ONLINE',
+                        statusChangedAt: nowP,
+                        connectedAt: device.createdAt || nowP,
+                        lastHeartbeatAt: nowP,
+                      },
+                    })
+                    broadcastSafe('agency-device:connected', { agencyId: agency.id, deviceId: device.id, deviceName: device.name, deviceType: device.type, reconciled: true, via: 'already-paired-offer-response' })
+                    deviceEvents.deviceEvent('pairing_reconciled', 'Already-paired target reconciled from the pairing-offer response: ' + (device.name || device.id), { deviceId: device.id, deviceName: device.name, deviceType: device.type, status: 'ONLINE' })
+                    return 'reconciled'
+                  } catch { /* fall through to the plain result */ }
+                }
+                if (offerData && offerData.success) return true
+                // Understood answer on this port but no success — try the 3080
+                // fallback before giving up (stale-port case).
+              } catch { /* next port */ }
+            }
+            return false
           })()
         : Promise.resolve(false)
       // 0.6.101 → 0.6.107 — STRICT DEVICE-TO-DEVICE DELIVERY. The user
@@ -1498,7 +1515,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         printerRow,
         mode: 'host-forward',
         hostIp: pCfg.hostIp,
-        hostPort: Number(pCfg.hostPort) > 0 ? Number(pCfg.hostPort) : 3080,
+        hostPort: Number(pCfg.hostPort) > 0 ? Number(pCfg.hostPort) : BLASTI_LAN_PORTS.HTTP_API,
         cupsName: pCfg.cupsName || pCfg.osPrinterName || printerRow.name || null,
       }
     }
@@ -1540,34 +1557,30 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
           ? JSON.parse(printerRow.printerConfig || '{}')
           : (printerRow && printerRow.printerConfig) || {}
         if (printerRow && printerRow.type === 'PRINTER' && cfg && cfg.attachment === 'USB' && cfg.hostIp) {
-          const hostPort = Number(cfg.hostPort) > 0 ? Number(cfg.hostPort) : 3080
+          const hostPort = Number(cfg.hostPort) > 0 ? Number(cfg.hostPort) : BLASTI_LAN_PORTS.HTTP_API
           const hostToken = printerRow.deviceToken || ''
           if (!hostToken) {
             return c.json({ success: false, error: 'HOST_NOT_PAIRED — pair the host PC first so print jobs can be authenticated' }, 409)
           }
-          const ctl = new AbortController()
-          const timer = setTimeout(() => ctl.abort(), 20_000)
-          try {
-            const fwd = await fetch(`http://${cfg.hostIp}:${hostPort}/api/agency-devices/host/print-job`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + hostToken },
-              body: JSON.stringify({
-                printerName: cfg.cupsName || cfg.osPrinterName || printerRow.name || undefined,
-                cupsName: cfg.cupsName || undefined,
-                ticket: body.ticket || undefined,
-                escposBase64: body.escposBase64 || undefined,
-              }),
-              signal: ctl.signal,
-            })
-            const fwdData = await fwd.json().catch(() => null)
-            if (fwd.ok && fwdData && fwdData.success) {
-              try { deviceEvents.deviceEvent('print_job_done', `USB print job forwarded to host ${cfg.hostIp}:${hostPort} for ${printerRow.name}`, { deviceType: 'PRINTER', status: 'OK', sessionId: printerDeviceId, source: 'usb-forward' }) } catch { /* log only */ }
-              return c.json({ success: true, via: 'host-forward', host: `${cfg.hostIp}:${hostPort}` })
-            }
-            return c.json({ success: false, error: (fwdData && fwdData.error) || `Host print failed (${fwd.status})`, host: `${cfg.hostIp}:${hostPort}` }, 502)
-          } finally {
-            clearTimeout(timer)
+          // 0.6.118 — the dedicated SENDER service delivers the job: the
+          // master/host PC's print-relay listener (:3083) first, then the
+          // compat route (:3080), two bounded rounds, real print outcome back.
+          const fwd = await printRelaySender.submitPrintJob({
+            hostIp: cfg.hostIp,
+            token: hostToken,
+            ticket: body.ticket || undefined,
+            escposBase64: body.escposBase64 || undefined,
+            printerName: cfg.cupsName || cfg.osPrinterName || printerRow.name || undefined,
+            cupsName: cfg.cupsName || undefined,
+            source: 'usb-forward',
+            timeoutMs: 6000,
+            log: (m) => diagLog && diagLog('PRINT-RELAY sender: ' + m),
+          })
+          if (fwd.ok) {
+            try { deviceEvents.deviceEvent('print_job_done', `USB print job forwarded to host ${fwd.host} for ${printerRow.name}`, { deviceType: 'PRINTER', status: 'OK', sessionId: printerDeviceId, source: 'usb-forward' }) } catch { /* log only */ }
+            return c.json({ success: true, via: 'host-forward', host: fwd.host })
           }
+          return c.json({ success: false, error: fwd.error || 'Host print failed', host: fwd.host }, 502)
         }
       } catch (fwdErr) {
         if (diagLog) diagLog('AGENCY-DEVICE print usb-forward error: ' + (fwdErr && fwdErr.message))
@@ -1600,29 +1613,24 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         if (!hostToken) {
           return c.json({ success: false, error: 'HOST_NOT_PAIRED — pair the host PC first so print jobs can be authenticated' }, 409)
         }
-        const ctl = new AbortController()
-        const timer = setTimeout(() => ctl.abort(), 20_000)
-        try {
-          const fwd = await fetch(`http://${kioskDefault.hostIp}:${kioskDefault.hostPort}/api/agency-devices/host/print-job`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + hostToken },
-            body: JSON.stringify({
-              printerName: kioskDefault.cupsName || undefined,
-              cupsName: kioskDefault.cupsName || undefined,
-              ticket: body.ticket || undefined,
-              escposBase64: body.escposBase64 || undefined,
-            }),
-            signal: ctl.signal,
-          })
-          const fwdData = await fwd.json().catch(() => null)
-          if (fwd.ok && fwdData && fwdData.success) {
-            try { deviceEvents.deviceEvent('print_job_done', `Kiosk default printer forwarded to host ${kioskDefault.hostIp}:${kioskDefault.hostPort} for ${kioskDefault.printerRow.name}`, { deviceType: 'PRINTER', status: 'OK', sessionId: kioskDefault.printerRow.id, source: 'kiosk-default-host-forward' }) } catch { /* log only */ }
-            return c.json({ success: true, via: 'host-forward', host: `${kioskDefault.hostIp}:${kioskDefault.hostPort}` })
-          }
-          return c.json({ success: false, error: (fwdData && fwdData.error) || `Host print failed (${fwd.status})`, host: `${kioskDefault.hostIp}:${kioskDefault.hostPort}` }, 502)
-        } finally {
-          clearTimeout(timer)
+        // 0.6.118 — the dedicated SENDER service (ports :3083 dedicated →
+        // :3080 compat, two bounded rounds) replaces the single inline fetch.
+        const fwd = await printRelaySender.submitPrintJob({
+          hostIp: kioskDefault.hostIp,
+          token: hostToken,
+          ticket: body.ticket || undefined,
+          escposBase64: body.escposBase64 || undefined,
+          printerName: kioskDefault.cupsName || undefined,
+          cupsName: kioskDefault.cupsName || undefined,
+          source: 'kiosk-default-host-forward',
+          timeoutMs: 6000,
+          log: (m) => diagLog && diagLog('PRINT-RELAY sender: ' + m),
+        })
+        if (fwd.ok) {
+          try { deviceEvents.deviceEvent('print_job_done', `Kiosk default printer forwarded to host ${fwd.host} for ${kioskDefault.printerRow.name}`, { deviceType: 'PRINTER', status: 'OK', sessionId: kioskDefault.printerRow.id, source: 'kiosk-default-host-forward' }) } catch { /* log only */ }
+          return c.json({ success: true, via: 'host-forward', host: fwd.host })
         }
+        return c.json({ success: false, error: fwd.error || 'Host print failed', host: fwd.host }, 502)
       } else if (kioskDefault && kioskDefault.mode === 'os-print') {
         // Loopback / locally-attached → let the EXISTING 0.6.103 os-print path
         // below handle it (test pages included) by pointing it at the row.
@@ -1654,7 +1662,36 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         }
       } catch { /* fall through */ }
     }
-    if (!ip) return c.json({ success: false, error: 'No printer target — save a default printer or pass ip' }, 400)
+    // 0.6.118 — KIOSK → MASTER PC RELAY (the dedicated print service chain):
+    // when THIS store cannot resolve any printer target (the usual kiosk case
+    // — its own store carries no printer rows), the kiosk SENDS the ticket
+    // information to the MASTER PC (the elected LAN master / freshest desktop
+    // beacon), whose dedicated print-relay handler prints it on the CONNECTED
+    // and SELECTED printer (the kiosk row in the master's store pins it via
+    // printerConfig.defaultPrinterDeviceId). Device-to-device, no cloud.
+    if (!ip) {
+      const kioskToken = (kioskDevice && kioskDevice.deviceToken)
+        || c.req.header('x-device-token')
+        || (c.req.header('Authorization') || '').replace(/^Bearer\s+/i, '')
+      const master = printRelaySender.resolveMasterPcAddress()
+      if (master && master.ip && kioskToken && body.ticket && typeof body.ticket === 'object' && !body.test) {
+        const relay = await printRelaySender.submitPrintJob({
+          hostIp: master.ip,
+          token: kioskToken,
+          ticket: body.ticket,
+          escposBase64: typeof body.escposBase64 === 'string' ? body.escposBase64 : undefined,
+          source: 'kiosk-master-relay',
+          timeoutMs: 6000,
+          log: (m) => diagLog && diagLog('PRINT-RELAY sender: ' + m),
+        })
+        if (relay.ok) {
+          try { deviceEvents.deviceEvent('print_job_done', `Ticket relayed to master PC ${relay.host} (${master.via}) and printed on the selected printer`, { deviceType: 'KIOSK', status: 'OK', sessionId: relay.jobId, source: 'kiosk-master-relay' }) } catch { /* log only */ }
+          return c.json({ success: true, via: 'master-relay', host: relay.host, master: master.name || master.ip })
+        }
+        if (diagLog) diagLog('PRINT-RELAY master relay failed: ' + (relay.error || 'unknown') + ' — falling through to the target error')
+      }
+      return c.json({ success: false, error: 'No printer target — save a default printer or pass ip' }, 400)
+    }
 
     // 0.6.103 — LOCALLY-ATTACHED (USB / loopback) printers: raw JetDirect TCP
     // can never reach a printer plugged into THIS PC's USB port — the old code
@@ -3077,7 +3114,9 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         where: { id: deviceId },
         // 0.6.101 — deviceFingerprint selected: the socket push and the cloud
         // relay both key the delivery on the device's stable identity.
-        select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true, deviceFingerprint: true, deviceToken: true, ipAddress: true, connectionType: true },
+        // 0.6.117 — port selected: the LAN HTTP offer leg needs the target's
+        // discovered API port.
+        select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true, deviceFingerprint: true, deviceToken: true, ipAddress: true, port: true, connectionType: true },
       }))
       if (!device) {
         return c.json({ success: false, error: 'Device not found' }, 404)
@@ -3139,6 +3178,96 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         deviceToken: device.deviceToken || undefined,
         sentAt: command.createdAt,
       })
+      // ── 0.6.117 — LAN DELIVERY LEGS (the "pairing request does not reach
+      // other pc devices" root-cause fix): this route used to write the
+      // command ONLY into THIS manager's store — a PC/kiosk waiting on its
+      // OWN local API never saw it (the two-stores bug the by-identity route
+      // fixed for scan cards in 0.6.106). The unpaired-strip route now
+      // delivers device-to-device the SAME way:
+      //   (1) UDP :3082 unicast — ACKed by phones (Android plugin) AND PCs
+      //       (lib/pairing-offer-udp-receiver, new in 0.6.117).
+      //   (2) LAN HTTP DIRECT — POST the offer straight to the target's
+      //       /api/agency-devices/public/pairing-offer, with a 3080 fallback
+      //       when the stored port is stale (a scan card's port can point at
+      //       an unrelated web service the scanner fingerprinted).
+      // The cloud relay below stays the ONLY channel for devices with no LAN
+      // address, and it keeps the connection-mode gate.
+      const managerIpP = typeof ctx.getLanIp === 'function' ? ctx.getLanIp() : null
+      const managerPortP = (typeof ctx.getHttpPort === 'function' && ctx.getHttpPort()) || 3080
+      const offerTypeP = device.type === 'TV' ? 'TV'
+        : device.type === 'KIOSK' ? 'KIOSK'
+          : device.type === 'PRINTER' ? 'PRINTER'
+            : device.type === 'PHONE' ? 'PHONE'
+              : 'APP'
+      const offerPayloadP = {
+        fingerprint: device.deviceFingerprint || undefined,
+        deviceName: device.name || undefined,
+        deviceType: offerTypeP === 'APP' ? 'desktop' : offerTypeP.toLowerCase(),
+        deviceToken: device.deviceToken || undefined,
+        managerIp: managerIpP || undefined,
+        managerPort: managerPortP,
+        commandId: command.id,
+        agencyId: agency.id,
+        agencyName: agency.name,
+        agencyNameAr: agency.nameAr || undefined,
+        agencyNameFr: agency.nameFr || undefined,
+        sentByName: user.fullName || user.username,
+        sentAt: command.createdAt,
+      }
+      const targetIpP = device.ipAddress
+      const udpTaskP = targetIpP
+        ? sendPairingOfferUdp(targetIpP, offerPayloadP).catch(() => false)
+        : Promise.resolve(false)
+      const lanTaskP = targetIpP
+        ? (async () => {
+            const portsP = [...new Set([Number(device.port) > 0 ? Number(device.port) : 3080, 3080])]
+            for (const p of portsP) {
+              try {
+                const ctlP = new AbortController()
+                const timerP = setTimeout(() => ctlP.abort(), 1500)
+                const resP = await fetch(`http://${targetIpP}:${p}/api/agency-devices/public/pairing-offer`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(offerPayloadP),
+                  signal: ctlP.signal,
+                })
+                clearTimeout(timerP)
+                const dataP = await resP.json().catch(() => null)
+                if (dataP && dataP.alreadyPaired && dataP.pairing
+                    && String((dataP.pairing.agencyId || '')) === String(agency.id)) {
+                  // 0.6.117 — already-paired reconcile (mirrors the
+                  // by-identity route): our orphan row missed its accept
+                  // callback at some point — settle it here so the pair is
+                  // visible without any re-pairing round-trip.
+                  try {
+                    const nowP = new Date()
+                    await db.agencyDevice.update({
+                      where: { id: device.id },
+                      data: {
+                        agencyId: agency.id,
+                        status: 'ONLINE',
+                        statusChangedAt: nowP,
+                        connectedAt: nowP,
+                        lastHeartbeatAt: nowP,
+                      },
+                    })
+                    broadcastSafe('agency-device:connected', { agencyId: agency.id, deviceId: device.id, deviceName: device.name, reconciled: true, via: 'id-pairing-offer-response' })
+                    return 'reconciled'
+                  } catch { /* fall through to the plain result */ }
+                }
+                if (dataP && dataP.success) return true
+                // A 4xx/5xx that the target understood — a second port on the
+                // same host will not answer better UNLESS this was a wrong-port
+                // hit (404/no BLASTI API). Continue to the fallback port.
+              } catch { /* try the next port */ }
+            }
+            return false
+          })()
+        : Promise.resolve(false)
+      const [udpOfferP, lanOfferP] = await Promise.all([udpTaskP, lanTaskP])
+      if (udpOfferP) {
+        deviceEvents.deviceEvent('pairing_delivered_lan', `Pairing offer delivered DEVICE-TO-DEVICE over the LAN (UDP ack) to ${device.name} @ ${targetIpP}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId: agency.id, status: 'DELIVERED' })
+      }
       // 0.6.101 → 0.6.107 — cross-store relay ONLY for genuinely remote
       // devices. A LAN-discovered orphan (ipAddress set) must receive its
       // pairing request DEVICE-TO-DEVICE (it lives on this network, works
@@ -3168,6 +3297,12 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         success: true,
         message: `Pairing request sent to ${device.name}`,
         commandId: command.id,
+        delivery: {
+          udpOffer: udpOfferP === true,
+          lanOffer: lanOfferP === true || lanOfferP === 'reconciled',
+          reconciled: lanOfferP === 'reconciled',
+          needsApproval: true,
+        },
       })
     } catch (err) {
       // 0.6.112 — safe detail in the 500 body (see pairing-request-by-identity).

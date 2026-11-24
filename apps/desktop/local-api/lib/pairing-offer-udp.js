@@ -24,7 +24,12 @@
 const dgram = require('dgram')
 
 /** UDP port the BLASTI phone/tablet plugin listens on (BlastiNativeStatus). */
-const PAIRING_OFFER_UDP_PORT = 3082
+// 0.6.118 — the pairing offer port now comes from the canonical LAN port
+// registry (lib/lan-ports.js) — one source of truth for the predetermined
+// discovery/communication/listen ports (pc-pc + pc-kiosk).
+const { BLASTI_LAN_PORTS } = require('./lan-ports')
+
+const PAIRING_OFFER_UDP_PORT = BLASTI_LAN_PORTS.UDP_PAIRING
 
 /**
  * Send a pairing offer to a device's LAN pairing listener.
