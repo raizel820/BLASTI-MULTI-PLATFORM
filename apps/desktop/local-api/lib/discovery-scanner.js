@@ -2836,6 +2836,27 @@ const VIRTUAL_PRINTER_NAMES = new Set([
   'pdf995', 'pdf995 printer',
 ])
 
+// 0.6.123 — KEYWORD patterns for the virtual queues the exact-match set misses.
+// Field fault 2026-11-25 ("discovery shows three results for printers: Send To
+// OneNote 16, OneNote for Windows 10, Canon G2010 series"): Windows names its
+// OneNote spooler queues "Send To OneNote 16" and "OneNote for Windows 10" —
+// neither equals any set entry, so both leaked into the discovered-printer
+// list and the manager could mistake a software queue for the real Canon.
+// A queue whose name CONTAINS one of these tokens is a host-side artifact:
+//   • onenote   — every OneNote variant ("Send To OneNote 16", …)
+//   • print to pdf / \bpdf\b — PDF writers (Adobe/CutePDF/PDF24/nitro…)
+//   • xps       — Microsoft XPS Document Writer variants
+//   • document writer — same family
+//   • \bfax\b   — fax queues (never a receipt target; safe on word boundary)
+const VIRTUAL_PRINTER_PATTERNS = [
+  /\bonenote\b/i,
+  /print\s+to\s+pdf/i,
+  /\bpdf\b/i,
+  /\bxps\b/i,
+  /document\s+writer/i,
+  /\bfax\b/i,
+]
+
 /** Vendor tokens used by `nameQuality()` to recognise self-advertised names
  *  that include a real vendor + model (e.g. "Canon TS3400 series"). */
 const VENDOR_TOKENS = [
@@ -2873,11 +2894,18 @@ function isPrinterMacVendor(mac) {
   return PRINTER_MAC_OUI_PREFIXES.includes(oui)
 }
 
-/** Returns true if `name` is a known virtual / software printer queue name. */
+/** Returns true if `name` is a known virtual / software printer queue name.
+ * 0.6.123 — exact set match FIRST, then the keyword patterns (a queue whose
+ * name CONTAINS "onenote" / "pdf" / "xps" / "fax" … is a host-side artifact:
+ * "Send To OneNote 16" and "OneNote for Windows 10" never matched the old
+ * exact-only set and leaked into the discovered-printer list). */
 function isVirtualPrinterName(name) {
   if (!name) return false
   const lower = name.toLowerCase().trim()
   if (VIRTUAL_PRINTER_NAMES.has(lower)) return true
+  for (const re of VIRTUAL_PRINTER_PATTERNS) {
+    if (re.test(lower)) return true
+  }
   // Also catch "Adobe PDF (Copy 1)" style variants
   const base = lower.replace(/\s+\(.*\)$/, '').replace(/\s+copy\s*\d+$/, '')
   return VIRTUAL_PRINTER_NAMES.has(base)

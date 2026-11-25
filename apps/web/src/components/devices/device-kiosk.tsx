@@ -1169,33 +1169,84 @@ export function DeviceKiosk() {
     // and delivers by host-forward (USB printer on a branch PC), os-print
     // (locally attached) or raw TCP/ESC-POS (network printer).
     let serverError = '';
+    const printHeaders = {
+      'Content-Type': 'application/json',
+      ...(deviceToken ? { 'X-Device-Token': deviceToken } : {}),
+    };
+    const printBody = JSON.stringify({
+      // 0.6.104 — the kiosk's device id lets the desktop print route resolve
+      // the printer ASSIGNED to this kiosk (printerConfig.defaultPrinterDeviceId)
+      // and fall back to the agency default printer when none is assigned.
+      deviceId: deviceId || undefined,
+      ticket: {
+        agencyName: ticket.agencyName,
+        branchName: ticket.branchName || undefined,
+        ticketNumber: ticket.ticketNumber,
+        lines: [
+          ticket.serviceName || '',
+          ticket.customerName ? `Customer: ${ticket.customerName}` : '',
+          ticket.joinedAt ? new Date(ticket.joinedAt).toLocaleString('en-GB') : '',
+          `Wait: ~${ticket.estimatedWaitMinutes} min`,
+        ].filter(Boolean),
+        // 0.6.110 — phone-reachable claim base on the ESC-POS receipt QR.
+        qrData: ticket.importToken ? await buildClaimUrl(ticket.importToken) : undefined,
+        footer: 'BLASTI',
+      },
+    });
+
+    // ── 0.6.123 — LAN-FIRST PRINT (offline directive) ──────────────────────
+    // Field fault 2026-11-25 (Logs Manager, 1h window): the kiosk's print ran
+    // CLOUD-first, the cloud flapped ("Failed to fetch" ×4), the LAN failover
+    // had NO pinned desktop ("no LAN server discovered") and the receipt was
+    // LOST — while the Canon printer sat connected to the branch PC on the
+    // same WiFi. Printing is a branch-local operation, so every KNOWN LAN
+    // desktop is tried DIRECTLY first (bounded 8s each): the pinned kiosk
+    // base, then the global LAN pin. The cloud apiFetch below stays the
+    // fallback (its realtime relay + LAN failover still cover exotic
+    // topologies — a network printer reachable from the cloud only).
+    try {
+      const { getGlobalLanServer } = await import('@/hooks/use-lan-mode');
+      const globalLan = getGlobalLanServer();
+      const lanBases: string[] = [];
+      const pinnedBase = getKioskLanBase();
+      if (pinnedBase) lanBases.push(pinnedBase);
+      if (globalLan?.ip && globalLan?.port) {
+        const candidate = `http://${globalLan.ip}:${globalLan.port}`;
+        if (!lanBases.includes(candidate)) lanBases.push(candidate);
+      }
+      for (const base of lanBases) {
+        try {
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 8000);
+          const lanRes = await fetch(`${base}/api/agency-devices/discovery/print`, {
+            method: 'POST',
+            headers: printHeaders,
+            body: printBody,
+            signal: ctl.signal,
+          });
+          clearTimeout(timer);
+          const lanData = await lanRes.json().catch(() => ({}));
+          if (lanRes.ok && lanData && lanData.success) {
+            toast.success(t('printTicket') || 'Ticket sent to printer');
+            schedulePostPrintReset();
+            try { logQueue('ticket_printed_lan', `Kiosk receipt printed via LAN desktop ${base}`, { agencyId: agency?.id, ticketNumber: ticket.ticketNumber, source: 'kiosk', deviceId: deviceId || undefined }); } catch { /* never block */ }
+            return;
+          }
+          // A REAL answer from the LAN desktop (route exists, print refused):
+          // remember it as the most specific error and stop walking LAN bases.
+          if (lanData && typeof lanData.error === 'string' && lanData.error) {
+            serverError = lanData.error;
+            break;
+          }
+        } catch { /* base unreachable → next */ }
+      }
+    } catch { /* dynamic import unavailable — the cloud path still runs */ }
+
     try {
       const printRes = await apiFetch('/api/agency-devices/discovery/print', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(deviceToken ? { 'X-Device-Token': deviceToken } : {}),
-        },
-        body: JSON.stringify({
-          // 0.6.104 — the kiosk's device id lets the desktop print route resolve
-          // the printer ASSIGNED to this kiosk (printerConfig.defaultPrinterDeviceId)
-          // and fall back to the agency default printer when none is assigned.
-          deviceId: deviceId || undefined,
-          ticket: {
-            agencyName: ticket.agencyName,
-            branchName: ticket.branchName || undefined,
-            ticketNumber: ticket.ticketNumber,
-            lines: [
-              ticket.serviceName || '',
-              ticket.customerName ? `Customer: ${ticket.customerName}` : '',
-              ticket.joinedAt ? new Date(ticket.joinedAt).toLocaleString('en-GB') : '',
-              `Wait: ~${ticket.estimatedWaitMinutes} min`,
-            ].filter(Boolean),
-            // 0.6.110 — phone-reachable claim base on the ESC-POS receipt QR.
-            qrData: ticket.importToken ? await buildClaimUrl(ticket.importToken) : undefined,
-            footer: 'BLASTI',
-          },
-        }),
+        headers: printHeaders,
+        body: printBody,
       });
       const printData = await printRes.json().catch(() => ({}));
       if (printRes.ok && printData.success) {
@@ -1205,9 +1256,10 @@ export function DeviceKiosk() {
         return;
       }
       serverError = (printData && typeof printData.error === 'string' && printData.error)
+        || serverError
         || `Print failed (server ${printRes.status})`;
     } catch {
-      serverError = t('kioskPrinterUnreachable') || 'Printer service unreachable — check that the branch PC is running BLASTI on the same network';
+      serverError = serverError || t('kioskPrinterUnreachable') || 'Printer service unreachable — check that the branch PC is running BLASTI on the same network';
     }
     // 0.6.114 — FAILURE: NO popup, NO receipt window. An explicit,
     // actionable error instead — the "No printer target" answer means the

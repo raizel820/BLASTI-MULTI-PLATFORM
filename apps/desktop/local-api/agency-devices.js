@@ -4282,6 +4282,31 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         data: updateData,
         select: { id: true, status: true, lastHeartbeatAt: true },
       })
+      // 0.6.123 — PRINTER TOUCH (kiosk heartbeat path): a PRINTER row can
+      // never heartbeat for itself (passive hardware — the watchdog used to
+      // flip it "not connected" 90s after registration while the Canon kept
+      // printing). When a device AT THE HOST'S ADDRESS beats, refresh the
+      // printer rows registered at that address so the manager sees the
+      // printer connected exactly as long as its host PC is alive.
+      if (updated.ipAddress && device.agencyId) {
+        try {
+          const printers = await db.agencyDevice.findMany({
+            where: { agencyId: device.agencyId, type: 'PRINTER', ipAddress: updated.ipAddress, status: { not: 'DISABLED' } },
+            select: { id: true, status: true },
+            take: 20,
+          })
+          const touchNow = new Date()
+          for (const pr of printers) {
+            const bringOnline = pr.status !== 'ONLINE'
+            await db.agencyDevice.update({
+              where: { id: pr.id },
+              data: bringOnline
+                ? { lastHeartbeatAt: touchNow, status: 'ONLINE', statusChangedAt: touchNow }
+                : { lastHeartbeatAt: touchNow },
+            }).catch(() => null)
+          }
+        } catch { /* printer touch is best-effort */ }
+      }
       let pendingCommands = []
       try {
         const rows = await db.deviceCommand.findMany({

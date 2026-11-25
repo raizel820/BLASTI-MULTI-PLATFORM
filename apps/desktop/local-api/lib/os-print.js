@@ -85,12 +85,28 @@ async function printHtmlSilent(html, deviceName) {
     if (Array.isArray(printers) && printers.length === 0) {
       return { ok: false, error: 'No printers available on this system' }
     }
-    if (deviceName && Array.isArray(printers) && printers.length > 0 && !printers.some((p) => p.name === deviceName)) {
-      return { ok: false, error: `Printer "${deviceName}" not found on this system` }
+    // 0.6.123 — FUZZY TARGET RESOLUTION (field fault: "print from kiosk failed
+    // with error: Canon G2010 series"). A saved/registered printer name can
+    // drift from the live spooler name (driver update, "(Copy 1)" suffix,
+    // case or punctuation drift, leading/trailing spaces from a JSON hand
+    // copy). The old exact `some(p => p.name === deviceName)` check then
+    // refused to print even though the printer WAS attached. Resolution
+    // ladder: exact → case-insensitive → normalized → unique prefix/contains.
+    let targetName = deviceName || undefined
+    if (deviceName && Array.isArray(printers) && printers.length > 0) {
+      const resolved = resolvePrinterName(printers, deviceName)
+      if (!resolved) {
+        const available = printers.map((p) => p.name).filter(Boolean).slice(0, 8).join(', ')
+        return {
+          ok: false,
+          error: `Printer "${deviceName}" is not connected to this PC — available printers: ${available || 'none'}`,
+        }
+      }
+      targetName = resolved
     }
     return await new Promise((resolve) => {
       win.webContents.print(
-        { silent: true, printBackground: true, ...(deviceName ? { deviceName } : {}), margins: { marginType: 'none' } },
+        { silent: true, printBackground: true, ...(targetName ? { deviceName: targetName } : {}), margins: { marginType: 'none' } },
         (success, errorType) => resolve(success ? { ok: true } : { ok: false, error: errorType || 'print failed' }),
       )
     })
@@ -99,6 +115,56 @@ async function printHtmlSilent(html, deviceName) {
   } finally {
     try { win.destroy() } catch { /* already gone */ }
   }
+}
+
+/**
+ * 0.6.123 — resolve the wanted OS printer name against the system's spooler
+ * queues. Ladder (first hit wins):
+ *   1. exact name match
+ *   2. case-insensitive / trimmed match ("canon g2010 series")
+ *   3. normalized match — lowercase, every non-alphanumeric stripped
+ *      ("Canon G2010 Series (Copy 1)" normalizes beside "CanonG2010Series")
+ *   4. unique prefix / containment match ("Canon G2010" ↔ "Canon G2010 series")
+ * Returns the LIVE printer name to hand Electron, or null when nothing
+ * matches (caller reports a listing of available printers instead of a bare
+ * printer-name error).
+ */
+function resolvePrinterName(printers, wanted) {
+  if (!Array.isArray(printers) || printers.length === 0 || !wanted) return null
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const want = String(wanted).trim()
+  const wantNorm = norm(want)
+  // 1) exact
+  const exact = printers.find((p) => p && p.name === want)
+  if (exact) return exact.name
+  // 2) case-insensitive
+  const ci = printers.find((p) => p && typeof p.name === 'string' && p.name.trim().toLowerCase() === want.toLowerCase())
+  if (ci) return ci.name
+  // 3) normalized
+  const normalized = printers.find((p) => p && typeof p.name === 'string' && norm(p.name) === wantNorm)
+  if (normalized) return normalized.name
+  // 4) unique prefix / containment (skip virtual queues — never a target)
+  const real = printers.filter((p) => p && typeof p.name === 'string' && p.name.trim()
+    && !isVirtualLikePrinterName(p.name))
+  const prefixHits = real.filter((p) => {
+    const n = norm(p.name)
+    return n.startsWith(wantNorm) || wantNorm.startsWith(n)
+  })
+  if (prefixHits.length === 1) return prefixHits[0].name
+  const containsHits = real.filter((p) => {
+    const n = norm(p.name)
+    return n.includes(wantNorm) || wantNorm.includes(n)
+  })
+  if (containsHits.length === 1) return containsHits[0].name
+  return null
+}
+
+/** Minimal virtual-queue guard for the fuzzy ladder (avoids requiring the
+ *  discovery-scanner module from os-print): OneNote / PDF / XPS / fax names
+ *  must never be picked as a fuzzy print target. */
+function isVirtualLikePrinterName(name) {
+  const s = String(name || '').toLowerCase()
+  return /\bonenote\b|\bpdf\b|\bxps\b|\bfax\b|document\s+writer/.test(s)
 }
 
 /** Raw ESC/POS through CUPS (`lp -o raw`) — Linux / macOS hosts. */
@@ -166,4 +232,6 @@ module.exports = {
   printEscposRaw,
   receiptQrDataUrl,
   printLocalTicket,
+  resolvePrinterName,
+  isVirtualLikePrinterName,
 }

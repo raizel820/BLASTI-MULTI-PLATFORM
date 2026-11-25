@@ -77,19 +77,79 @@ async function requireDeviceAuth(db, c) {
 }
 
 // ─── Watchdog-lite: flip stale ONLINE devices OFFLINE (90s, 120s grace) ─────
+// 0.6.123 — PRINTER rows are EXCLUDED from the blind stale sweep (field fault
+// 2026-11-25: the Canon G2010 kept printing while its registered row showed
+// "not connected" — a printer can never heartbeat for itself, so 90s after
+// registration the sweep flipped it OFFLINE). Printer liveness now rides its
+// HOST PC: the heartbeat routes touch printer rows at the host's address, and
+// the printer pass below flips a printer OFFLINE only when that host row is
+// itself stale. Loopback / host-unknown printers are never blind-flipped.
 let lastWatchdogRun = 0
 async function runHeartbeatWatchdog(db) {
   const staleThreshold = new Date(Date.now() - 90_000)
   const graceThreshold = new Date(Date.now() - 120_000)
   try {
     await db.agencyDevice.updateMany({
-      where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'ONLINE', createdAt: { lt: graceThreshold } },
+      where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'ONLINE', createdAt: { lt: graceThreshold }, type: { not: 'PRINTER' } },
       data: { status: 'OFFLINE', statusChangedAt: new Date() },
     })
     await db.agencyDevice.updateMany({
       where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'PAIRING', agencyId: null, createdAt: { lt: graceThreshold } },
       data: { status: 'OFFLINE', statusChangedAt: new Date() },
     })
+    // PRINTER-DETERMINED LIVENESS (0.6.123): flip a printer OFFLINE only when
+    // the (non-printer) device row at its HOST address is itself stale. No
+    // host row → cannot prove the host is dead → leave the row untouched
+    // (the local API process running this sweep IS the host being alive).
+    const printers = await db.agencyDevice.findMany({
+      where: { type: 'PRINTER', status: 'ONLINE' },
+      select: { id: true, agencyId: true, ipAddress: true },
+      take: 200,
+    })
+    for (const p of printers) {
+      const hostIp = typeof p.ipAddress === 'string' ? p.ipAddress : ''
+      if (!hostIp || hostIp === '127.0.0.1' || hostIp === 'localhost' || hostIp === '::1') continue
+      const host = await db.agencyDevice.findFirst({
+        where: { ipAddress: hostIp, type: { not: 'PRINTER' }, ...(p.agencyId ? { agencyId: p.agencyId } : {}) },
+        select: { id: true, lastHeartbeatAt: true },
+        orderBy: { lastHeartbeatAt: 'desc' },
+      })
+      if (!host || !host.lastHeartbeatAt) continue
+      if (host.lastHeartbeatAt < staleThreshold) {
+        await db.agencyDevice.update({
+          where: { id: p.id },
+          data: { status: 'OFFLINE', statusChangedAt: new Date() },
+        }).catch(() => null)
+      }
+    }
+  } catch { /* best-effort */ }
+}
+
+/**
+ * 0.6.123 — PRINTER TOUCH (shared by every local heartbeat route): whenever a
+ * device AT AN ADDRESS beats, PRINTER rows registered at that same address
+ * (their HOST PC) are alive too — refresh their lastHeartbeatAt and bring
+ * OFFLINE rows back ONLINE so the manager sees "connected" while the printer
+ * actually prints. DISABLED rows stay disabled.
+ */
+async function touchPrintersForHost(db, agencyId, hostIp) {
+  if (!db || !hostIp || !agencyId) return
+  try {
+    const printers = await db.agencyDevice.findMany({
+      where: { agencyId, type: 'PRINTER', ipAddress: hostIp, status: { not: 'DISABLED' } },
+      select: { id: true, status: true },
+      take: 20,
+    })
+    const now = new Date()
+    for (const pr of printers) {
+      const bringOnline = pr.status !== 'ONLINE'
+      await db.agencyDevice.update({
+        where: { id: pr.id },
+        data: bringOnline
+          ? { lastHeartbeatAt: now, status: 'ONLINE', statusChangedAt: now }
+          : { lastHeartbeatAt: now },
+      }).catch(() => null)
+    }
   } catch { /* best-effort */ }
 }
 
@@ -597,6 +657,9 @@ function registerDeviceBoardRoutes(app, ctx) {
         data: updateData,
         select: { id: true, status: true, lastHeartbeatAt: true, totalUptimeSec: true, appVersion: true, ipAddress: true },
       })
+
+      // 0.6.123 — the host PC's beat keeps its USB printers "connected".
+      await touchPrintersForHost(db, device.agencyId, updated.ipAddress)
 
       await expireOldDeliveredCommands(db, device.id)
 

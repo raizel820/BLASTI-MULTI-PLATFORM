@@ -4026,12 +4026,32 @@ ipcMain.handle('printer:print-silent', async (event, options = {}) => {
 
     // If the caller specified a deviceName, verify it exists
     if (options.deviceName && Array.isArray(printers)) {
-      const found = printers.some((p) => p.name === options.deviceName);
+      // 0.6.123 — FUZZY TARGET RESOLUTION (parity with local-api os-print.js):
+      // a saved printer name can drift from the live spooler name ("(Copy 1)"
+      // suffix, case/punctuation drift). The old exact-match check refused to
+      // print even though the printer WAS attached. Resolve exact →
+      // case-insensitive → normalized → unique prefix, then pass the LIVE
+      // spooler name to Electron; when nothing matches, fail with the
+      // available-printer list instead of a bare printer-name error.
+      let printOptions = options;
+      try {
+        const { resolvePrinterName } = require('./local-api/lib/os-print');
+        const resolved = resolvePrinterName(printers, options.deviceName);
+        if (!resolved) {
+          const available = printers.map((p) => p.name).filter(Boolean).slice(0, 8).join(', ');
+          const result = { success: false, error: `Printer "${options.deviceName}" is not connected to this PC — available printers: ${available || 'none'}` };
+          event.sender.send('printer:print-result', result);
+          return result;
+        }
+        printOptions = { ...options, deviceName: resolved };
+      } catch { /* resolver unavailable — keep the exact-name behavior */ }
+      const found = printers.some((p) => p.name === printOptions.deviceName);
       if (!found) {
-        const result = { success: false, error: `Printer "${options.deviceName}" not found` };
+        const result = { success: false, error: `Printer "${options.deviceName}" is not connected to this PC — available printers: ${printers.map((p) => p.name).filter(Boolean).slice(0, 8).join(', ') || 'none'}` };
         event.sender.send('printer:print-result', result);
         return result;
       }
+      options = printOptions;
     }
 
     return await new Promise((resolve) => {

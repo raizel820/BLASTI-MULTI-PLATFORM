@@ -594,6 +594,41 @@ function blastiClientHeaders(): Record<string, string> {
   return { 'x-blasti-client': blastiClientPlatform() };
 }
 
+// ─── 0.6.123 — Bounded LAN re-discovery for the LAN failover path ─────────
+// When a native client has NO pinned LAN desktop and the cloud just failed,
+// the failover used to throw instantly ("No LAN server available") and every
+// mutation in that window was lost (field fault 2026-11-25: kiosk receipt
+// never printed). This helper runs ONE quickDiscover sweep (cached pin →
+// localhost → gateways → bounded subnet sweep), throttled to at most one
+// sweep per 30s so a burst of failing routes cannot scan-storm the LAN.
+// The kiosk/TV device token (device-scope cloud /api/lan-topology read) is
+// attached when present so the topology shortcut still works for devices
+// without a staff session.
+let _lanReDiscoverAt = 0;
+
+async function discoverLanServerOnce(): Promise<{ ip: string; port: number } | null> {
+  try {
+    const { quickDiscover, getCachedServer } = await import('./lan-discovery');
+    // 1) a cached (fresh) sweep answer pins instantly — no network storm.
+    const cached = getCachedServer();
+    if (cached?.ip) {
+      return { ip: cached.ip, port: cached.apiPort || cached.port || 3080 };
+    }
+    // 2) sweep throttle — at most one full sweep per 30s module-wide.
+    if (Date.now() - _lanReDiscoverAt < 30_000) return null;
+    _lanReDiscoverAt = Date.now();
+    let deviceToken: string | null = null;
+    try { deviceToken = localStorage.getItem('blasti_kiosk_device_token') || localStorage.getItem('blasti_tv_device_token') || null; } catch { /* ignore */ }
+    const found = await quickDiscover({ preferRemote: true, deviceToken });
+    if (found?.ip) {
+      return { ip: found.ip, port: found.apiPort || found.port || 3080 };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build auth-related headers for the request.
  *
@@ -1884,7 +1919,19 @@ export class ApiClient {
     } else {
       // Capacitor / other native: use discovered server
       const { getGlobalLanServer } = await import('@/hooks/use-lan-mode');
-      const server = getGlobalLanServer();
+      let server = getGlobalLanServer();
+      if (!server) {
+        // 0.6.123 — ONE bounded discovery attempt instead of an instant
+        // throw. Field fault 2026-11-25: a print ran while the cloud flapped
+        // and the boot-time sweep had found nothing ("no LAN server
+        // discovered, throwing") — the receipt was lost even though the
+        // branch desktop was on the same WiFi. The boot sweep may simply have
+        // run BEFORE this device associated to the AP, or WebRTC was blocked
+        // then; re-deriving the subnets now (device self-reported IP first,
+        // 0.6.115) and sweeping once (throttled to at most one sweep / 30s)
+        // gives every route's LAN failover a real chance.
+        server = await discoverLanServerOnce();
+      }
       if (!server) {
         console.log(`[ApiClient:LAN] ${method} ${path} → no LAN server discovered, throwing`);
         throw new ApiClientError('No LAN server available', 0, null);

@@ -1,6 +1,6 @@
 {
   "name": "@blasti/desktop",
-  "version": "0.6.122",
+  "version": "0.6.123",
   "private": true,
   "description": "BLASTI Desktop — Multi-agency queue management system",
   "main": "main.js",

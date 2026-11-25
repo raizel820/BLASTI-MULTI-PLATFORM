@@ -284,19 +284,49 @@ async function runHeartbeatWatchdog() {
   const graceThreshold = new Date(Date.now() - 120_000)
 
   // Mark stale ONLINE devices as OFFLINE (respecting grace period)
-  const result = await db.agencyDevice.updateMany({
-    where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'ONLINE', createdAt: { lt: graceThreshold } },
+  // 0.6.123 — PRINTER rows are EXCLUDED from this blind sweep. Field fault
+  // 2026-11-25 ("the printer is connected and I can use it to print but shows
+  // as not connected in registered devices"): a printer is PASSIVE hardware —
+  // it can never send its own heartbeat, so 90s after registration the sweep
+  // flipped every PRINTER row to OFFLINE while the Canon was printing fine.
+  // Printer liveness now rides its HOST PC: see the printer pass below and
+  // the heartbeat-side touch (POST /device/heartbeat).
+  await db.agencyDevice.updateMany({
+    where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'ONLINE', createdAt: { lt: graceThreshold }, type: { not: 'PRINTER' } },
     data: { status: 'OFFLINE', statusChangedAt: new Date() },
   })
-  if (result.count > 0) {
-    const offlineDevices = await db.agencyDevice.findMany({
-      where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'OFFLINE' },
-      select: { id: true, agencyId: true, name: true, type: true },
+
+  // 0.6.123 — PRINTER-DETERMINED LIVENESS: a PRINTER row goes OFFLINE only
+  // when its HOST PC is itself stale. The host is the (non-printer) device row
+  // registered at the same ipAddress (register-peripheral writes the host's
+  // address into the printer row's ipAddress column). Loopback printers and
+  // printers with no matching host row are left untouched — no host row means
+  // we cannot prove the host is dead, and the user's printer must not show
+  // "not connected" while it prints.
+  try {
+    const printers = await db.agencyDevice.findMany({
+      where: { type: 'PRINTER', status: 'ONLINE' },
+      select: { id: true, agencyId: true, ipAddress: true },
+      take: 200,
     })
-    for (const d of offlineDevices) {
-      emitAgencyDeviceEvent('agency-device:updated', d.agencyId, { deviceId: d.id, deviceName: d.name, deviceType: d.type })
+    for (const p of printers) {
+      const hostIp = typeof p.ipAddress === 'string' ? p.ipAddress : ''
+      if (!hostIp || hostIp === '127.0.0.1' || hostIp === 'localhost' || hostIp === '::1') continue
+      const host = await db.agencyDevice.findFirst({
+        where: { ipAddress: hostIp, type: { not: 'PRINTER' }, ...(p.agencyId ? { agencyId: p.agencyId } : {}) },
+        select: { id: true, lastHeartbeatAt: true },
+        orderBy: { lastHeartbeatAt: 'desc' },
+      })
+      if (!host || !host.lastHeartbeatAt) continue
+      if (host.lastHeartbeatAt < staleThreshold) {
+        await db.agencyDevice.update({
+          where: { id: p.id },
+          data: { status: 'OFFLINE', statusChangedAt: new Date() },
+        }).catch(() => null)
+        emitAgencyDeviceEvent('agency-device:updated', p.agencyId, { deviceId: p.id, deviceType: 'PRINTER', hostStale: true })
+      }
     }
-  }
+  } catch { /* printer pass is best-effort */ }
 
   // Mark stale PAIRING devices (unpaired) as OFFLINE so they disappear from /unpaired (respecting grace period)
   await db.agencyDevice.updateMany({
@@ -1502,6 +1532,37 @@ app.post('/device/heartbeat', async (c) => {
       data: updateData,
       select: { id: true, status: true, lastHeartbeatAt: true, totalUptimeSec: true, appVersion: true, ipAddress: true },
     })
+
+    // ── 0.6.123 — PRINTER LIVENESS RIDES THE HOST HEARTBEAT ──
+    // A PRINTER row can never heartbeat for itself (passive hardware). Every
+    // PRINTER registered via cascade discovery carries its HOST PC's address
+    // in the ipAddress column, so whenever a device AT THAT ADDRESS beats,
+    // its printers are alive too: touch their lastHeartbeatAt and bring any
+    // OFFLINE row back ONLINE. The watchdog's printer pass then flips them
+    // OFFLINE only when this host goes quiet — "connected" finally mirrors
+    // reality instead of turning red 90s after registration.
+    if (updated.ipAddress && device.agencyId) {
+      try {
+        const printers = await db.agencyDevice.findMany({
+          where: { agencyId: device.agencyId, type: 'PRINTER', ipAddress: updated.ipAddress, status: { not: 'DISABLED' } },
+          select: { id: true, status: true },
+          take: 20,
+        })
+        const touchNow = new Date()
+        for (const pr of printers) {
+          const bringOnline = pr.status !== 'ONLINE'
+          await db.agencyDevice.update({
+            where: { id: pr.id },
+            data: bringOnline
+              ? { lastHeartbeatAt: touchNow, status: 'ONLINE', statusChangedAt: touchNow }
+              : { lastHeartbeatAt: touchNow },
+          }).catch(() => null)
+          if (bringOnline) {
+            emitAgencyDeviceEvent('agency-device:updated', device.agencyId, { deviceId: pr.id, deviceType: 'PRINTER', via: 'host-heartbeat' })
+          }
+        }
+      } catch { /* printer touch is best-effort */ }
+    }
 
     // ── Expire old DELIVERED commands ──
     await expireOldDeliveredCommands(device.id)
