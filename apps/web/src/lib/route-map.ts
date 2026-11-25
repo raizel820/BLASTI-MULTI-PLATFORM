@@ -19,7 +19,9 @@ export const viewToUrl: Record<ViewName, string> = {
   'customer-settings': '/customer/settings',
   'customer-agency-profile': '/customer/agency-profile',
   'customer-branch-profile': '/customer/branch-profile',
-  'customer-sms-wallet': '/customer/sms-wallet',
+  // 'customer-sms-wallet' removed (UI audit R-6 — dead view, no render case;
+  // the ViewName union and the store hash map dropped it, this stale URL
+  // entry failed the Record<ViewName,string> typecheck).
   // Task 54-d: personal "My Analytics" module (doc-2 §38-44).
   'customer-analytics': '/customer/analytics',
   'customer-support': '/customer/support',
@@ -59,6 +61,13 @@ export const viewToUrl: Record<ViewName, string> = {
   'admin-services-management': '/admin/services-management',
   'admin-category-manager': '/admin/category-manager',
   'admin-category-language': '/admin/category-language',
+  // 0.6.61 — AI Translation Agent console (was in ViewName but missing here —
+  // failed the exhaustive Record<ViewName,string> typecheck).
+  'admin-translation-agent': '/admin/translation-agent',
+  // Legal & Agreements — SUPER_ADMIN console (documents + consent ledger).
+  // Role guard inherited from the `admin-` prefix branch in
+  // getAllowedRolesForView (SUPER_ADMIN only).
+  'admin-legal': '/admin/legal',
   'admin-audit': '/admin/audit',
   'admin-users': '/admin/users',
   'admin-analytics': '/admin/analytics',

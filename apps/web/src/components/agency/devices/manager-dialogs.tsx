@@ -25,11 +25,15 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
+import { Switch } from '@/components/ui/switch';
+import { Slider } from '@/components/ui/slider';
 import {
-  Copy, ExternalLink, Loader2, QrCode, Monitor, Unplug, Trash2, RefreshCw,
+  Copy, ExternalLink, Loader2, QrCode, Monitor, Unplug, Trash2, RefreshCw, Volume2,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { TranslationKeys } from '@/i18n';
+// 0.6.121 — voice-calling settings + live test (dedicated offline TTS service).
+import { parseVoiceCalling, playTestAnnouncement, type VoiceCallingConfig } from '@/lib/tv-voice';
 import {
   type AgencyDevice, type Branch, type DeviceType, type ConnectionType,
   type DeviceStatus, type ScreenLayout, type CommandType, type DisplaySettings,
@@ -73,6 +77,38 @@ export function EditDeviceDialog({
   onPreviewTv: (device: AgencyDevice, layout: ScreenLayout) => void;
 }) {
   const isTvLike = form.type === 'TV' || form.type === 'DISPLAY';
+
+  // ── 0.6.121 — voice-calling form state (rides in displaySettings JSON) ──
+  const vc: VoiceCallingConfig = (form.displaySettings && typeof form.displaySettings === 'object'
+    ? (form.displaySettings as { voiceCalling?: VoiceCallingConfig }).voiceCalling
+    : undefined) || {};
+  const [voiceTesting, setVoiceTesting] = useState(false);
+  const updateVc = (patch: Partial<VoiceCallingConfig>) => {
+    onFormChange({
+      displaySettings: {
+        ...form.displaySettings,
+        voiceCalling: { ...vc, ...patch },
+      },
+    });
+  };
+  const vcLangs = vc.languages ?? ['ar', 'fr', 'en'];
+  const toggleVcLang = (l: 'ar' | 'fr' | 'en') => {
+    const next = vcLangs.includes(l) ? vcLangs.filter((x) => x !== l) : [...vcLangs, l];
+    if (next.length === 0) return; // at least one language must stay on
+    // Canonical cycle order (ar → fr → en) regardless of toggle order.
+    updateVc({ languages: (['ar', 'fr', 'en'] as const).filter((x) => next.includes(x)) });
+  };
+  const testVoiceCalling = async () => {
+    setVoiceTesting(true);
+    try {
+      const ok = await playTestAnnouncement(parseVoiceCalling(form.displaySettings));
+      if (!ok) toast.error(t('dmVoiceUnavailable'));
+    } catch {
+      toast.error(t('dmVoiceUnavailable'));
+    } finally {
+      setVoiceTesting(false);
+    }
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -152,6 +188,87 @@ export function EditDeviceDialog({
                   })}
               </div>
               <p className="text-xs text-muted-foreground">{t('dmScreenStyleHint')}</p>
+            </div>
+          )}
+
+          {/* 0.6.121 — VOICE CALLING (TV screens): the owner enables the offline
+              announcement voice, picks the language cycle (Arabic / French /
+              English), tunes volume + speech rate, and hears a live test —
+              all persisted in displaySettings.voiceCalling on the TV row. */}
+          {isTvLike && (
+            <div className="grid gap-3 rounded-xl border bg-muted/30 p-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-0.5">
+                  <Label htmlFor="dev-voice-calling">{t('dmVoiceCalling')}</Label>
+                  <p className="text-xs text-muted-foreground">{t('dmVoiceDesc')}</p>
+                </div>
+                <Switch
+                  id="dev-voice-calling"
+                  checked={vc.enabled !== false}
+                  onCheckedChange={(v) => updateVc({ enabled: v })}
+                />
+              </div>
+              {vc.enabled !== false && (
+                <>
+                  <div className="grid gap-1.5">
+                    <Label className="text-xs">{t('dmVoiceLanguages')}</Label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(['ar', 'fr', 'en'] as const).map((l) => {
+                        const active = vcLangs.includes(l);
+                        return (
+                          <button
+                            key={l}
+                            type="button"
+                            onClick={() => toggleVcLang(l)}
+                            className={`rounded-lg border px-2 py-1.5 text-xs transition-colors ${
+                              active
+                                ? 'border-emerald-500 bg-emerald-50 font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                                : 'bg-background text-muted-foreground hover:bg-muted/60'
+                            }`}
+                          >
+                            {l === 'ar' ? t('dmVoiceLangAr') : l === 'fr' ? t('dmVoiceLangFr') : t('dmVoiceLangEn')}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label className="text-xs">
+                      {t('dmVoiceVolume')} · {Math.round((vc.volume ?? 0.9) * 100)}%
+                    </Label>
+                    <Slider
+                      value={[Math.round((vc.volume ?? 0.9) * 100)]}
+                      min={0}
+                      max={100}
+                      step={5}
+                      onValueChange={(vals) => updateVc({ volume: (Array.isArray(vals) ? vals[0] : vals) / 100 })}
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="grid gap-1.5">
+                      <Label className="text-xs">{t('dmVoiceSpeed')}</Label>
+                      <Select
+                        value={vc.speed ?? 'normal'}
+                        onValueChange={(v) => updateVc({ speed: v as VoiceCallingConfig['speed'] })}
+                      >
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="slow">{t('dmVoiceSpeedSlow')}</SelectItem>
+                          <SelectItem value="normal">{t('dmVoiceSpeedNormal')}</SelectItem>
+                          <SelectItem value="fast">{t('dmVoiceSpeedFast')}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label className="text-xs">{t('dmVoiceTest')}</Label>
+                      <Button type="button" variant="outline" className="gap-1.5" onClick={testVoiceCalling} disabled={voiceTesting}>
+                        {voiceTesting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Volume2 className="h-4 w-4" />}
+                        {t('dmVoiceTestPlay')}
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           )}
 

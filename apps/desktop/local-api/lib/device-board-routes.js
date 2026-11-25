@@ -34,6 +34,11 @@
 
 const crypto = require('crypto')
 const net = require('node:net')
+// 0.6.119 — deleted-fingerprint blocklist: a manager-deleted device must not
+// resurrect itself through the register routes (ghost kiosk devices).
+const deviceTombstones = require('./device-tombstones')
+// 0.6.122 — preset LAN port registry (raw-print probe port etc.).
+const { BLASTI_LAN_PORTS } = require('./lan-ports')
 
 // ─── Helpers (mirror cloud route) ────────────────────────────────────────────
 
@@ -406,7 +411,17 @@ function registerDeviceBoardRoutes(app, ctx) {
         })
       }
 
-      // 3. Create new
+      // 3. Create new — BUT a fingerprint the manager deliberately deleted
+      // must never resurrect itself here (the kiosk auto-registers on every
+      // mount with its saved branch code; without this gate every deletion
+      // was undone within seconds and the ghost returned).
+      if (deviceFingerprint && deviceTombstones.isDeviceTombstoned(deviceFingerprint)) {
+        return c.json({
+          success: false,
+          error: 'DEVICE_REMOVED_BY_MANAGER',
+          removed: true,
+        }, 409)
+      }
       const pairingCode = generatePairingCode()
       const deviceToken = crypto.randomBytes(32).toString('hex')
       const screenLayout = deviceType === 'KIOSK' ? 'SERVICE_SELECTOR' : 'QUEUE_BOARD'
@@ -649,86 +664,15 @@ function registerDeviceBoardRoutes(app, ctx) {
   //  cloud exactly; writes go to the local SQLite mirror.
   // ═════════════════════════════════════════════════════════════════════════
 
-  // ─── POST /public/discover-register — "Wait for Discovery" (no agency) ────
-  // Creates an ORPHAN device (agencyId: null) in PAIRING status. The agency
-  // manager later sends a pairing request (:id/pairing-request in
-  // agency-devices.js, already ported) and the kiosk accepts it below.
-  app.post('/api/agency-devices/public/discover-register', async (c) => {
-    const db = getDb()
-    if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
-    try {
-      const body = await c.req.json().catch(() => ({}))
-      // 0.6.102 — audit fix: PHONE joins the orphan whitelist so a phone
-      // running the BLASTI app (agency account opened) can register as a
-      // "PHONE WITH BLASTI APP" device waiting for approval — its pairing
-      // requests then reach it through the same device-status/pairing-wait
-      // channels the kiosk uses.
-      const deviceType = ['KIOSK', 'TV', 'DISPLAY', 'PRINTER', 'APP', 'PHONE'].includes(body.deviceType) ? body.deviceType : 'KIOSK'
-      const connectionType = ['LAN', 'WIFI', 'CABLE', 'MANUAL'].includes(body.connectionType) ? body.connectionType : 'LAN'
-      const deviceFingerprint = typeof body.deviceFingerprint === 'string' && body.deviceFingerprint ? body.deviceFingerprint.slice(0, 200) : null
-      const effectiveName = typeof body.deviceName === 'string' && body.deviceName.trim()
-        ? body.deviceName.trim().slice(0, 100)
-        : 'BLASTI Kiosk (Discovering)'
-
-      // Same fingerprint already waiting for discovery? re-issue its token.
-      let existingDevice = null
-      if (deviceFingerprint) {
-        try {
-          existingDevice = await db.agencyDevice.findFirst({
-            where: { deviceFingerprint, status: 'PAIRING' },
-          })
-        } catch { /* non-fatal */ }
-      }
-
-      if (existingDevice) {
-        let token = existingDevice.deviceToken
-        if (!token) {
-          token = crypto.randomBytes(32).toString('hex')
-          await db.agencyDevice.update({
-            where: { id: existingDevice.id },
-            data: { deviceToken: token, connectionType, name: effectiveName, type: deviceType },
-          })
-          return c.json({ success: true, device: { id: existingDevice.id, name: effectiveName, type: deviceType, status: 'PAIRING' }, deviceToken: token })
-        }
-        return c.json({
-          success: true,
-          device: { id: existingDevice.id, name: existingDevice.name, type: existingDevice.type, status: existingDevice.status },
-          deviceToken: token,
-        })
-      }
-
-      // Create a new orphan device (no agencyId — that's the whole point).
-      const deviceToken = crypto.randomBytes(32).toString('hex')
-      const newDevice = await db.agencyDevice.create({
-        data: {
-          name: effectiveName,
-          type: deviceType,
-          status: 'PAIRING',
-          connectionType,
-          deviceToken,
-          deviceFingerprint,
-          screenLayout: deviceType === 'KIOSK' ? 'SERVICE_SELECTOR' : 'QUEUE_BOARD',
-          offlineCapable: deviceType === 'KIOSK',
-          autoDiscovery: true,
-          lastHeartbeatAt: new Date(),
-        },
-      })
-
-      // 0.6.101 — the historic `broadcast('device:registered', { agencyId:
-      // 'discovery' })` went to room agency:discovery, which NO client ever
-      // joins — dead air. Removed; the manager's unpaired strip refreshes on
-      // its 10s poll, and pairing requests now use the pairing-wait rooms.
-
-      return c.json({
-        success: true,
-        device: { id: newDevice.id, name: newDevice.name, type: newDevice.type, status: newDevice.status },
-        deviceToken,
-      }, 201)
-    } catch (err) {
-      log('discover-register failed:', errorMessage(err))
-      return c.json({ success: false, error: errorMessage(err) }, 500)
-    }
-  })
+  // ─── POST /public/discover-register — REMOVED (0.6.119, ghost fix) ───────
+  // This old status-filtered copy (`status: 'PAIRING'` match) was SHADOWING
+  // the 0.6.115 status-independent handler in agency-devices.js (Hono serves
+  // the FIRST registered route). Every kiosk re-announce after the local
+  // watchdog aged its row out of PAIRING minted ANOTHER orphan row — the
+  // batch ghost pattern (cmwu9l… / cmwubl… / cmwubmn…) in the field logs.
+  // The single canonical handler (with the 0.6.119 tombstone gate) lives in
+  // agency-devices.js; device-kiosk.tsx needs zero changes — the response
+  // shape is identical.
 
   // ─── POST /public/pairing-offer — LAN DIRECT pairing delivery (0.6.99) ────
   // THE missing half of "pairing request is not reaching to the kiosk device":
@@ -794,6 +738,10 @@ function registerDeviceBoardRoutes(app, ctx) {
         try {
           device = await db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } })
         } catch { /* non-fatal */ }
+        // A manager-delivered offer is explicit consent to (re)pair — lift the
+        // deleted-device blocklist for this fingerprint (unless the row was
+        // already deleted AND the operator re-sent the request on purpose).
+        if (device && fingerprint) deviceTombstones.clearDeviceTombstone(fingerprint)
       }
       if (!device) {
         // Legacy fallback: the newest unpaired orphan heartbeat (≤90s) — the
@@ -815,6 +763,7 @@ function registerDeviceBoardRoutes(app, ctx) {
         // fingerprint rides the offer) — then the native dialog asks the
         // operator to accept.
         try {
+          if (fingerprint) deviceTombstones.clearDeviceTombstone(fingerprint)
           device = await db.agencyDevice.create({
             data: {
               name: typeof body.deviceName === 'string' && body.deviceName.trim()
@@ -875,6 +824,30 @@ function registerDeviceBoardRoutes(app, ctx) {
           device.deviceToken = managerToken
         } catch { /* non-fatal */ }
       }
+      // 0.6.117 — DELIVERY-LEG DEDUPE: the manager now races the UDP :3082
+      // offer and the LAN HTTP offer in parallel (plus a 3-datagram UDP
+      // burst), and the desktop UDP receiver forwards every datagram into
+      // THIS route. Without this check one manager click produced several
+      // PAIRING_REQUEST commands — duplicate Accept/Reject dialogs on the
+      // target PC. A PENDING PAIRING_REQUEST for the same device younger than
+      // 20s collapses into the original command.
+      try {
+        const dedupeSince = new Date(Date.now() - 20_000)
+        const recent = await db.deviceCommand.findFirst({
+          where: { deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING', createdAt: { gte: dedupeSince } },
+          orderBy: { createdAt: 'desc' },
+        })
+        if (recent) {
+          return c.json({
+            success: true,
+            delivered: true,
+            needsApproval: true,
+            deduped: true,
+            deviceId: device.id,
+            commandId: recent.id,
+          })
+        }
+      } catch { /* dedupe is best-effort — fall through to create */ }
       const command = await db.deviceCommand.create({
         data: {
           deviceId: device.id,
@@ -1493,6 +1466,10 @@ function registerDeviceBoardRoutes(app, ctx) {
         }, 500)
       }
 
+      // 0.6.119 — the pair is live: lift any deleted-device blocklist so a
+      // previously deleted (ghosted) fingerprint can exist again.
+      try { if (device.deviceFingerprint) deviceTombstones.clearDeviceTombstone(device.deviceFingerprint) } catch { /* non-fatal */ }
+
       const services = await db.service.findMany({
         where: { agencyId, isActive: true },
         select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
@@ -1772,7 +1749,9 @@ function registerDeviceBoardRoutes(app, ctx) {
         return c.json({ success: true, reachable: true, target: body.usbPath, detail: 'USB device — locally attached' })
       }
       if (!body.ip) return c.json({ success: false, reachable: false, error: 'ip or usbPath is required' }, 400)
-      const port = Number(body.port) > 0 ? Number(body.port) : 9100
+      // 0.6.122 — the probe's default raw-print port comes from the preset
+      // registry (lib/lan-ports.js PRINTER_JETDIRECT), not a literal.
+      const port = Number(body.port) > 0 ? Number(body.port) : BLASTI_LAN_PORTS.PRINTER_JETDIRECT
       const timeoutMs = Number(body.timeoutMs) > 0 ? Math.min(Number(body.timeoutMs), 10000) : 3000
       const startedAt = Date.now()
 
@@ -1829,10 +1808,9 @@ function registerDeviceBoardRoutes(app, ctx) {
   // 0.6.103 — OS-print helpers moved to lib/os-print.js so the discovery
   // print route (agency-devices.js) shares ONE implementation for USB/loopback
   // printers (raw JetDirect :9100 can never reach a locally-attached printer).
-  const osPrint = require('./os-print')
-  const buildReceiptHtml = osPrint.buildReceiptHtml
-  const printHtmlSilent = osPrint.printHtmlSilent
-  const printEscposRaw = osPrint.printEscposRaw
+  // 0.6.122 — receipt printing goes through print-relay-handler →
+  // os-print.printLocalTicket; the HTML/QR builders stay internal to that
+  // module (locally-generated QR, offline-safe).
 
   function hostPrintLimiterCheck(ip) {
     const now = Date.now()
@@ -1870,6 +1848,11 @@ function registerDeviceBoardRoutes(app, ctx) {
 
   // POST /api/agency-devices/host/print-job — print a ticket/receipt/invoice
   // on THIS machine's printer. Body: { printerName?, cupsName?, ticket?, escposBase64? }
+  // 0.6.118 — this compat route now DELEGATES to the dedicated print-relay
+  // handler (lib/print-relay-handler.js): selected-printer resolution (the
+  // caller's pinned printer), the SERIAL job queue, one free retry and the
+  // secondary forward to a printer-host PC — identical behavior to the
+  // dedicated :3083 listener, one pipeline.
   app.post('/api/agency-devices/host/print-job', async (c) => {
     const clientIp = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || c.req.header('x-real-ip') || 'lan'
     if (!hostPrintLimiterCheck(clientIp)) {
@@ -1879,12 +1862,13 @@ function registerDeviceBoardRoutes(app, ctx) {
     const deviceHeader = c.req.header('X-Device-Token') || ''
     const token = bearer || deviceHeader
     const db = getDb()
-    let isDeviceCaller = false
+    let callerRow = null
     if (db && token) {
-      try { isDeviceCaller = !!(await db.agencyDevice.findFirst({ where: { deviceToken: token } })) } catch { /* not a device */ }
+      try { callerRow = await db.agencyDevice.findFirst({ where: { deviceToken: token } }) } catch { /* not a device */ }
     }
+    let isDeviceCaller = !!callerRow
     if (!isDeviceCaller) {
-      try { isDeviceCaller = !!require('./lib/lan-authority').verifyDeviceToken(token) } catch { /* not a lan token */ }
+      try { isDeviceCaller = !!require('./lan-authority').verifyDeviceToken(token) } catch { /* not a lan token */ }
     }
     if (!isDeviceCaller && !!(ctx.sessionToken && token === ctx.sessionToken)) isDeviceCaller = true
     if (!isDeviceCaller) {
@@ -1892,40 +1876,13 @@ function registerDeviceBoardRoutes(app, ctx) {
     }
     try {
       const body = await c.req.json().catch(() => ({}))
-      const printerName = typeof body.printerName === 'string' && body.printerName.trim() ? body.printerName.trim().slice(0, 120) : ''
-      const cupsName = typeof body.cupsName === 'string' && body.cupsName.trim() ? body.cupsName.trim().slice(0, 120) : printerName
-      const escposBase64 = typeof body.escposBase64 === 'string' ? body.escposBase64 : ''
-      const ticket = body.ticket && typeof body.ticket === 'object' ? body.ticket : null
-
-      // 1) Raw ESC/POS when the caller provides the buffer AND a CUPS queue.
-      if (escposBase64 && cupsName && process.platform !== 'win32') {
-        try {
-          const buf = Buffer.from(escposBase64, 'base64')
-          if (buf.length > 0 && buf.length < 1_000_000) {
-            const res = printEscposRaw(buf, cupsName)
-            if (res.ok) {
-              try { require('./device-event').deviceEvent('print_job_done', `Raw ESC/POS print via ${cupsName}`, { deviceType: 'PRINTER', status: 'OK', source: 'host-print-job' }) } catch { /* log only */ }
-              return c.json({ success: true, via: res.via })
-            }
-            log('host print-job lp failed:', res.error, '— falling back to HTML print')
-          }
-        } catch { /* fall through to HTML print */ }
-      }
-
-      // 2) HTML receipt via Electron silent print (cross-platform).
-      if (ticket && (ticket.ticketNumber || ticket.agencyName)) {
-        const html = buildReceiptHtml(ticket)
-        const res = await printHtmlSilent(html, printerName || undefined)
-        try {
-          require('./device-event').deviceEvent(res.ok ? 'print_job_done' : 'print_job_failed',
-            res.ok ? `Ticket ${ticket.ticketNumber || ''} printed on ${printerName || 'default printer'}` : `Host print failed: ${res.error}`,
-            { deviceType: 'PRINTER', status: res.ok ? 'OK' : 'FAILED', source: 'host-print-job', deviceName: printerName || undefined })
-        } catch { /* log only */ }
-        if (res.ok) return c.json({ success: true, via: 'electron-silent' })
-        return c.json({ success: false, error: res.error }, 500)
-      }
-
-      return c.json({ success: false, error: 'Nothing to print — provide ticket or escposBase64' }, 400)
+      const result = await require('./print-relay-handler').handleRelayedPrintJob({
+        db,
+        deviceRow: callerRow,
+        body,
+        source: 'host-print-job',
+      })
+      return c.json(result.payload, result.status && result.status !== 200 ? result.status : 200)
     } catch (err) {
       log('host print-job failed:', errorMessage(err))
       return c.json({ success: false, error: errorMessage(err) }, 500)

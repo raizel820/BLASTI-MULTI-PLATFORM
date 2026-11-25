@@ -86,6 +86,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { apiFetch } from '@/lib/api-fetch';
 import { unwrapListPayload } from '@/lib/list-payload';
 import { apiClient } from '@/lib/api-client';
+// Task 5-b: MANDATORY Law 18-07 consent block (role agreement + privacy
+// policy) rendered inside the create-staff dialog.
+import { LegalConsentBlock } from '@/components/legal/legal-consent';
 
 interface Employee {
   id: string;
@@ -186,6 +189,9 @@ export function AgencyEmployees() {
   const [branchError, setBranchError] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
+  // Task 5-b: Law 18-07 consent — the parent holds the AND of the consent
+  // block's two checkboxes; the server rejects staff bodies without it.
+  const [staffAgreeTerms, setStaffAgreeTerms] = useState(false);
 
   // Credentials dialog
   const [credentialsOpen, setCredentialsOpen] = useState(false);
@@ -333,6 +339,12 @@ export function AgencyEmployees() {
   });
 
   const handleCreate = async () => {
+    // Task 5-b: fail fast on the Law 18-07 consent gate — BOTH the Staff
+    // User Agreement and the Privacy Policy must be accepted first.
+    if (!staffAgreeTerms) {
+      toast.error(t('legalConsentRequiredBoth'));
+      return;
+    }
     if (!newUsername.trim() || !newFullName.trim() || !newPassword.trim()) {
       toast.error(t('requiredField'));
       return;
@@ -354,6 +366,9 @@ export function AgencyEmployees() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           agencyId,
+          // Task 5-b: Law 18-07 consent gate — the server rejects create
+          // bodies without agreeTerms: true.
+          agreeTerms: true,
           username: newUsername.trim(),
           fullName: newFullName.trim(),
           password: newPassword,
@@ -376,6 +391,7 @@ export function AgencyEmployees() {
         setNewPermissions({ ...MANAGER_TIER_DEFAULTS });
         setNewBranchId('');
         setBranchError(false);
+        setStaffAgreeTerms(false);
         setCredentialsOpen(true);
         fetchEmployees();
       } else {
@@ -845,7 +861,7 @@ export function AgencyEmployees() {
       )}
 
       {/* Create Employee Dialog */}
-      <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); setNewBranchId(''); setBranchError(false); } }}>
+      <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); setNewBranchId(''); setBranchError(false); setStaffAgreeTerms(false); } }}>
         <DialogContent className="sm:max-w-lg max-h-[88vh] overflow-y-auto custom-scrollbar">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -971,6 +987,15 @@ export function AgencyEmployees() {
                 </div>
               </div>
             )}
+            {/* Task 5-b: MANDATORY Law 18-07 consent — BOTH the Staff User
+                Agreement and the Privacy Policy must be accepted (each with a
+                "View document" viewer) before the create request is sent. */}
+            <LegalConsentBlock
+              role="STAFF"
+              checked={staffAgreeTerms}
+              onCheckedChange={setStaffAgreeTerms}
+              className="mt-2"
+            />
           </div>
           <div className="flex gap-2 justify-end">
             <Button variant="outline" onClick={() => setCreateOpen(false)}>{t('cancel')}</Button>

@@ -27,7 +27,11 @@ import type { PairingRequest } from './kiosk-types';
 // registration on the manager store BEFORE any access token is granted and
 // BEFORE the service selector is entered. No token, no navigation in this
 // state — only the read-back verification loop.
-export type DiscoveryStatus = 'idle' | 'registering' | 'waiting' | 'discovered' | 'connecting' | 'verifying';
+// 0.6.119 — 'removed': the manager DELETED this device — register returns
+// 409 DEVICE_REMOVED_BY_MANAGER, the stored identity is cleared and the
+// retry loop stops (ghost-device fix). Re-pairing requires the manager to
+// allow re-discovery or send a fresh pairing request.
+export type DiscoveryStatus = 'idle' | 'registering' | 'waiting' | 'discovered' | 'connecting' | 'verifying' | 'removed';
 
 interface KioskDiscoveryLoginProps {
   status: DiscoveryStatus;
@@ -145,6 +149,8 @@ export function KioskDiscoveryLogin({
   const isDiscovered = status === 'discovered';
   // 0.6.113 — the final registration check (hardened pairing protocol).
   const isVerifying = status === 'verifying';
+  // 0.6.119 — the manager removed this device (register answered 409).
+  const isRemoved = status === 'removed';
 
   return (
     <motion.div
@@ -235,13 +241,17 @@ export function KioskDiscoveryLogin({
               className="absolute inset-0 flex items-center justify-center"
             >
               <div className={`h-20 w-20 rounded-full flex items-center justify-center shadow-lg ring-4 ${
-                hasPairingRequests || isDiscovered || isConnecting || isVerifying
-                  ? 'bg-emerald-100 ring-emerald-200'
-                  : isRegistering
-                    ? 'bg-teal-100 ring-teal-200'
-                    : 'bg-teal-100 ring-teal-100'
+                isRemoved
+                  ? 'bg-red-100 ring-red-200'
+                  : hasPairingRequests || isDiscovered || isConnecting || isVerifying
+                    ? 'bg-emerald-100 ring-emerald-200'
+                    : isRegistering
+                      ? 'bg-teal-100 ring-teal-200'
+                      : 'bg-teal-100 ring-teal-100'
               }`}>
-                {isRegistering ? (
+                {isRemoved ? (
+                  <ShieldX className="h-10 w-10 text-red-600" />
+                ) : isRegistering ? (
                   <Loader2 className="h-9 w-9 text-teal-600 animate-spin" />
                 ) : isVerifying ? (
                   <ShieldCheck className="h-10 w-10 text-emerald-600" />
@@ -256,16 +266,22 @@ export function KioskDiscoveryLogin({
 
           {/* Status text */}
           <h2 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-2">
-            {hasPairingRequests && t('kioskPairingRequest')}
-            {!hasPairingRequests && isDiscovered && t('kioskDiscovered')}
-            {!hasPairingRequests && isConnecting && t('kioskAutoConnecting')}
-            {!hasPairingRequests && isVerifying && (t('kioskVerifyingRegistration') || 'Final check: verifying registration…')}
-            {!hasPairingRequests && isRegistering && t('kioskWaitingForManager')}
-            {!hasPairingRequests && isWaiting && t('kioskWaitingForManager')}
+            {isRemoved && (t('kioskRemovedByManager') || 'Device removed by the manager')}
+            {!isRemoved && hasPairingRequests && t('kioskPairingRequest')}
+            {!isRemoved && !hasPairingRequests && isDiscovered && t('kioskDiscovered')}
+            {!isRemoved && !hasPairingRequests && isConnecting && t('kioskAutoConnecting')}
+            {!isRemoved && !hasPairingRequests && isVerifying && (t('kioskVerifyingRegistration') || 'Final check: verifying registration…')}
+            {!isRemoved && !hasPairingRequests && isRegistering && t('kioskWaitingForManager')}
+            {!isRemoved && !hasPairingRequests && isWaiting && t('kioskWaitingForManager')}
           </h2>
 
           <p className="text-gray-500 dark:text-gray-400 text-sm mb-1">
-            {isRegistering && (
+            {isRemoved && (
+              <span className="text-red-600 font-medium">
+                Registration was blocked. Ask the manager to allow re-discovery or send a new pairing request.
+              </span>
+            )}
+            {!isRemoved && isRegistering && (
               <span className="flex items-center justify-center gap-2">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 Registering device...

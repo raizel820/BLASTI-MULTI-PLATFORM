@@ -8,6 +8,17 @@ import { requireAuth, authErrorResponse, AuthError } from '../lib/auth'
 import { z } from 'zod'
 import { recordSyncChange } from '../lib/sync-helpers'
 import crypto from 'crypto'
+// 0.6.122 — PRESET LAN protocol constants (ports/channels/protocols of the
+// reservation-receipt pipeline): the cloud dials host PCs through the SAME
+// port ladder as the desktop's own print-relay sender — dedicated :3083
+// first, compat :3080 second. Canonical registry: @blasti/core/lan-protocol
+// (value-mirrored in apps/desktop/local-api/lib/lan-ports.js).
+import {
+  LAN_HTTP_API_PORT,
+  PRINT_RELAY_TARGET_PORTS,
+  PRINT_RELAY_ATTEMPT_TIMEOUT_MS,
+  printRelayRequestPath,
+} from '@blasti/core/lan-protocol'
 import { validateBody, kioskJoinSchema } from '../lib/validations'
 import { emitQueueEvent, emitKioskEvent, emitAgencyDeviceEvent, emitPairingWaitEvent } from '../lib/realtime-emit'
 // Task 2-a — device walk-in joins create reservations → invalidate cached
@@ -25,6 +36,15 @@ import {
 import { calculateETA, getEffectiveServiceTime, filterGhostTickets } from '../lib/eta-calculator'
 import { appendDeviceEvent } from '../lib/device-event-log'
 import { todayLocalDateString } from '../lib/queue-waiting'
+// 0.6.119 — deleted-fingerprint blocklist (ghost kiosk fix): a manager-deleted
+// device must never resurrect itself through the register routes, and the
+// /unpaired strip keeps showing it so the manager can allow re-discovery.
+import {
+  isDeviceTombstoned,
+  addDeviceTombstone,
+  clearDeviceTombstone,
+  listDeviceTombstones,
+} from '../lib/device-tombstones'
 import {
   runDiscoveryScan,
   getLocalSubnets,
@@ -385,7 +405,12 @@ app.post('/public/register', async (c) => {
         return { type: 'existing' as const, device: existingDevice, token }
       }
 
-      // 4. Create new AgencyDevice
+      // 4. Create new AgencyDevice — BUT a fingerprint the manager
+      // deliberately deleted must never resurrect itself here (the kiosk
+      // auto-registers on every mount with its saved branch code).
+      if (deviceFingerprint && (await isDeviceTombstoned(deviceFingerprint))) {
+        return { type: 'removed' as const }
+      }
       const pairingCode = generatePairingCode()
       const deviceToken = crypto.randomBytes(32).toString('hex')
 
@@ -409,6 +434,10 @@ app.post('/public/register', async (c) => {
       })
       return { type: 'new' as const, device: newDevice, token: deviceToken }
     })
+
+    if (result.type === 'removed') {
+      return c.json({ success: false, error: 'DEVICE_REMOVED_BY_MANAGER', removed: true }, 409)
+    }
 
     if (result.type === 'existing') {
       return c.json({
@@ -1243,6 +1272,14 @@ app.post('/public/discover-register', async (c) => {
 
     // Create new orphan device
     const deviceToken = crypto.randomBytes(32).toString('hex')
+    // ── 0.6.119 — GHOST GATE (discover-register) ──
+    // A fingerprint the manager deliberately deleted never re-registers:
+    // the kiosk's 10s waiting-mode retry would otherwise mint a fresh row
+    // seconds after every delete. 409 + removed:true lets the kiosk clear
+    // its stored identity and stop the retry loop.
+    if (deviceFingerprint && (await isDeviceTombstoned(deviceFingerprint))) {
+      return c.json({ success: false, error: 'DEVICE_REMOVED_BY_MANAGER', removed: true }, 409)
+    }
     let newDevice: any = null
     try {
       newDevice = await db.agencyDevice.create({
@@ -1809,6 +1846,10 @@ app.post('/device/accept-pairing', async (c) => {
       }, 500)
     }
 
+    // 0.6.119 — the pair is live: lift any deleted-device blocklist so a
+    // previously ghosted fingerprint can exist again.
+    try { if (device.deviceFingerprint) await clearDeviceTombstone(device.deviceFingerprint) } catch { /* non-fatal */ }
+
     // Fetch services for the kiosk
     const services = await db.service.findMany({
       where: { agencyId, isActive: true },
@@ -2262,6 +2303,30 @@ app.get('/unpaired', async (c) => {
       seenFingerprints.add(key)
       return true
     })
+
+    // ── 0.6.119 — BLOCKED (deleted) fingerprints stay visible ──
+    // Deliberately deleted devices no longer re-register; the strip shows a
+    // "Removed — re-registration blocked" chip with an explicit "allow
+    // re-discovery" action so re-pairing stays possible.
+    try {
+      const tombstones = await listDeviceTombstones()
+      for (const t of tombstones) {
+        if (collapsedDevices.some((d: any) => d.deviceFingerprint === t.fingerprint)) continue
+        if (t.agencyId && t.agencyId !== user.agencyId) continue
+        collapsedDevices.push({
+          id: 'tombstone-' + t.fingerprint,
+          name: t.name || 'Removed device',
+          type: t.type || 'KIOSK',
+          status: 'REMOVED',
+          connectionType: 'LAN',
+          ipAddress: t.ipAddress || null,
+          port: null,
+          deviceFingerprint: t.fingerprint,
+          tombstoned: true,
+          tombstonedAt: t.deletedAt,
+        })
+      }
+    } catch { /* display-only — never break the strip */ }
 
     return c.json({ success: true, devices: collapsedDevices })
   } catch (error: unknown) {
@@ -2764,16 +2829,85 @@ app.delete('/:id', async (c) => {
     await dbRaw.deviceCommand.deleteMany({ where: { deviceId: c.req.param('id') } })
     await dbRaw.agencyDevice.delete({ where: { id: c.req.param('id') } })
 
+    // 0.6.119 — GHOST FIX: tombstone the fingerprint so discover-register /
+    // public-register can never mint the row again (the physical device keeps
+    // re-announcing with its stable fingerprint). Lifted automatically on a
+    // genuine re-pair or via POST /tombstones/clear.
+    if (existing.deviceFingerprint) {
+      await addDeviceTombstone(existing.deviceFingerprint, {
+        name: existing.name,
+        type: existing.type,
+        ipAddress: existing.ipAddress,
+        agencyId: existing.agencyId,
+      })
+    }
+
     // Emit realtime event
     emitAgencyDeviceEvent('agency-device:disconnected', existing.agencyId || 'system', { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type })
 
-    return c.json({ success: true })
+    return c.json({ success: true, tombstoned: !!existing.deviceFingerprint })
   } catch (error: unknown) {
     console.error('[AgencyDevice] DELETE error:', error)
     if (error instanceof AuthError) {
       return c.json({ success: false, error: error.message }, error.statusCode as any)
     }
     return c.json({ success: false, error: 'Failed to delete device' }, 500)
+  }
+})
+
+// ─── POST /delete-by-fingerprint — cross-store delete (0.6.119) ──────────
+// The desktop's local DELETE proxies here (best-effort) so a ghost deleted
+// on the LAN manager is ALSO removed + tombstoned in the cloud store the
+// kiosk may be registering against. Idempotent: no rows → success.
+app.post('/delete-by-fingerprint', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const body = await c.req.json().catch(() => ({}))
+    const fingerprint = typeof body.fingerprint === 'string' ? body.fingerprint.trim().slice(0, 200) : ''
+    if (!fingerprint) {
+      return c.json({ success: false, error: 'fingerprint required' }, 400)
+    }
+    const whereClause: any = { deviceFingerprint: fingerprint }
+    if (user.agencyId) whereClause.agencyId = user.agencyId
+    const rows = await dbRaw.agencyDevice.findMany({ where: whereClause, select: { id: true, name: true, type: true, ipAddress: true, agencyId: true } })
+    let deleted = 0
+    for (const row of rows) {
+      await dbRaw.deviceCommand.deleteMany({ where: { deviceId: row.id } })
+      await dbRaw.agencyDevice.delete({ where: { id: row.id } })
+      deleted += 1
+    }
+    if (fingerprint) {
+      await addDeviceTombstone(fingerprint, rows[0] || { agencyId: user.agencyId })
+    }
+    if (rows[0]) {
+      emitAgencyDeviceEvent('agency-device:disconnected', rows[0].agencyId || 'system', { deviceId: rows[0].id, deviceName: rows[0].name, deviceType: rows[0].type })
+    }
+    return c.json({ success: true, deleted, tombstoned: true })
+  } catch (error: unknown) {
+    console.error('[AgencyDevice] DELETE-by-fingerprint error:', error)
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
+    return c.json({ success: false, error: 'Failed to delete device' }, 500)
+  }
+})
+
+// ─── POST /tombstones/clear — "Allow re-discovery" (0.6.119) ──────────────
+// Lift the deleted-device blocklist for one fingerprint (manager UI action
+// on the unpaired strip; also called by the desktop proxy).
+app.post('/tombstones/clear', async (c) => {
+  try {
+    await requireAuth(c)
+    const body = await c.req.json().catch(() => ({}))
+    const fingerprint = typeof body.fingerprint === 'string' ? body.fingerprint.trim().slice(0, 200) : ''
+    if (!fingerprint) {
+      return c.json({ success: false, error: 'fingerprint required' }, 400)
+    }
+    const cleared = await clearDeviceTombstone(fingerprint)
+    return c.json({ success: true, cleared })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 
@@ -4074,6 +4208,9 @@ app.post('/discovery/pairing-request-by-identity', async (c) => {
     if (!device && body.ip && fingerprint) {
       device = await db.agencyDevice.findFirst({ where: { ipAddress: body.ip, status: 'PAIRING' } })
     }
+    // 0.6.119 — the manager is explicitly pairing this fingerprint, which is
+    // consent: lift any deleted-device blocklist so the row can be created.
+    if (fingerprint) await clearDeviceTombstone(fingerprint)
 
     if (device && device.agencyId && device.agencyId !== user.agencyId) {
       return c.json({ success: false, error: 'Device is already paired with another agency' }, 409)
@@ -4282,7 +4419,9 @@ app.post('/discovery/register-peripheral', async (c) => {
       (typeof printer.hostIp === 'string' && printer.hostIp.trim() ? printer.hostIp.trim() : '')
     if (!name) return c.json({ success: false, error: 'printer.name is required' }, 400)
     if (!hostIp) return c.json({ success: false, error: 'hostIp is required (which PC owns the USB printer?)' }, 400)
-    const hostPort = Number(body.hostPort) > 0 ? Math.min(65535, Math.max(1, Math.floor(Number(body.hostPort)))) : 3080
+    // 0.6.122 — the compat print port default comes from the PRESET registry
+    // (LAN_HTTP_API_PORT, @blasti/core/lan-protocol) — never a bare literal.
+    const hostPort = Number(body.hostPort) > 0 ? Math.min(65535, Math.max(1, Math.floor(Number(body.hostPort)))) : LAN_HTTP_API_PORT
     const cupsName = typeof printer.cupsName === 'string' ? printer.cupsName.slice(0, 120) : null
     const usbVendorId = typeof printer.usbVendorId === 'string' ? printer.usbVendorId.slice(0, 20) : null
     const usbProductId = typeof printer.usbProductId === 'string' ? printer.usbProductId.slice(0, 20) : null
@@ -4739,54 +4878,99 @@ app.post('/discovery/print', printAuth, async (c) => {
             }
             if (pcfg.attachment === 'USB' && hostIp) {
               // USB-attached — first try the DIRECT LAN forward to the host
-              // PC's local API (works when the host is LAN-reachable from the
-              // requester's store); on failure fall back to the realtime
-              // relay (0.6.105) instead of a 502 — the active desktop app on
-              // the host still prints the receipt in the background.
-              const hostPort = Number(pcfg.hostPort) > 0 ? Number(pcfg.hostPort) : 3080
+              // PC's print services (works when the host is LAN-reachable
+              // from the requester's store); on failure fall back to the
+              // realtime relay (0.6.105) instead of a 502 — the active
+              // desktop app on the host still prints the receipt in the
+              // background.
+              //
+              // 0.6.122 — PRESET PORT LADDER (user mandate: "pre-set this
+              // services ports and channels and communication protocols"):
+              // the cloud now dials the host exactly like the desktop's own
+              // print-relay sender — the DEDICATED listener :3083 /print-job
+              // first, then the compat route :3080
+              // /api/agency-devices/host/print-job. Pre-0.6.122 the cloud
+              // dialed compat :3080 only, so a host whose firewall allows
+              // only the dedicated port (or vice versa) failed the direct
+              // leg and degraded to the realtime relay.
+              const configuredPort = Number(pcfg.hostPort) > 0 ? Number(pcfg.hostPort) : 0
+              // An explicitly configured NON-compat hostPort wins; a stored
+              // compat default (:3080 — what register-peripheral presets) or
+              // no port at all walks the preset ladder (dedicated :3083 →
+              // compat :3080), matching the desktop print-relay sender.
+              const targetPorts: number[] = configuredPort > 0 && configuredPort !== LAN_HTTP_API_PORT
+                ? [configuredPort]
+                : [...PRINT_RELAY_TARGET_PORTS]
               const hostToken = printerRow.deviceToken || ''
               if (!hostToken) {
                 // Not paired → the direct path cannot authenticate, but the
                 // relay path authenticates via the agency room membership.
                 return relayJob('host not paired — job relayed over realtime')
               }
-              const ctl = new AbortController()
-              const timer = setTimeout(() => ctl.abort(), 20_000)
+              const perAttemptCtl = () => {
+                const ctl = new AbortController()
+                const timer = setTimeout(() => ctl.abort(), PRINT_RELAY_ATTEMPT_TIMEOUT_MS)
+                return { ctl, clear: () => clearTimeout(timer) }
+              }
               try {
-                const fwd = await fetch(`http://${hostIp}:${hostPort}/api/agency-devices/host/print-job`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${hostToken}` },
-                  body: JSON.stringify({
-                    printerName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName)
-                      || (typeof pcfg.osPrinterName === 'string' && pcfg.osPrinterName)
-                      || printerRow.name
-                      || undefined,
-                    cupsName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName) || undefined,
-                    ticket: printBody.ticket || undefined,
-                  }),
-                  signal: ctl.signal,
-                })
-                const fwdData = await fwd.json().catch(() => null) as { success?: boolean; error?: string } | null
-                if (fwd.ok && fwdData && fwdData.success) {
+                for (const targetPort of targetPorts) {
+                  const { ctl, clear } = perAttemptCtl()
                   try {
-                    appendDeviceEvent({
-                      event: 'print_job_done',
-                      message: `USB print job forwarded to host ${hostIp}:${hostPort} for ${printerRow.name}`,
-                      deviceId: printerRow.id,
-                      deviceName: printerRow.name,
-                      deviceType: 'PRINTER',
-                      agencyId: printerRow.agencyId,
-                      data: { source: 'usb-forward', kioskDeviceId: kioskDevice.id },
+                    const fwd = await fetch(`http://${hostIp}:${targetPort}${printRelayRequestPath(targetPort)}`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${hostToken}` },
+                      body: JSON.stringify({
+                        printerName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName)
+                          || (typeof pcfg.osPrinterName === 'string' && pcfg.osPrinterName)
+                          || printerRow.name
+                          || undefined,
+                        cupsName: (typeof pcfg.cupsName === 'string' && pcfg.cupsName) || undefined,
+                        ticket: printBody.ticket || undefined,
+                      }),
+                      signal: ctl.signal,
                     })
-                  } catch { /* log only */ }
-                  return c.json({ success: true, via: 'host-forward', host: `${hostIp}:${hostPort}` })
+                    const fwdData = await fwd.json().catch(() => null) as { success?: boolean; error?: string } | null
+                    if (fwd.ok && fwdData && fwdData.success) {
+                      try {
+                        appendDeviceEvent({
+                          event: 'print_job_done',
+                          message: `USB print job forwarded to host ${hostIp}:${targetPort} for ${printerRow.name}`,
+                          deviceId: printerRow.id,
+                          deviceName: printerRow.name,
+                          deviceType: 'PRINTER',
+                          agencyId: printerRow.agencyId,
+                          data: { source: 'usb-forward', kioskDeviceId: kioskDevice.id },
+                        })
+                      } catch { /* log only */ }
+                      return c.json({ success: true, via: 'host-forward', host: `${hostIp}:${targetPort}` })
+                    }
+                    // A 4xx the host UNDERSTOOD means its listener is alive —
+                    // auth/payload problems will not improve on other ports.
+                    if (fwd.status === 400 || fwd.status === 401) {
+                      try {
+                        appendDeviceEvent({
+                          event: 'print_job_failed',
+                          message: `USB print job rejected by host ${hostIp}:${targetPort}: ${(fwdData && fwdData.error) || `status ${fwd.status}`}`,
+                          deviceId: printerRow.id,
+                          deviceName: printerRow.name,
+                          deviceType: 'PRINTER',
+                          agencyId: printerRow.agencyId,
+                          data: { source: 'usb-forward', kioskDeviceId: kioskDevice.id, status: fwd.status },
+                        })
+                      } catch { /* log only */ }
+                      return relayJob('direct host forward rejected the job — relayed over realtime')
+                    }
+                  } catch { /* port unreachable → next ladder port */ }
+                  finally { clear() }
                 }
-                // 0.6.105 — direct forward failed (host offline / LAN split) →
-                // realtime relay fallback; the job still reaches the active
-                // desktop app through the cloud socket.
+                // 0.6.105 — direct forward failed on every preset port (host
+                // offline / LAN split) → realtime relay fallback; the job
+                // still reaches the active desktop app through the socket.
                 return relayJob('direct host forward failed — job relayed over realtime')
               } finally {
-                clearTimeout(timer)
+                // Per-attempt timers are cleared in the loop above; nothing
+                // shared to clean here (kept for structural symmetry with the
+                // pre-0.6.122 guard rails).
               }
             }
             // Raw ESC/POS target for network printers (NOT for USB-local ones:
@@ -4935,6 +5119,42 @@ app.post('/discovery/saved-tvs', async (c) => {
         lastSeenAt: new Date(),
       },
     })
+    // ── 0.6.119 — "SAVE TV" ALSO REGISTERS THE DEVICE (desktop parity) ──
+    // The registered-devices list reads AgencyDevice; without this row the TV
+    // never appeared there and the screen-template picker was unreachable.
+    try {
+      const layoutInput = ['TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL', 'QUEUE_BOARD'].includes(String(body.screenLayout || ''))
+        ? String(body.screenLayout)
+        : null
+      const existingDev = await db.agencyDevice.findFirst({
+        where: { agencyId: user.agencyId, type: { in: ['TV', 'DISPLAY'] }, ipAddress: v.ip },
+        select: { id: true },
+      })
+      if (existingDev) {
+        await db.agencyDevice.update({
+          where: { id: existingDev.id },
+          data: {
+            name: String(v.name || 'BLASTI TV').slice(0, 100),
+            ...(v.port > 0 ? { port: v.port } : {}),
+            ...(layoutInput ? { screenLayout: layoutInput } : {}),
+          },
+        })
+      } else {
+        await db.agencyDevice.create({
+          data: {
+            agencyId: user.agencyId,
+            name: String(v.name || 'BLASTI TV').slice(0, 100),
+            type: 'TV',
+            status: 'OFFLINE',
+            connectionType: 'LAN',
+            ipAddress: v.ip,
+            ...(v.port > 0 ? { port: v.port } : {}),
+            screenLayout: layoutInput || 'TV_CLASSIC',
+            autoDiscovery: true,
+          },
+        })
+      }
+    } catch { /* display-only — never fail the save */ }
     return c.json({ success: true, savedTv: tv })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -5185,6 +5405,54 @@ app.post('/discovery/cast', async (c) => {
         if (parsed.protocol === 'http:' || parsed.protocol === 'https:') tvBoardUrl = parsed.toString()
       } catch { /* invalid → keep the origin-built URL */ }
     }
+
+    // ── 0.6.119 — TEMPLATE + REGISTRATION (desktop parity) ──
+    // The manager's chosen screen style rides the cast URL, and the cast
+    // target is REGISTERED as an AgencyDevice (type TV, keyed by agency + IP)
+    // so it appears in the registered list and its template is configurable.
+    const layoutRaw = typeof body.screenLayout === 'string' ? body.screenLayout.trim().toUpperCase() : ''
+    const TV_LAYOUT_URL_PARAM: Record<string, string> = {
+      TV_CLASSIC: 'classic', TV_COUNTERS: 'counters', TV_FOCUS: 'focus', TV_MINIMAL: 'minimal', QUEUE_BOARD: 'board',
+    }
+    const layoutParam = TV_LAYOUT_URL_PARAM[layoutRaw] || null
+    if (layoutParam) {
+      try {
+        const boardUrl = new URL(tvBoardUrl)
+        boardUrl.searchParams.set('layout', layoutParam)
+        tvBoardUrl = boardUrl.toString()
+      } catch { /* keep the original URL */ }
+    }
+    try {
+      const layoutInput = ['TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL', 'QUEUE_BOARD'].includes(layoutRaw) ? layoutRaw : null
+      const existingTv = await db.agencyDevice.findFirst({
+        where: { agencyId: user.agencyId, type: { in: ['TV', 'DISPLAY'] }, ipAddress: ip },
+        select: { id: true },
+      })
+      if (existingTv) {
+        await db.agencyDevice.update({
+          where: { id: existingTv.id },
+          data: {
+            ...(tvName && tvName !== 'BLASTI TV' ? { name: tvName.slice(0, 100) } : {}),
+            ...(port > 0 ? { port } : {}),
+            ...(layoutInput ? { screenLayout: layoutInput } : {}),
+          },
+        })
+      } else {
+        await db.agencyDevice.create({
+          data: {
+            agencyId: user.agencyId,
+            name: (tvName || `TV @ ${ip}`).slice(0, 100),
+            type: 'TV',
+            status: 'OFFLINE',
+            connectionType: 'LAN',
+            ipAddress: ip,
+            ...(port > 0 ? { port } : {}),
+            screenLayout: layoutInput || 'TV_CLASSIC',
+            autoDiscovery: true,
+          },
+        })
+      }
+    } catch { /* display-only — never block the cast */ }
 
     // 'url' → unchanged behavior: hand the URL to the frontend (it opens it
     // in a new tab so the user can navigate on the TV or use Chromecast/HDMI).

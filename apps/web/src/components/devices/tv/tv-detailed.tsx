@@ -14,6 +14,9 @@ import { toast } from 'sonner';
 import { translateStatus } from '@/lib/enum-i18n';
 import { getCachedLocalIp } from '@/lib/get-local-ip';
 import { getProxiedUrl } from '@/lib/utils';
+// 0.6.121 — VOICE CALLING on the rich board (same offline service as the
+// simple layouts): announces newly called tickets in Arabic/French/English.
+import { useTvVoiceCalling } from './use-tv-voice-calling';
 
 interface CurrentlyServing {
   id: string;
@@ -78,6 +81,8 @@ interface DisplayConfig {
   showEstimatedWait?: boolean;
   showServiceStats?: boolean;
   serviceFilter?: string[];
+  /** 0.6.121 — voice-calling config (see lib/tv-voice.ts). */
+  voiceCalling?: Record<string, unknown>;
 }
 
 interface DeviceTvBoardProps {
@@ -346,6 +351,12 @@ export function DeviceTvBoardDetailed({
     () => ({ ...serverDisplaySettings, ...urlDisplaySettings }),
     [serverDisplaySettings, urlDisplaySettings],
   );
+
+  // 0.6.121 — VOICE CALLING on the rich board: every newly CALLED ticket is
+  // announced (chime + Arabic → French → English) through the desktop's
+  // dedicated offline voice service (:3084, espeak-ng WASM). Device-surface
+  // gating + boot-snapshot silence live inside the hook.
+  useTvVoiceCalling({ serving: status?.currentlyServing, config: displaySettings });
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // LAN Discovery state

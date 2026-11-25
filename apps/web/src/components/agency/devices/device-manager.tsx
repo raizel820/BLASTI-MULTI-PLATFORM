@@ -45,7 +45,7 @@ import {
   Loader2, Tv, Printer, Plus, Settings, Square, CheckCheck, Wifi,
   AlertTriangle, RadioTower, Usb, X, Search, MonitorPlay, Trash2, Unplug,
   Plug, Send, Smartphone, Laptop, Router as RouterIcon, Cpu,
-  Cloud, CloudOff,
+  Cloud, CloudOff, ShieldX, Unlock,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useDiscoveryService } from '@/hooks/use-discovery-service';
@@ -159,6 +159,9 @@ export function DeviceManager() {
   const [savedTvIps, setSavedTvIps] = useState<Set<string>>(new Set());
   const [defaultPrinterIp, setDefaultPrinterIp] = useState<string | null>(null);
   const [busyDeviceId, setBusyDeviceId] = useState<string | null>(null);
+  // 0.6.119 — TV cast screen template: which design a discovery-card cast
+  // opens (rides the cast URL as &layout=… and persists on the TV row).
+  const [tvCastLayout, setTvCastLayout] = useState<ScreenLayout>('TV_CLASSIC');
 
   // 0.6.78 — connect protocol + raw print states (per discovered-device id)
   const [connectingId, setConnectingId] = useState<string | null>(null);
@@ -562,15 +565,45 @@ export function DeviceManager() {
       const res = await apiFetch(`${API_BASE}/${confirmState.device.id}`, { method: 'DELETE' });
       const data = await res.json().catch(() => ({}));
       if (data.success) {
-        toast.success(getLocalizedString('تم حذف الجهاز', 'Appareil supprimé', 'Device deleted', lang));
+        // 0.6.119 — the delete now tombstones the fingerprint (the device can
+        // no longer resurrect itself); surface that to the manager.
+        toast.success(
+          data.tombstoned
+            ? getLocalizedString('تم حذف الجهاز ومنع إعادة تسجيله', 'Appareil supprimé — réenregistrement bloqué', 'Device deleted — re-registration blocked', lang)
+            : getLocalizedString('تم حذف الجهاز', 'Appareil supprimé', 'Device deleted', lang),
+        );
         setConfirmState(null);
         fetchDevices();
+        fetchUnpaired();
       } else {
         toast.error(data.error || getLocalizedString('فشل الحذف', 'Échec de la suppression', 'Delete failed', lang));
       }
     } catch {
       toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));
     } finally { setConfirmLoading(false); }
+  };
+
+  // ─── 0.6.119 — deleted-device tombstones (ghost fix) ─────────────────
+  // "Allow re-discovery": lift the removed-device blocklist for one
+  // fingerprint so the physical device can register again (manager action on
+  // the unpaired strip's blocked chips).
+  const handleClearTombstone = async (fingerprint: string) => {
+    setBusyDeviceId('tombstone-' + fingerprint);
+    try {
+      const res = await apiFetch(`${API_BASE}/tombstones/clear`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fingerprint }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.success) {
+        toast.success(getLocalizedString('تم السماح بإعادة الاكتشاف', 'Redécouverte autorisée', 'Re-discovery allowed', lang));
+        fetchUnpaired();
+      } else {
+        toast.error(data.error || getLocalizedString('فشل التنفيذ', 'Échec de l\'opération', 'Operation failed', lang));
+      }
+    } catch {
+      toast.error(getLocalizedString('حدث خطأ', 'Une erreur est survenue', 'An error occurred', lang));
+    } finally { setBusyDeviceId(null); }
   };
 
   const handleConfirmUnpair = async () => {
@@ -735,12 +768,16 @@ export function DeviceManager() {
           ip: device.ip, port: device.port, mac: device.mac,
           manufacturer: device.manufacturer || device.macVendor, model: device.model,
           ssdpLocation: device.ssdpLocation, mdnsService: device.mdnsService, source: device.source,
+          // 0.6.119 — saving also REGISTERS the TV (AgencyDevice row) so it
+          // appears in the registered list with a configurable screen template.
+          screenLayout: tvCastLayout,
         }),
       });
       const data = await res.json();
       if (data.success) {
         toast.success(getLocalizedString('تم حفظ التلفاز', 'Téléviseur enregistré', 'TV saved', lang));
         setSavedTvIps((prev) => new Set(prev).add(device.ip));
+        fetchDevices();
       } else {
         toast.error(data.error || getLocalizedString('فشل الحفظ', 'Échec de la sauvegarde', 'Save failed', lang));
       }
@@ -759,6 +796,9 @@ export function DeviceManager() {
           manufacturer: device.manufacturer || device.macVendor,
           name: device.name, ssdpLocation: device.ssdpLocation,
           mdnsService: device.mdnsService,
+          // 0.6.119 — the chosen screen template rides the cast (the route
+          // appends &layout=… and persists it on the registered TV row).
+          screenLayout: tvCastLayout,
         }),
       });
       const data = await res.json();
@@ -775,6 +815,9 @@ export function DeviceManager() {
             : 'Cast successful via ' + String(data.protocol || ''),
           lang,
         ));
+        // 0.6.119 — the cast target is now a REGISTERED device: refresh so it
+        // appears in the registered list immediately.
+        if (data.registered || data.deviceId) fetchDevices();
       } else {
         toast.error(data.message || data.error || getLocalizedString(
           'فشل البث — لا توجد بروتوكولات متاحة على هذا التلفاز',
@@ -1478,19 +1521,46 @@ export function DeviceManager() {
                     {getLocalizedString('أجهزة تنتظر الموافقة', 'Appareils en attente', 'Devices waiting for approval', lang)}
                   </p>
                   <div className="flex flex-wrap gap-2">
-                    {unpairedDevices.map((d) => (
-                      <div key={d.id} className="flex items-center gap-2 rounded-xl border border-amber-300/60 bg-amber-50/60 dark:border-amber-900/40 dark:bg-amber-950/20 px-3 py-2">
-                        <StatusDot status="PAIRING" />
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium truncate max-w-40">{getLocalizedName(d, lang)}</p>
-                          <p className="text-[11px] text-muted-foreground" dir="ltr">{d.ipAddress || d.deviceFingerprint?.slice(0, 12) || '—'}</p>
+                    {unpairedDevices.map((d) => {
+                      // 0.6.119 — deliberately deleted fingerprints arrive as
+                      // blocked chips: re-registration is TOMBSTONED server-side;
+                      // the manager can explicitly allow re-discovery.
+                      const blocked = !!(d as UnpairedDevice & { tombstoned?: boolean }).tombstoned;
+                      return (
+                        <div key={d.id} className={`flex items-center gap-2 rounded-xl border px-3 py-2 ${
+                          blocked
+                            ? 'border-red-300/60 bg-red-50/60 dark:border-red-900/40 dark:bg-red-950/20'
+                            : 'border-amber-300/60 bg-amber-50/60 dark:border-amber-900/40 dark:bg-amber-950/20'
+                        }`}>
+                          {blocked ? <ShieldX className="h-4 w-4 text-red-500" /> : <StatusDot status="PAIRING" />}
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium truncate max-w-40">{getLocalizedName(d, lang)}</p>
+                            <p className="text-[11px] text-muted-foreground" dir="ltr">
+                              {blocked
+                                ? getLocalizedString('محذوف — إعادة التسجيل محظورة', 'Supprimé — réenregistrement bloqué', 'Removed — re-registration blocked', lang)
+                                : (d.ipAddress || d.deviceFingerprint?.slice(0, 12) || '—')}
+                            </p>
+                          </div>
+                          {blocked ? (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 gap-1 border-red-300 text-xs text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300"
+                              disabled={busyDeviceId === d.id || !(d as UnpairedDevice & { deviceFingerprint?: string }).deviceFingerprint}
+                              onClick={() => handleClearTombstone(String((d as UnpairedDevice & { deviceFingerprint?: string }).deviceFingerprint || ''))}
+                            >
+                              {busyDeviceId === d.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Unlock className="h-3.5 w-3.5" />}
+                              {getLocalizedString('اسمح بإعادة الاكتشاف', 'Autoriser la redécouverte', 'Allow re-discovery', lang)}
+                            </Button>
+                          ) : (
+                            <Button size="sm" className="h-7 gap-1 text-xs" disabled={busyDeviceId === d.id} onClick={() => handleSendPairingRequest(d.id)}>
+                              {busyDeviceId === d.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCheck className="h-3.5 w-3.5" />}
+                              {getLocalizedString('ربط', 'Associer', 'Pair', lang)}
+                            </Button>
+                          )}
                         </div>
-                        <Button size="sm" className="h-7 gap-1 text-xs" disabled={busyDeviceId === d.id} onClick={() => handleSendPairingRequest(d.id)}>
-                          {busyDeviceId === d.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCheck className="h-3.5 w-3.5" />}
-                          {getLocalizedString('ربط', 'Associer', 'Pair', lang)}
-                        </Button>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -1498,9 +1568,30 @@ export function DeviceManager() {
               {/* Discovered network devices */}
               {visibleDiscovered.length > 0 && (
                 <div className="space-y-2">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    {getLocalizedString('مكتشف على الشبكة', 'Découverts sur le réseau', 'Discovered on the network', lang)} ({visibleDiscovered.length})
-                  </p>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {getLocalizedString('مكتشف على الشبكة', 'Découverts sur le réseau', 'Discovered on the network', lang)} ({visibleDiscovered.length})
+                    </p>
+                    {/* 0.6.119 — TV cast screen template: the design the cast
+                        opens and the registered TV row stores. */}
+                    <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      {getLocalizedString('نمط شاشة البث', 'Style de diffusion TV', 'TV cast layout', lang)}
+                      <select
+                        value={tvCastLayout}
+                        onChange={(e) => setTvCastLayout(e.target.value as ScreenLayout)}
+                        className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+                      >
+                        {(['TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL', 'QUEUE_BOARD'] as ScreenLayout[]).map((l) => {
+                          const cfg = SCREEN_LAYOUT_CONFIG[l];
+                          return (
+                            <option key={l} value={l}>
+                              {lang === 'ar' ? cfg.labelAr : lang === 'fr' ? (cfg.labelFr || cfg.labelEn) : cfg.labelEn}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </label>
+                  </div>
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                     {visibleDiscovered.map((d) => (
                       <DiscoveredCard

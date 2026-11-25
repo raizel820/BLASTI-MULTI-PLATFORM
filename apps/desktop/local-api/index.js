@@ -76,6 +76,12 @@ const CORS_ORIGINS = [
 
 let db = null
 let httpServer = null
+// 0.6.117 — UDP :3082 device-to-device pairing receiver (PC-side offer intake).
+let pairingOfferUdpReceiver = null
+// 0.6.118 — dedicated print-relay listener (:3083) + runtime refs.
+let printRelayListener = null
+// 0.6.121 — dedicated offline voice-calling listener (:3084).
+let voiceListener = null
 let sessionToken = null
 let sessionUser = null
 
@@ -3281,6 +3287,49 @@ function createApp() {
    * simply means the credential is stored at the next successful login.
    */
   const pendingVerificationPasswords = new Map()
+
+  /**
+   * Legal & Agreements cloud proxy (0.6.120). The desktop keeps NO legal
+   * tables: the versioned agreements (per-role user agreements + privacy
+   * policy) and the proof-of-consent ledger live in the cloud database.
+   * Every /api/legal-documents* verb is forwarded transparently:
+   *   - GET  /api/legal-documents            — public active documents
+   *     (register forms, staff-create dialog, create-agency wizard viewers)
+   *   - GET/POST /api/legal-documents/admin, PUT …/admin/activate,
+   *     GET …/admin/consents — SUPER_ADMIN Legal console (auth header
+   *     forwarded unchanged; the cloud's requireAdmin enforces the role).
+   * Offline → 503 CLOUD_UNREACHABLE; the consent block keeps its checkboxes
+   * usable in that case and the server still gates the actual submission.
+   */
+  const legalDocsProxy = async (c) => {
+    const search = new URL(c.req.url).search
+    const method = c.req.method.toUpperCase()
+    try {
+      const headers = { 'Content-Type': 'application/json' }
+      const auth = c.req.header('authorization')
+      if (auth) headers.Authorization = auth
+      const init = { method, headers }
+      if (method !== 'GET' && method !== 'HEAD') {
+        const raw = await c.req.text()
+        init.body = raw
+      }
+      const res = await cloudFetchWithRetry(c.req.path + search, init, { timeoutMs: 12000, attempts: 1 })
+      const text = await res.text()
+      let data = null
+      try { data = JSON.parse(text) } catch { data = null }
+      if (data !== null) return c.json(data, res.status)
+      return c.newResponse(text, res.status, { 'Content-Type': res.headers.get('content-type') || 'text/plain' })
+    } catch (err) {
+      console.warn('[LocalAPI] Legal-documents proxy: cloud unreachable:', err?.message || err)
+      return c.json({
+        success: false,
+        error: 'Legal documents require an internet connection — the cloud API is unreachable',
+        code: 'CLOUD_UNREACHABLE',
+      }, 503)
+    }
+  }
+  app.get('/api/legal-documents', legalDocsProxy)
+  app.all('/api/legal-documents/*', legalDocsProxy)
 
   /**
    * Register a new account — CLOUD-NATIVE operation proxied through the
@@ -14039,6 +14088,81 @@ async function startLocalApi(dbPath, port, options) {
     })
   })
 
+  // 0.6.117 — DEVICE-TO-DEVICE PAIRING RECEIVER FOR PCs: bind UDP :3082 so
+  // the manager's sendPairingOfferUdp() unicast actually reaches THIS desktop
+  // (until now only the Android plugin listened there — a PC never ACKed and
+  // the "pairing request does not reach other pc devices" class was born).
+  // The receiver ACKs the manager instantly and forwards the offer into this
+  // machine's own /api/agency-devices/public/pairing-offer route, which owns
+  // orphan match/create, the PAIRING_REQUEST command and the native dialog.
+  try {
+    const { startPairingOfferUdpReceiver } = require('./lib/pairing-offer-udp-receiver')
+    pairingOfferUdpReceiver = startPairingOfferUdpReceiver({ port, origin: localOrigin, log: (m) => console.log('[LocalAPI] ' + m) })
+  } catch (err) {
+    console.warn('[LocalAPI] pairing-offer UDP receiver unavailable (non-fatal):', err && err.message)
+  }
+
+  // 0.6.118 — DEDICATED PRINT-RELAY SERVICES (the two-service print chain):
+  //   • HANDLER (this machine): initPrintRelayHandler wires the LAN-IP getter,
+  //     then startPrintRelayListener opens the DEDICATED listener on the
+  //     predetermined port :3083 (lib/lan-ports.js). Kiosks/staff PCs send
+  //     ticket payloads here; the handler resolves the caller's SELECTED
+  //     printer (printerConfig.defaultPrinterDeviceId on the caller's row in
+  //     THIS store) and prints through the SERIAL job queue on the CONNECTED
+  //     printer — or forwards one hop to the printer-host PC.
+  //   • SENDER (kiosk side) lives in lib/print-relay-sender.js and is used by
+  //     the print route's relay + host-forward legs.
+  // Auth: the same token ladder as the compat route (device token → LAN
+  // token → session token); the device ROW rides along so the selected
+  // printer can be resolved. A failed bind degrades gracefully — the compat
+  // route on :3080 keeps printing.
+  try {
+    const printRelayHandler = require('./lib/print-relay-handler')
+    const { BLASTI_LAN_PORTS } = require('./lib/lan-ports')
+    printRelayHandler.initPrintRelayHandler({
+      getLanIp: () => (LAN_ENABLED ? bestLanIp() : null),
+      log: (m) => console.log('[LocalAPI] [PRINT-RELAY] ' + m),
+    })
+    const verifyPrintRelayCaller = async (token) => {
+      if (!token) return null
+      try {
+        if (db) {
+          const row = await db.agencyDevice.findFirst({ where: { deviceToken: token } })
+          if (row) return { deviceRow: row }
+        }
+      } catch { /* not a device token */ }
+      try { if (require('./lib/lan-authority').verifyDeviceToken(token)) return { deviceRow: null } } catch { /* not a LAN token */ }
+      if (sessionToken && token === sessionToken) return { deviceRow: null }
+      return null
+    }
+    printRelayListener = printRelayHandler.startPrintRelayListener({
+      port: BLASTI_LAN_PORTS.PRINT_RELAY,
+      verifyCaller: verifyPrintRelayCaller,
+      getDb: () => db,
+      log: (m) => console.log('[LocalAPI] [PRINT-RELAY] ' + m),
+    })
+  } catch (err) {
+    console.warn('[LocalAPI] print-relay listener unavailable (non-fatal):', err && err.message)
+  }
+
+  // 0.6.121 — DEDICATED OFFLINE VOICE-CALLING SERVICE (user mandate: "to the
+  // tv screen add voice calling in all three languages — dedicated service,
+  // free and open source tools, works offline locally"): bind the tiny
+  // espeak-ng-WASM synthesizer listener on the predetermined port :3084
+  // (lib/lan-ports.js). TV boards fetch announcement WAVs (ar/fr/en) from
+  // this LAN port instead of depending on any cloud TTS. A failed bind
+  // degrades gracefully — the TV falls back to its browser voice.
+  try {
+    const { startVoiceService } = require('./lib/voice-service')
+    const { BLASTI_LAN_PORTS: voicePorts } = require('./lib/lan-ports')
+    voiceListener = startVoiceService({
+      port: voicePorts.VOICE_TTS,
+      log: (m) => console.log('[LocalAPI] [VOICE] ' + m),
+    })
+  } catch (err) {
+    console.warn('[LocalAPI] voice service unavailable (non-fatal):', err && err.message)
+  }
+
   // 0.6.67 — warm the cloud connection NOW (background, non-blocking): the
   // user's first register/verify/agency-create of the session then reuses a
   // ready DNS/TLS/connection-pool instead of paying the cold-start budget
@@ -14302,6 +14426,28 @@ async function startLocalApi(dbPath, port, options) {
  * Stop the embedded local API server.
  */
 function stopLocalApi() {
+  // 0.6.117 — release the UDP :3082 pairing receiver first (its loopback
+  // forwards need the HTTP server alive, and the socket must not linger).
+  try {
+    if (pairingOfferUdpReceiver && typeof pairingOfferUdpReceiver.stop === 'function') {
+      pairingOfferUdpReceiver.stop()
+      pairingOfferUdpReceiver = null
+    }
+  } catch { /* non-fatal */ }
+  // 0.6.118 — release the dedicated print-relay listener (:3083).
+  try {
+    if (printRelayListener && typeof printRelayListener.stop === 'function') {
+      printRelayListener.stop()
+      printRelayListener = null
+    }
+  } catch { /* non-fatal */ }
+  // 0.6.121 — release the dedicated voice-calling listener (:3084).
+  try {
+    if (voiceListener && typeof voiceListener.stop === 'function') {
+      voiceListener.stop()
+      voiceListener = null
+    }
+  } catch { /* non-fatal */ }
   // r21-8: release counters controlled by the closing session BEFORE the DB
   // goes down — the local API is the queue's source of truth offline, so a
   // staff member who closes the app must not keep a counter lease alive past

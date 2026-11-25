@@ -61,10 +61,13 @@ function hasSnapshotProvider() {
   return !!snapshotProvider;
 }
 
-async function captureSnapshot(url) {
+async function captureSnapshot(url, opts = {}) {
   if (!snapshotProvider) return null;
   // Fresh cache → reuse (a renderer may fetch the URL seconds after the cast).
-  if (lastSnapshot && Date.now() - lastSnapshot.ts < SNAPSHOT_MAX_AGE_MS) {
+  // `force` bypasses the cache — the 0.6.119 live-snapshot loop uses it to
+  // push a genuinely NEW frame to the TV on every tick.
+  const force = !!(opts && opts.force);
+  if (!force && lastSnapshot && Date.now() - lastSnapshot.ts < SNAPSHOT_MAX_AGE_MS) {
     return lastSnapshot.buf;
   }
   try {
@@ -819,6 +822,71 @@ async function castToTv(target, mediaUrl, preferred) {
   };
 }
 
+// ─── 0.2. Live snapshot loop (0.6.119) ─────────────────────────────────────
+// ROOT FIX for "after initial casting the TV screen did not update though I
+// served several customers": media renderers (Chromecast CASTv2 / DLNA / Roku)
+// display ONE static JPEG captured at cast time. The live loop re-captures
+// the board (hidden Electron window, force-refresh) and re-pushes it to the
+// TV every interval so the screen tracks the real queue. Webview protocols
+// (Samsung Tizen / LG webOS) load the LIVE board URL and must NOT loop.
+
+const LIVE_LOOP_INTERVAL_MS_DEFAULT = 45_000;
+const LIVE_LOOP_MAX_FAILURES = 4;
+const liveLoops = new Map(); // ip → { timer, proto, target, boardUrl, lanBase, failures, intervalMs }
+
+function liveSnapshotMediaUrl(lanBase, ts) {
+  return `${lanBase}/api/agency-devices/discovery/cast/snapshot.jpg?ts=${ts}`;
+}
+
+async function liveLoopTick(ip) {
+  const loop = liveLoops.get(ip);
+  if (!loop) return;
+  try {
+    const buf = await captureSnapshot(loop.boardUrl, { force: true });
+    if (!buf) {
+      loop.failures += 1;
+    } else {
+      const mediaUrl = liveSnapshotMediaUrl(loop.lanBase, Date.now());
+      let result = null;
+      if (loop.proto === 'dlna') result = await castViaDlna(loop.target, mediaUrl);
+      else if (loop.proto === 'roku-ecp' || loop.proto === 'roku') result = await castViaRokuEcp(loop.target, mediaUrl);
+      else result = await castViaGoogleCast(loop.target, mediaUrl, { title: 'BLASTI Queue Board' });
+      loop.failures = result && result.success !== false ? 0 : loop.failures + 1;
+    }
+  } catch {
+    loop.failures += 1;
+  }
+  // TV off / gone from the network → stop pushing after a few quiet cycles.
+  if (loop.failures >= LIVE_LOOP_MAX_FAILURES) {
+    stopLiveSnapshotLoop(ip);
+  }
+}
+
+/** Start (or restart) the per-TV snapshot refresh loop. */
+function startLiveSnapshotLoop(target, proto, boardUrl, lanBase, opts = {}) {
+  if (!target || !target.ip || !boardUrl || !lanBase) return false;
+  stopLiveSnapshotLoop(target.ip);
+  const intervalMs = Math.min(300_000, Math.max(10_000, Number(opts.intervalMs) || LIVE_LOOP_INTERVAL_MS_DEFAULT));
+  const loop = { proto, target, boardUrl, lanBase, failures: 0, intervalMs, timer: null };
+  liveLoops.set(String(target.ip), loop);
+  loop.timer = setInterval(() => { liveLoopTick(String(target.ip)).catch(() => { /* tick errors counted above */ }); }, intervalMs);
+  return true;
+}
+
+/** Stop the loop for one TV (stop-cast route / webview cast took over). */
+function stopLiveSnapshotLoop(ip) {
+  const key = String(ip || '');
+  const loop = liveLoops.get(key);
+  if (!loop) return false;
+  if (loop.timer) clearInterval(loop.timer);
+  liveLoops.delete(key);
+  return true;
+}
+
+function isLiveLoopActive(ip) {
+  return liveLoops.has(String(ip || ''));
+}
+
 module.exports = {
   detectCastProtocols,
   castToTv,
@@ -833,4 +901,7 @@ module.exports = {
   captureSnapshot,
   getLastSnapshot,
   getLastSnapshotTs,
+  startLiveSnapshotLoop,
+  stopLiveSnapshotLoop,
+  isLiveLoopActive,
 };

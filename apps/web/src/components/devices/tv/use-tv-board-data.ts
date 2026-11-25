@@ -94,6 +94,15 @@ export interface TvDisplayConfig {
   showLogo?: boolean;
   rotationSec?: number;
   serviceFilter?: string[];
+  /** 0.6.121 — voice-calling config (lib/tv-voice.ts). */
+  voiceCalling?: {
+    enabled?: boolean;
+    languages?: Array<'ar' | 'fr' | 'en'>;
+    volume?: number;
+    speed?: 'slow' | 'normal' | 'fast';
+    chime?: boolean;
+    cycles?: number;
+  };
 }
 
 export type TvScreenLayout = 'TV_CLASSIC' | 'TV_COUNTERS' | 'TV_FOCUS' | 'TV_MINIMAL';

@@ -13,6 +13,9 @@
     },
     "./sync-registry.json": {
       "default": "./sync-registry.json"
+    },
+    "./lan-protocol": {
+      "default": "./src/lan-protocol.ts"
     }
   },
   "devDependencies": {

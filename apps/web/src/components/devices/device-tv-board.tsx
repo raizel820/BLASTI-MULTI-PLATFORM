@@ -26,9 +26,15 @@ import { TvCounters } from './tv/layouts/tv-counters';
 import { TvFocus } from './tv/layouts/tv-focus';
 import { TvMinimal } from './tv/layouts/tv-minimal';
 import { useTvBoardData, type TvScreenLayout } from './tv/use-tv-board-data';
+// 0.6.121 — VOICE CALLING: offline queue-call announcements (ar/fr/en) via
+// the desktop's dedicated espeak-ng voice service (:3084).
+import { useTvVoiceCalling } from './tv/use-tv-voice-calling';
 import { useCategoryTermScope } from '@/hooks/use-category-terms';
 // 0.6.99 — device-surface flag + Electron beacon identity (shared with the kiosk)
 import { setDeviceSurfaceActive, reportDeviceSurfaceIdentity, clearDeviceSurfaceIdentity } from './kiosk/kiosk-types';
+// 0.6.119 — TV-side LAN API pin: a TV browser served by the desktop's local
+// API must poll THAT origin (the production build bakes the cloud URL).
+import { setKioskLanBase } from '@/lib/kiosk-lan-base';
 
 const TV_LAYOUTS: TvScreenLayout[] = ['TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL'];
 
@@ -62,6 +68,31 @@ interface DeviceTvBoardProps {
 
 export function DeviceTvBoard({ agencyId, onBack, currentLang }: DeviceTvBoardProps) {
   const { lang: appLang } = useLanguage();
+
+  // ── 0.6.119 — LAN API BASE PIN (TV twin of the kiosk's setKioskLanBase) ──
+  // ROOT FIX for "the TV screen did not update though I served customers":
+  // the TV's browser loads http://<desktop-lan-ip>:3080/?mode=device&type=TV
+  // from the desktop's local API, but the production web build bakes
+  // NEXT_PUBLIC_API_URL=https://blastidz.online — every poll/realtime/
+  // registration call then went to the CLOUD store while the desktop manager
+  // (and the cast snapshot) read the LOCAL :3080 store. In local-only mode
+  // the screen froze forever; in cloud mode it lagged behind the sync. When
+  // this page is served from a private/LAN host, pin ALL device API traffic
+  // to that origin so the TV talks to the very store the manager watches.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const ua = navigator.userAgent || '';
+      if (/electron/i.test(ua)) return; // Electron pins its own local base
+      const host = window.location.hostname;
+      const isLanHost = host === 'localhost' || host === '127.0.0.1'
+        || /^10\./.test(host)
+        || /^192\.168\./.test(host)
+        || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+      if (!isLanHost) return; // cloud-hosted manager page — keep cloud routing
+      setKioskLanBase(`${window.location.protocol}//${window.location.host}`);
+    } catch { /* never block the board */ }
+  }, []);
 
   // ── 0.6.99 — device-surface flag + Electron beacon identity ─────────────
   // The TV/kiosk window announces this machine with the SAME stable uid every
@@ -149,6 +180,15 @@ export function DeviceTvBoard({ agencyId, onBack, currentLang }: DeviceTvBoardPr
   // in the board tree ("No patients in queue" vs "No customers in queue").
   // Silent-degrade: no category / failed fetch → standard dictionary words.
   useCategoryTermScope(tvData.status?.agency?.category ?? null);
+
+  // 0.6.121 — VOICE CALLING (all boards): announces every newly CALLED ticket
+  // with the chime + Arabic → French → English cycle. Config rides in the
+  // device displaySettings (voiceCalling JSON) edited in Device Manager;
+  // announcements fire only on the device surface (?mode=device&type=TV).
+  useTvVoiceCalling({
+    serving: tvData.status?.currentlyServing,
+    config: tvData.displaySettings,
+  });
 
   // First-boot layout discovery: a freshly provisioned TV has no stored token
   // when the shell probes, so we re-probe the device config as soon as the

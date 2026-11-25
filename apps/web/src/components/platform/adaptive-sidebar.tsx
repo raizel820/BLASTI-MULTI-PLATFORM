@@ -77,6 +77,7 @@ import {
   History,
   LifeBuoy,
   RefreshCw,
+  BookOpen,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { toast } from 'sonner';
@@ -695,6 +696,9 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
       ],
     },
     { view: 'admin-audit', icon: ClipboardList, label: t('auditLogsPage') },
+    // Legal & Agreements — SUPER_ADMIN trilingual legal-document console
+    // (edit-publish / download / rollback) + consent ledger.
+    { view: 'admin-legal', icon: BookOpen, label: t('adminLegalTitle') },
     { view: 'admin-users', icon: Users, label: t('userManagement') },
     // Support desk — triage/reply incoming complaints, suggestions,
     // questions and notes from customers and agencies.

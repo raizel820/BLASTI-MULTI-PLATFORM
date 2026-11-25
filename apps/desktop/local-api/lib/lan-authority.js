@@ -41,7 +41,10 @@ const { createHmac, randomBytes, timingSafeEqual } = require('crypto')
 
 // ─── Tunables ────────────────────────────────────────────────────────────────
 
-const BEACON_PORT = 3081            // same channel main.js broadcasts on
+// 0.6.118 — the beacon port comes from the canonical LAN port registry
+// (lib/lan-ports.js — predetermined discovery/communication/listen ports).
+const { BLASTI_LAN_PORTS } = require('./lan-ports')
+const BEACON_PORT = BLASTI_LAN_PORTS.UDP_BEACON            // same channel main.js broadcasts on
 const BEACON_INTERVAL_MS = 3_000    // self-broadcast cadence (peers + election)
 const PEER_TTL_MS = 12_000          // beacon silence ⇒ peer presumed dead
 const ELECTION_TICK_MS = 3_000      // role evaluation cadence
@@ -1150,6 +1153,9 @@ module.exports = {
   joinHandler,
   verifyDeviceToken,
   computeSpecScore,
+  // 0.6.118 — the elected master peer (ip + port) for the print-relay sender
+  // and any surface that must reach the master PC device-to-device.
+  activeMasterPeer,
   // r21-9 — manual master selection
   setPreferredMaster,
   getPreferredMasterInstanceId,

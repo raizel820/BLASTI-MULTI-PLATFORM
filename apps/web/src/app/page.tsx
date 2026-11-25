@@ -94,6 +94,8 @@ const AdminCategoryLanguage = lazyNamed(() => import('@/components/admin/admin-c
 // 0.6.61 — AI Translation Agent console (agent settings + local dictionary + API keys)
 const AdminTranslationAgent = lazyNamed(() => import('@/components/admin/admin-translation-agent'), 'AdminTranslationAgent');
 const AdminAuditLogs = lazyNamed(() => import('@/components/admin/admin-audit-logs'), 'AdminAuditLogs');
+// Legal & Agreements — SUPER_ADMIN trilingual document console + consent ledger.
+const AdminLegalManager = lazyNamed(() => import('@/components/admin/admin-legal-manager'), 'AdminLegalManager');
 const AdminUsers = lazyNamed(() => import('@/components/admin/admin-users'), 'AdminUsers');
 const AdminAnalytics = lazyNamed(() => import('@/components/admin/admin-analytics'), 'AdminAnalytics');
 const AdminSettings = lazyNamed(() => import('@/components/admin/admin-settings'), 'AdminSettings');
@@ -412,6 +414,9 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminTranslationAgent />;
             case 'admin-audit':
               return <AdminAuditLogs />;
+            // Legal & Agreements — documents (edit-publish/rollback) + ledger.
+            case 'admin-legal':
+              return <AdminLegalManager />;
             case 'admin-users':
               return <AdminUsers />;
             case 'admin-analytics':
@@ -891,6 +896,7 @@ export default function Home() {
       'invoice-verify': t('billingScannerTitle') + ' - BLASTI',
       'admin-agencies': t('agencies') + ' - BLASTI',
       'admin-audit': t('auditLogs') + ' - BLASTI',
+      'admin-legal': t('adminLegalTitle') + ' - BLASTI',
       'admin-users': t('userManagement') + ' - BLASTI',
       'admin-analytics': t('analytics') + ' - BLASTI',
       'admin-tickets': t('supportTickets') + ' - BLASTI',

@@ -39,6 +39,9 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
+// Task 5-b: MANDATORY Law 18-07 consent block (role agreement + privacy
+// policy) rendered on the Preview step of the create-agency wizard.
+import { LegalConsentBlock } from '@/components/legal/legal-consent';
 import { BUILT_IN_CATEGORY_OPTIONS, fetchAgencyCategoriesOnce } from '@/hooks/use-agency-categories';
 // Task 5 — Algeria address selectors (58 wilayas + their communes).
 import {
@@ -347,6 +350,9 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const [created, setCreated] = useState(false);
   const [createdAgencyName, setCreatedAgencyName] = useState('');
   const [createdAgencyCode, setCreatedAgencyCode] = useState('');
+  // Task 5-b: Law 18-07 consent — the parent holds the AND of the consent
+  // block's two checkboxes; the server rejects create bodies without it.
+  const [agreeTerms, setAgreeTerms] = useState(false);
 
   // Step 0: Basic info
   const [name, setName] = useState('');
@@ -787,6 +793,14 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const handleCreate = async () => {
     if (!validateStep0() || !validateStep1()) return;
 
+    // Task 5-b: fail fast on the Law 18-07 consent gate — BOTH the Agency
+    // Owner User Agreement and the Privacy Policy must be accepted on the
+    // Preview step. (Steps 0-3 Next buttons stay ungated by design.)
+    if (!agreeTerms) {
+      toast.error(t('legalConsentRequiredBoth' as any));
+      return;
+    }
+
     setCreating(true);
     try {
       const body: Record<string, unknown> = {
@@ -801,6 +815,9 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       // 0.6.61 — AI Translation Agent: authoritative source language of every
       // string this wizard submits (name/description/services).
       contentLanguage: lang,
+      // Task 5-b: Law 18-07 consent gate — the server rejects create bodies
+      // without agreeTerms: true.
+      agreeTerms: true,
       };
       if (nameAr.trim()) body.nameAr = nameAr.trim();
       if (nameFr.trim()) body.nameFr = nameFr.trim();
@@ -1765,6 +1782,17 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                     {t('previewConfirmation' as any)}
                   </p>
                 </motion.div>
+
+                {/* Task 5-b: MANDATORY Law 18-07 consent — BOTH the Agency
+                    Owner User Agreement and the Privacy Policy must be
+                    accepted (each with a "View document" viewer) before the
+                    final Create request is sent. */}
+                <LegalConsentBlock
+                  role="AGENCY_OWNER"
+                  checked={agreeTerms}
+                  onCheckedChange={setAgreeTerms}
+                  className="mt-4"
+                />
               </CardContent>
             </Card>
           )}

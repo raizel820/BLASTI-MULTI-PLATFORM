@@ -1,6 +1,6 @@
 {
   "name": "@blasti/desktop",
-  "version": "0.6.116",
+  "version": "0.6.122",
   "private": true,
   "description": "BLASTI Desktop — Multi-agency queue management system",
   "main": "main.js",
@@ -22,7 +22,9 @@
     "@prisma/client": "^6.11.1",
     "bcryptjs": "^2.4.3",
     "electron-is-dev": "^3.0.1",
+    "espeak-ng": "^1.0.2",
     "hono": "^4.12.32",
+    "qrcode": "^1.5.4",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1"
   },

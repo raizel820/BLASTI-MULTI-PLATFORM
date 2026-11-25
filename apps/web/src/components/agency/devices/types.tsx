@@ -65,6 +65,16 @@ export interface DisplaySettings {
   rotationSec?: number;
   showEstimatedWait?: boolean;
   showServiceStats?: boolean;
+  /** 0.6.121 — voice-calling config (lib/tv-voice.ts): enable + languages +
+   *  volume + speed + chime + cycles. Edited in the TV device dialog. */
+  voiceCalling?: {
+    enabled?: boolean;
+    languages?: Array<'ar' | 'fr' | 'en'>;
+    volume?: number;
+    speed?: 'slow' | 'normal' | 'fast';
+    chime?: boolean;
+    cycles?: number;
+  };
 }
 
 export interface DeviceCommand {

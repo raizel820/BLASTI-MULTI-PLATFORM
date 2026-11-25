@@ -159,6 +159,13 @@ export const registerSchema = z.object({
   // the abandoned contact, re-issues OTPs for changed targets only).
   pendingToken: z.string().max(4096).optional(),
   avatarUrl: uploadFileUrlSchema.optional(),
+  // Task 5-a (0.6.120) — MANDATORY legal consent (Law 18-07): the register
+  // body must carry agreeTerms=true. The UI renders the two-checkbox
+  // LegalConsentBlock (role agreement + privacy policy, each viewable before
+  // consent); the server refuses any submission without it.
+  agreeTerms: z.boolean().refine((v) => v === true, {
+    message: 'You must agree to the User Agreement and the Privacy Policy',
+  }),
   // Task 5 — optional Algeria address (register form location selectors).
   // wilaya = two-digit official code, commune = baladiya Latin name.
   // Task 2-c — tolerant pipeline (string|number → canonical two-digit code).
@@ -371,6 +378,12 @@ export const createStaffSchema = z.object({
   role: z.enum(['STAFF', 'MANAGER']).optional().default('STAFF'),
   // Task 31 (bug 8): staff must be associated with a branch of the same agency.
   branchId: z.string().min(1).optional(),
+  // Task 5-a (0.6.120) — mandatory staff legal consent (Law 18-07), captured
+  // by the LegalConsentBlock in the staff-create dialog (STAFF agreement +
+  // privacy policy) and recorded in the consent ledger by the route.
+  agreeTerms: z.boolean().refine((v) => v === true, {
+    message: 'The staff member must agree to the Staff User Agreement and the Privacy Policy',
+  }),
 })
 
 export const updateStaffSchema = z.object({

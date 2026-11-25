@@ -1,7 +1,10 @@
+import { z } from 'zod'
 import { Hono } from 'hono'
 import { db, Prisma } from '@blasti/db'
 import { requireRole, requireAgencyAccess, authErrorResponse, createSessionToken, resolveClientPlatform } from '../lib/auth'
 import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody, wilayaCodeRegex } from '../lib/validations'
+// Task 5-a (0.6.120) — owner consent ledger for self-service agency creation.
+import { recordUserConsents } from '../lib/legal-server'
 import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, AGENCY_SEARCH_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
 import { recordSyncChangeNow } from '../lib/sync-helpers'
 // Performance Round — eager invalidation of the public GET response cache.
@@ -755,7 +758,18 @@ app.post('/', async (c) => {
     const user = await requireRole(c, 'SUPER_ADMIN', 'AGENCY_OWNER')
 
     const body = await c.req.json()
-    const validation = validateBody(adminCreateAgencySchema, body)
+    // Task 5-a (0.6.120) — self-service agency creation requires the owner's
+    // legal consent (Law 18-07): the create-agency wizard shows the
+    // two-checkbox LegalConsentBlock (owner agreement + privacy policy) on
+    // its final preview step. The SUPER_ADMIN console route (admin.ts) keeps
+    // the base schema — no user account is created there, so no consent is
+    // captured on that path.
+    const ownerCreateAgencySchema = adminCreateAgencySchema.extend({
+      agreeTerms: z.boolean().refine((v) => v === true, {
+        message: 'You must agree to the Agency Owner Agreement and the Privacy Policy',
+      }),
+    })
+    const validation = validateBody(ownerCreateAgencySchema, body)
     if (validation.error) {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
@@ -1025,6 +1039,15 @@ app.post('/', async (c) => {
         entityId: agency.id,
         details: JSON.stringify({ name, customCode: finalCustomCode, category, ownerId: resolvedOwnerId }),
       },
+    })
+
+    // Task 5-a (0.6.120) — record the agency owner's consent rows (context
+    // 'agency_create') for the exact document versions shown in the wizard
+    // (best-effort, never blocks the creation).
+    recordUserConsents(resolvedOwnerId, 'AGENCY_OWNER', {
+      context: 'agency_create',
+      requestIp: getClientIp(c),
+      userAgent: c.req.header('user-agent'),
     })
 
     // Performance Round — the public directory cache must not advertise the

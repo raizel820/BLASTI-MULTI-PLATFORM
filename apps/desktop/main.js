@@ -770,7 +770,11 @@ function getNetworkInterfaceName() {
 // confidence BLASTI device — this is what lets kiosk shells / other desktops
 // find this machine without a port scan. Runs ONLY in LAN mode; every step
 // is guarded so a UDP failure can never affect the app.
-const BEACON_PORT = 3081;
+// 0.6.118 — the beacon port comes from the canonical LAN port registry
+// (local-api/lib/lan-ports.js — predetermined discovery/communication/listen
+// ports for pc-pc and pc-kiosk).
+const { BLASTI_LAN_PORTS } = require('./local-api/lib/lan-ports');
+const BEACON_PORT = BLASTI_LAN_PORTS.UDP_BEACON;
 const BEACON_INTERVAL_MS = 3000;
 let beaconSocket = null;
 let beaconInterval = null;
@@ -942,7 +946,7 @@ function buildBeaconPayload() {
     hostname: getMachineDisplayName(),
     lanIp: getLocalIP(),
     ip: getLocalIP(),
-    httpPort: 3080,
+    httpPort: BLASTI_LAN_PORTS.HTTP_API,
     // 0.6.78 — identity fields the Device Manager surfaces directly
     appVersion: (() => { try { return app.getVersion() } catch { return '' } })(),
     mode: beaconIdentityMode,
@@ -3965,14 +3969,21 @@ ipcMain.on('update:install', () => {
   }
 });
 
-// LAN server info IPC — returns connection details for the local LAN server
+// LAN server info IPC — returns connection details for the local LAN server.
+// 0.6.122 — ports come from the canonical LAN port registry (lib/lan-ports.js)
+// instead of literals, per the audit mandate ("pre-set this services ports and
+// channels and communication protocols"). WEB_DEV/API port entries document
+// the dev-shell companions; the runtime port is BLASTI_LAN_PORTS.HTTP_API.
 ipcMain.handle('lan:server-info', () => {
   if (!localServer) return null;
   return {
     ip: getLocalIP(),
-    port: 3080,
+    port: BLASTI_LAN_PORTS.HTTP_API,
     webPort: 3000,
     apiPort: 3003,
+    printRelayPort: BLASTI_LAN_PORTS.PRINT_RELAY,
+    voiceTtsPort: BLASTI_LAN_PORTS.VOICE_TTS,
+    printerJetdirectPort: BLASTI_LAN_PORTS.PRINTER_JETDIRECT,
     hostname: require('os').hostname(),
   };
 });

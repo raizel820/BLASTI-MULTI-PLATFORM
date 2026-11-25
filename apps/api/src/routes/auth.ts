@@ -21,6 +21,10 @@ import { getConnInfo } from '@hono/node-server/conninfo'
 import { validateBody, loginSchema, registerSchema, forgotPasswordSchema, resetPasswordSchema } from '../lib/validations'
 // UID-0.6.14 — immutable per-user identifier ({TYPE}-{WILAYA}-{SEQ}).
 import { assignUidToUser } from '../lib/uid-generator'
+// Task 5-a (0.6.120) — proof-of-consent ledger (Law 18-07): every created
+// account gets one ConsentRecord per required document version. Best-effort:
+// a ledger failure never blocks the registration.
+import { recordUserConsents } from '../lib/legal-server'
 import { normalizeRecordFileUrls } from '../lib/file-url'
 import {
   resolveVerificationStatus,
@@ -717,6 +721,14 @@ app.post('/register', async (c) => {
         },
       })
 
+      // Task 5-a (0.6.120) — record the consent rows for the exact document
+      // versions that were shown and accepted at registration (best-effort).
+      recordUserConsents(user.id, role || 'CUSTOMER', {
+        context: 'registration',
+        requestIp: ip,
+        userAgent: c.req.header('user-agent'),
+      })
+
       // If agency code provided and role is AGENCY_OWNER, link to agency
       let agencyId: string | undefined
       let agencyName: string | undefined
@@ -1085,6 +1097,14 @@ app.post('/verify', async (c) => {
           avatarUrl: true, freeSmsCount: true, isActive: true, email: true,
           phoneNumber: true, wilaya: true, commune: true, createdAt: true,
         },
+      })
+
+      // Task 5-a (0.6.120) — consent was captured (and validated) at register
+      // time; record the ledger rows now that the account exists (best-effort).
+      recordUserConsents(user.id, refreshed.role, {
+        context: 'registration',
+        requestIp: ip,
+        userAgent: c.req.header('user-agent'),
       })
 
       if (pendingAgencyId) {

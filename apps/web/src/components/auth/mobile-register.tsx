@@ -38,9 +38,11 @@ import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Checkbox } from '@/components/ui/checkbox';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
+// Task 5-a — mandatory two-checkbox legal consent (role User Agreement +
+// Privacy Policy, each with a "View document" versioned viewer).
+import { LegalConsentBlock } from '@/components/legal/legal-consent';
 import {
   ArrowLeft, ArrowRight, Loader2, Eye, EyeOff, Check, X, Camera, ImageIcon,
   UserRound, Building2, AlertCircle, CheckCircle2, UserPlus,
@@ -403,7 +405,9 @@ export function MobileRegisterForm() {
     if (password !== confirmPassword) errors.confirmPassword = t('passwordMismatch');
 
     if (!agreeTerms) {
-      toast.error(t('mustAgreeTerms'));
+      // Task 5-a — LegalConsentBlock requires BOTH documents (User Agreement
+      // + Privacy Policy); the block shows the same requirement inline.
+      toast.error(t('legalConsentRequiredBoth'));
       return;
     }
     if (Object.keys(errors).length > 0) {
@@ -414,12 +418,17 @@ export function MobileRegisterForm() {
 
     setLoading(true);
     try {
-      const body: Record<string, string> = {
+      // Task 5-a — widened to string | boolean so the Law 18-07 consent
+      // flag rides along with the string fields.
+      const body: Record<string, string | boolean> = {
         username: username.trim(),
         fullName: fullName.trim(),
         password,
         role,
         email: trimmedEmail,
+        // Law 18-07 consent gate — the server rejects the request unless
+        // consent is explicit (gated above via the LegalConsentBlock).
+        agreeTerms: true,
       };
       // 0.6.60 — send the CANONICAL 0XXXXXXXXX form (+213/00213/213/spaces/
       // Arabic digits are all unified here AND on the server).
@@ -1053,21 +1062,18 @@ export function MobileRegisterForm() {
                     </div>
                   </div>
 
-                  {/* Terms */}
-                  <div className="flex items-start gap-3">
-                    <Checkbox
-                      id="m-reg-terms"
-                      checked={agreeTerms}
-                      onCheckedChange={(checked) => setAgreeTerms(checked === true)}
-                      className="mt-1"
-                    />
-                    <label htmlFor="m-reg-terms" className="text-xs text-muted-foreground leading-relaxed cursor-pointer">
-                      {copy.termsLead}{' '}
-                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">{t('termsOfService')}</span>{' '}
-                      {t('andStr')}{' '}
-                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">{t('privacyPolicy')}</span>
-                    </label>
-                  </div>
+                  {/* Task 5-a — MANDATORY legal consent: the role-appropriate
+                      User Agreement AND the Privacy Policy, each with a
+                      "View document" viewer. Lifts the AND of the two
+                      checkboxes into `agreeTerms` (gated in handleRegister
+                      and sent as `agreeTerms: true`). This selector only
+                      offers CUSTOMER / AGENCY_OWNER. */}
+                  <LegalConsentBlock
+                    role={role as 'CUSTOMER' | 'AGENCY_OWNER'}
+                    checked={agreeTerms}
+                    onCheckedChange={setAgreeTerms}
+                    className="mt-3"
+                  />
                 </motion.div>
               )}
             </motion.div>

@@ -16,7 +16,7 @@
     },
     "apps/api": {
       "name": "@blasti/api",
-      "version": "0.6.60",
+      "version": "0.6.121",
       "dependencies": {
         "@blasti/binary-delta": "workspace:*",
         "@blasti/core": "workspace:*",
@@ -37,14 +37,16 @@
     },
     "apps/desktop": {
       "name": "@blasti/desktop",
-      "version": "0.6.60",
+      "version": "0.6.121",
       "dependencies": {
         "@blasti/binary-delta": "workspace:*",
         "@hono/node-server": "^2.0.12",
         "@prisma/client": "^6.11.1",
         "bcryptjs": "^2.4.3",
         "electron-is-dev": "^3.0.1",
+        "espeak-ng": "^1.0.2",
         "hono": "^4.12.32",
+        "qrcode": "^1.5.4",
         "socket.io": "^4.8.1",
         "socket.io-client": "^4.8.1",
       },
@@ -57,7 +59,7 @@
     },
     "apps/mobile": {
       "name": "@blasti/mobile",
-      "version": "0.6.60",
+      "version": "0.6.121",
       "dependencies": {
         "@capacitor/app": "^8.0.0",
         "@capacitor/camera": "^8.0.0",
@@ -80,7 +82,7 @@
     },
     "apps/web": {
       "name": "@blasti/web",
-      "version": "0.6.60",
+      "version": "0.6.121",
       "dependencies": {
         "@nozbe/watermelondb": "^0.28.0",
         "@radix-ui/react-alert-dialog": "^1.1.14",
@@ -1142,6 +1144,8 @@
     "eslint-scope": ["eslint-scope@8.4.0", "", { "dependencies": { "esrecurse": "^4.3.0", "estraverse": "^5.2.0" } }, "sha512-sNXOfKCn74rt8RICKMvJS7XKV/Xk9kA7DyJr8mJik3S7Cwgy3qlkkmyS2uQB3jiJg6VNdZd/pDBJu0nvG2NlTg=="],
 
     "eslint-visitor-keys": ["eslint-visitor-keys@4.2.1", "", {}, "sha512-Uhdk5sfqcee/9H/rCOJikYz67o0a2Tw2hGRPOG2Y1R2dg7brRe1uG0yaNQDHu+TO/uQPF/5eCapvYSmHUjt7JQ=="],
+
+    "espeak-ng": ["espeak-ng@1.0.2", "", {}, "sha512-Xe4YC7d/+O06zYpsqrJ3LpbETdL/IO8JrnAmWcQEMoRFmMLWU+2y2HnpEkOCnqZfb40MBDVyP4ppfusKdWbPcQ=="],
 
     "espree": ["espree@10.4.0", "", { "dependencies": { "acorn": "^8.15.0", "acorn-jsx": "^5.3.2", "eslint-visitor-keys": "^4.2.1" } }, "sha512-j6PAQ2uUr79PZhBjP5C5fhl8e39FmRnOjsD5lGnWrFU8i2G776tBK7+nP8KuQUTTyAZUwfQqXAgrVH5MbH9CYQ=="],
 

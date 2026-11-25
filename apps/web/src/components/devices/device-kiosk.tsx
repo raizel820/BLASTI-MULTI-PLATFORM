@@ -729,6 +729,13 @@ export function DeviceKiosk() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ agencyCode: code.trim(), deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
           });
+          // 0.6.119 — 409 = the manager deleted this device: drop the saved
+          // branch code so the kiosk stops silently re-registering ghosts on
+          // every mount (the removed-device tombstone is manager-lifted only).
+          if (regRes.status === 409) {
+            removeAgencyCode();
+            try { logDevice('device_removed_by_manager', 'auto-register blocked by the removed-device tombstone — saved branch code cleared', { deviceType: 'KIOSK', status: 'REMOVED' }, 'warn'); } catch { /* never block */ }
+          }
           const regData = await regRes.json();
           if (regData.success && regData.deviceToken) {
             setDeviceToken(regData.deviceToken);
@@ -999,6 +1006,14 @@ export function DeviceKiosk() {
         }),
       });
       const regData = await regRes.json();
+      // 0.6.119 — join self-heal must respect the removed-device tombstone:
+      // 409 = the manager deleted this device — clear the branch code and
+      // refuse to mint a replacement row.
+      if (regRes.status === 409 || regData?.removed) {
+        removeAgencyCode();
+        try { logDevice('device_removed_by_manager', 'join self-heal register blocked by the removed-device tombstone — branch code cleared', { deviceType: 'KIOSK', status: 'REMOVED' }, 'warn'); } catch { /* never block */ }
+        return { ok: false };
+      }
       if (!regData?.success || !regData.deviceToken) return { ok: false };
       setDeviceToken(regData.deviceToken);
       setDeviceId(regData.device?.id || '');
@@ -1351,6 +1366,28 @@ export function DeviceKiosk() {
       return true;
     };
 
+    // 0.6.119 — the manager DELETED this device: register answered 409
+    // DEVICE_REMOVED_BY_MANAGER. Stop every loop, wipe the stored identity
+    // (token + branch code) so nothing re-registers, and show the removed
+    // state (the ghost-device fix — previously the kiosk silently minted a
+    // fresh row seconds after every delete).
+    const enterRemovedState = (source: string) => {
+      if (discoveryRegisterRetryRef.current) { clearInterval(discoveryRegisterRetryRef.current); discoveryRegisterRetryRef.current = null; }
+      if (discoveryPollRef.current) { clearInterval(discoveryPollRef.current); discoveryPollRef.current = null; }
+      removeDeviceToken();
+      removeAgencyCode();
+      setDeviceToken('');
+      setDeviceId('');
+      setIsDeviceRegistered(false);
+      setDiscoveryToken('');
+      discoveryTokenRef.current = '';
+      setPairingRequests([]);
+      setDiscoveryError(null);
+      setDiscoveryStatus('removed');
+      setStep('discovery');
+      try { logDevice('device_removed_by_manager', `register blocked by the removed-device tombstone (${source}) — stored identity cleared, retry loop stopped`, { deviceType: 'KIOSK', status: 'REMOVED' }, 'warn'); } catch { /* never block */ }
+    };
+
     // Token-less degraded waiting: everything except the cloud identity.
     const enterWaitingFallback = (reason: string) => {
       setDiscoveryError(reason);
@@ -1367,8 +1404,20 @@ export function DeviceKiosk() {
           const ctl = new AbortController();
           const timer = setTimeout(() => ctl.abort(), 20_000);
           const retryRes = await discoverRegisterOnce(ctl.signal).finally(() => clearTimeout(timer));
-          if (!retryRes.ok) return;
+          if (!retryRes.ok) {
+            // 0.6.119 — the retry must NEVER fight a deleted-device tombstone:
+            // 409 means the manager removed this device — stop the loop.
+            if (retryRes.status === 409) {
+              enterRemovedState('background-retry');
+              return;
+            }
+            return;
+          }
           const retryData = await retryRes.json().catch(() => null);
+          if (retryData && retryData.removed) {
+            enterRemovedState('background-retry-body');
+            return;
+          }
           if (retryData && retryData.success && retryData.deviceToken) {
             try { logDevice('discovery_register_recovered', 'background re-register succeeded — cloud identity adopted', { deviceType: 'KIOSK', status: 'PENDING' }); } catch { /* never block */ }
             adoptDiscoveryRegistration(retryData);
@@ -1420,6 +1469,13 @@ export function DeviceKiosk() {
             detail = text.slice(0, 300) || `(empty body, status ${res.status})`;
           }
         } catch { detail = `(could not read response body, status ${res.status})`; }
+        // 0.6.119 — 409 = the manager deleted this device. No retry loop, no
+        // waiting mode: show the removed state with the identity wiped.
+        if (res.status === 409) {
+          console.warn('[Kiosk Discovery] discover-register blocked — device was removed by the manager');
+          enterRemovedState('discover-register');
+          return;
+        }
         const message = `Server returned ${res.status}${detail ? `: ${detail}` : ''}`;
         console.error('[Kiosk Discovery] discover-register failed:', res.status, detail);
         // 0.6.112 — token-less waiting mode: the device stays pairable over

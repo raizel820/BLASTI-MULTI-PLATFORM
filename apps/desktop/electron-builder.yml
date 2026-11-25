@@ -140,6 +140,10 @@ asar: true
 asarUnpack:
   - out/**/*
   - prisma/generated/**/*
+  # 0.6.121 — the voice-calling engine (espeak-ng WASM, ~18 MB) is loaded by
+  # Node's WebAssembly.instantiate from the filesystem; keep the .wasm outside
+  # the asar so the instantiation path never has to read through the archive.
+  - node_modules/espeak-ng/**/*
 
 npmRebuild: true
 

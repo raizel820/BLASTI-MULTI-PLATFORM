@@ -1,6 +1,9 @@
 import { Hono, type Context } from 'hono'
 import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, requireResourceOwnership, resolveUserAgencyId, authErrorResponse, verifyAgencyOwnership, requireAgencyAuthority, getAgencyAuthority, STAFF_PERMISSION_KEYS, AuthError, type StaffPermission, type SessionUser } from '../lib/auth'
+// Task 5-a (0.6.120) — staff consent ledger (Law 18-07) + client IP capture.
+import { recordUserConsents } from '../lib/legal-server'
+import { getClientIp } from '../lib/rate-limit'
 import { validateBody, createAnnouncementSchema, createBranchSchema, updateBranchSchema, createCounterSchema, updateCounterSchema, updateAgencyProfileSchema, updateAgencySettingsSchema, createServiceSchema, updateServiceSchema, updateStaffSchema, createStaffSchema, createReviewSchema, subscriptionPaySchema, subscriptionUnsubscribeSchema, updateWorkingHoursSchema, createHardwareOrderSchema, createEnterpriseRequestSchema } from '../lib/validations'
 import { servicePolicyPriceViolation, getServicePolicyForCategory } from './admin-service-policies'
 import { emitQueueEvent, emitNotificationEvent, emitKioskEvent, emitReservationEvent, emitAgencyEvent, emitStaffEvent, emitCounterEvent } from '../lib/realtime-emit'
@@ -5737,6 +5740,15 @@ app.post('/staff/create', async (c) => {
         language: 'ar',
         isActive: true,
       },
+    })
+
+    // Task 5-a (0.6.120) — record the staff member's consent rows for the
+    // exact document versions shown in the create dialog (best-effort,
+    // never blocks the creation).
+    recordUserConsents(newUser.id, userRole, {
+      context: 'staff_create',
+      requestIp: getClientIp(c),
+      userAgent: c.req.header('user-agent'),
     })
 
     // 0.6.98 — translation agent: transliterate the staff member's display

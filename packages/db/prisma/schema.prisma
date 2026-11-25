@@ -2421,3 +2421,53 @@ model ServerOutage {
 
   @@index([startedAt])
 }
+
+// ─── Legal & Agreements ────────────────────────────────────────────────────────
+// Versioned legal documents (per-role user agreements + privacy policy) shown
+// at every account/agency creation surface. Admin publishes a NEW version
+// instead of mutating rows: Law 18-07 requires consent to remain demonstrable
+// against the exact version the user accepted, so old versions are kept.
+//   docType = AGREEMENT_AGENCY_OWNER | AGREEMENT_STAFF | AGREEMENT_CUSTOMER |
+//             PRIVACY_POLICY
+model LegalDocument {
+  id            String   @id @default(cuid())
+  docType       String
+  version       Int
+  title         String
+  titleFr       String?
+  titleAr       String?
+  content       String
+  contentFr     String?
+  contentAr     String?
+  isActive      Boolean  @default(true)
+  effectiveDate DateTime @default(now())
+  createdBy     String   @default("system")
+  updatedBy     String   @default("system")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([docType, version])
+  @@index([docType, isActive])
+  @@map("legal_documents")
+}
+
+// Proof-of-consent ledger — one append-only row per accepted document version
+// (Law 18-07: consent must be demonstrable — who, which document, which
+// version, when, from where). userId references the deleted-nullable User id
+// as plain text so ledger rows survive user deletion (audit evidence).
+//   context = registration | staff_create | agency_create
+model ConsentRecord {
+  id          String   @id @default(cuid())
+  userId      String
+  docType     String
+  docVersion  Int
+  context     String
+  requestIp   String?
+  userAgent   String?
+  consentedAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([docType, docVersion])
+  @@index([consentedAt])
+  @@map("consent_records")
+}

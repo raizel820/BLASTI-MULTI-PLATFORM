@@ -51,15 +51,18 @@ const { Buffer } = require('node:buffer')
  *  against (ip, port) pairs whose TCP connect already succeeded, plus the
  *  BLASTI API port on every responsive host. The old probe-everything sweep
  *  (254 IPs × 13 ports, fetch with a hard timeout on silent firewalls) was
- *  the single biggest reason a scan could run past 5 minutes. */
+ *  the single biggest reason a scan could run past 5 minutes.
+ *  0.6.122 — the pipeline ports (local API, printer raw, CUPS) come from the
+ *  preset registry (lib/lan-ports.js). */
+const { BLASTI_LAN_PORTS, BLASTI_API_PORTS: BLASTI_API_REGISTRY_PORTS } = require('./lan-ports')
 const SCAN_PORTS = [
   80,    // router admin / printer web UI
   443,   // HTTPS
-  631,   // IPP (printers)
-  9100,  // raw print / HP JetDirect
+  BLASTI_LAN_PORTS.CUPS_IPP,           // 631 — IPP (printers)
+  BLASTI_LAN_PORTS.PRINTER_JETDIRECT,  // 9100 — raw print / HP JetDirect
   3000,  // BLASTI API / dev servers
   3003,  // BLASTI API
-  3080,  // BLASTI local API (desktop / kiosk shell)
+  BLASTI_LAN_PORTS.HTTP_API,           // 3080 — BLASTI local API (desktop / kiosk shell)
   5000,  // UPnP / synology / dev
   8001,  // Samsung TV
   8060,  // Roku
@@ -69,8 +72,11 @@ const SCAN_PORTS = [
   49152, // UPnP ephemeral
 ]
 
-/** Ports that identify a BLASTI instance when they answer HTTP. */
-const BLASTI_API_PORTS = new Set([3000, 3003, 3080])
+/** Ports that identify a BLASTI instance when they answer HTTP.
+ *  0.6.122 — derived from the preset registry (lib/lan-ports.js) so the
+ *  scanner's identity classification and the print/pairing services agree
+ *  by construction (the set carries the scanner's own 3000/3003 companions). */
+const BLASTI_API_PORTS = new Set([...BLASTI_API_REGISTRY_PORTS, 3000, 3003])
 
 /** Hard budget for one full scan. When the wall clock passes this point the
  *  orchestrator skips whatever enrichment stages are left and emits
@@ -164,7 +170,12 @@ const TCP_SWEEP_PORTS = [
   { port: 55000, service: 'samsung-tv' },       // Samsung legacy
   { port: 1925, service: 'philips-tv' },        // Philips jointSPACE (Vestel-based local sets)
   { port: 62078, service: 'ios-sync' }, // iPhone / iPad (lockdownd sync port)
-  { port: 9100, service: 'jetdirect' }, // raw print / HP JetDirect
+  { port: BLASTI_LAN_PORTS.PRINTER_JETDIRECT, service: 'jetdirect' }, // raw print / HP JetDirect
+  // NOTE (0.6.122 audit): the BLASTI pipeline ports (:3080 API, :3083 print
+  // relay, :3084 voice, :631 CUPS) are deliberately NOT probed subnet-wide
+  // here — BLASTI nodes announce themselves on the UDP :3081 beacon and the
+  // HTTP identification stage probes the API port on responsive hosts; a
+  // full-subnet probe of the service ports would only burn sweep budget.
   { port: 8060, service: 'roku' },      // Roku TV (ECP)
   { port: 8080, service: 'http-alt' },  // generic alt HTTP
   { port: 8443, service: 'https-alt' }, // alt HTTPS (TLS probe in stage C)
@@ -3145,7 +3156,7 @@ function classifyDeviceSignals(input) {
   const hasPrinterServiceMdns = ['_ipp', '_ipps', '_printer', '_pdl-datastream'].some(
     (s) => mdnsServiceLower.includes(s),
   )
-  const hasPrinterPort = input.port === 9100
+  const hasPrinterPort = input.port === BLASTI_LAN_PORTS.PRINTER_JETDIRECT
   const hasPrinterMac = isPrinterMacVendor(input.mac)
   const hasPrinterUpnpSignal = !!(input.ssdpSt || input.upnpDeviceType) && /printer|jetdirect|laserjet|pixma|workforce|deskjet|officejet/.test(joined)
   const hasStrongPrinterSignal = hasPrinterServiceMdns || hasPrinterPort || hasPrinterMac || hasPrinterUpnpSignal
@@ -3564,7 +3575,7 @@ function computeDeviceConfidence(input, cls) {
     confidence = 85; identitySource = 'ssdp'
   } else if (input.mdnsService) {
     confidence = 88; identitySource = 'mdns'
-  } else if (tcpServices.includes('jetdirect') || input.port === 9100) {
+  } else if (tcpServices.includes('jetdirect') || input.port === BLASTI_LAN_PORTS.PRINTER_JETDIRECT) {
     confidence = 90; identitySource = 'tcp'
   } else if (
     tcpServices.includes('samsung-tv') || tcpServices.includes('roku')

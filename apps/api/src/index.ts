@@ -114,6 +114,9 @@ import { ensureCategoryDictionary } from './lib/ensure-category-dictionary'
 // UID-0.6.14 — boot-time backfill: every account without a UID gets one
 // (legacy VPS users, freshly seeded users) each time the API (re)starts.
 import { ensureUserUids } from './lib/uid-generator'
+// Task 5-a (0.6.120) — Legal & Agreements routes + default-document seeding.
+import { legalDocumentRoutes } from './routes/legal-documents'
+import { ensureDefaultLegalDocuments } from './lib/legal-server'
 import { adminServicePolicyRoutes } from './routes/admin-service-policies'
 // P0-5: kiosk routes MOUNTED (mount-or-delete decision) — offline-queue.ts calls /api/kiosk/join; unmounted it 404'd
 import { kioskRoutes } from './routes/kiosk'
@@ -739,6 +742,9 @@ app.route('/api/admin/service-policies', adminServicePolicyRoutes)
 // P0-5: public kiosk walk-in surface (device tokens handled inside)
 app.route('/api/kiosk', kioskRoutes)
 app.route('/api/agencies', agenciesRoutes)
+// Task 5-a (0.6.120) — Legal & Agreements: public active-document reads +
+// SUPER_ADMIN publish/activate/rollback + proof-of-consent ledger.
+app.route('/api/legal-documents', legalDocumentRoutes)
 app.route('/api/reservations', reservationsRoutes)
 app.route('/api/queue', queueRoutes)
 app.route('/api/notifications', notificationRoutes)
@@ -1769,6 +1775,12 @@ httpServer.listen(PORT, HOST, async () => {
   // 0.6.61 — AI Translation Agent: dictionary-first batched translation
   // windows (default every 5 minutes). Never blocks boot; failures only log.
   startTranslationAgentScheduler()
+  // Task 5-a (0.6.120) — Legal & Agreements: seed the four default documents
+  // (or refresh still-system-default v1 rows to the current audited master
+  // text). Fire-and-forget: every read path re-ensures as a fallback.
+  ensureDefaultLegalDocuments().catch((e) => {
+    console.error('[LEGAL] boot seeding failed:', e instanceof Error ? e.message : e)
+  })
   // Server analyzer collector: 60s VPS resource samples + per-component
   // counters + boot outage records (SUPER ADMIN analytics → Server section).
   startServerMetricsCollector()

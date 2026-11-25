@@ -125,6 +125,10 @@ export type ViewName =
   | 'admin-category-manager'
   | 'admin-category-language'
   | 'admin-translation-agent'
+  // Legal & Agreements — SUPER_ADMIN trilingual legal-document console
+  // (read/edit-publish/download/rollback) + consent ledger. Sidebar entry
+  // next to admin-audit; deep-links from /admin/legal.
+  | 'admin-legal'
   | 'admin-audit'
   | 'admin-users'
   | 'admin-analytics'
@@ -349,6 +353,7 @@ const viewHashMap: Record<ViewName, string> = {
   'admin-category-manager': '#/admin/category-manager',
   'admin-category-language': '#/admin/category-language',
   'admin-translation-agent': '#/admin/translation-agent',
+  'admin-legal': '#/admin/legal',
   'admin-audit': '#/admin/audit',
   'admin-users': '#/admin/users',
   'admin-analytics': '#/admin/analytics',
@@ -540,6 +545,7 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   // persisted-state sanitization too: a reload while on any of them used to
   // bounce the user back to the landing page (sanitizeViewName → 'landing').
   'admin-logs-manager', 'admin-backups',
+  'admin-legal',
   'admin-agencies-management', 'admin-category-manager', 'admin-category-language',
   'admin-translation-agent', 'admin-tickets',
   'agency-support', 'customer-support',
