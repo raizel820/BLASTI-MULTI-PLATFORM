@@ -356,6 +356,17 @@ function loadDiscoveryCache() {
     if (!parsed || !Array.isArray(parsed.devices)) return []
     return parsed.devices
       .filter((d) => d && typeof d.ip === 'string' && !d.ip.startsWith('local:'))
+      // 0.6.124 — SELF-HEAL: caches written before the virtual-printer filter
+      // (0.6.123) still carry "Send To OneNote 16" / "OneNote for Windows 10"
+      // / PDF / XPS / fax queue cards and re-served them on every boot (field
+      // fault: "discovery still show OneNote…"). Drop them at load time so an
+      // old cache purges itself instead of leaking into the manager again.
+      .filter((d) => {
+        try {
+          return !(scanner.isVirtualPrinterName(d.name) || scanner.isVirtualPrinterName(d.cupsName)
+            || scanner.isVirtualPrinterName(d.model) || scanner.isVirtualPrinterName(d.httpTitle))
+        } catch { return true }
+      })
       .slice(0, 500)
   } catch { return [] }
 }
@@ -555,6 +566,16 @@ function devicesResponse(category, status, includeAll) {
       try { return scanner.isSignalBackedDevice(d) } catch { return false }
     })
   }
+  // 0.6.124 — FINAL virtual-printer gate (response level): cached cards from
+  // pre-0.6.123 scans, stale scan entries and any future leak are stripped
+  // here so host-side spooler queues (OneNote / PDF / XPS / fax writers)
+  // NEVER reach the manager's discovered list, regardless of how they got in.
+  devices = devices.filter((d) => {
+    try {
+      return !(scanner.isVirtualPrinterName(d.name) || scanner.isVirtualPrinterName(d.cupsName)
+        || scanner.isVirtualPrinterName(d.model) || scanner.isVirtualPrinterName(d.httpTitle))
+    } catch { return true }
+  })
   // 0.6.96 — merge LIVE beacon cards so ACTIVE BLASTI apps appear INSTANTLY
   // (before/without a scan). Scan cards at the same IP win (they are richer).
   // 0.6.101 — dedupe by FINGERPRINT too: a beacon card and a scan card for the
@@ -1477,7 +1498,16 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   // printer (printerConfig.defaultPrinterDeviceId — 0.6.104), else the
   // agency's saved default printer.
   const printAuth = async (c, next) => {
-    const deviceToken = c.req.header('x-device-token')
+    // 0.6.124 — accept the kiosk device token from EITHER header convention:
+    // `X-Device-Token` (the direct LAN print fetch) OR `Authorization: Bearer
+    // <deviceToken>` (the api-client failover path reuses the kiosk's bearer
+    // form — the field log showed the LAN print leg dying with bare
+    // AUTH_NO_TOKEN although the kiosk DID hold a token, because only one
+    // header shape was read). The resolved reason is stashed on the context
+    // so the 401 below can say WHY instead of a blind printer-name error.
+    const header = c.req.header('authorization') || ''
+    const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
+    const deviceToken = bearer || (c.req.header('x-device-token') || '').trim()
     if (deviceToken && typeof getDb === 'function') {
       try {
         const db = getDb()
@@ -1488,9 +1518,23 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
           await next()
           return
         }
+        c.set('printAuthReason', 'DEVICE_TOKEN_UNKNOWN')
       } catch { /* fall through to staff auth */ }
+    } else {
+      c.set('printAuthReason', 'NO_DEVICE_TOKEN')
     }
-    return authMiddleware(c, next)
+    // 0.6.124 — when staff auth ALSO rejects, answer with a print-specific,
+    // actionable 401 (the field fault: the kiosk surfaced the bare printer
+    // name / AUTH_NO_TOKEN and nobody could tell WHY the job was refused).
+    const staffRes = await authMiddleware(c, next)
+    if (staffRes && staffRes.status === 401) {
+      const reason = c.get('printAuthReason') || 'NO_DEVICE_TOKEN'
+      const hint = reason === 'DEVICE_TOKEN_UNKNOWN'
+        ? 'the device token does not match any registered device on this branch PC — re-pair the kiosk (Device Manager → Pair) and try again'
+        : 'no device token was sent — pair this kiosk with the branch desktop so print jobs can be authenticated'
+      return c.json({ success: false, error: `Print rejected — ${hint}`, code: reason }, 401)
+    }
+    return staffRes
   }
 
   // 0.6.104 — KIOSK DEFAULT PRINTER RESOLUTION. The device manager UI (Task
@@ -1897,8 +1941,18 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       const printer = body.printer && typeof body.printer === 'object' ? body.printer : {}
       const name = (typeof printer.name === 'string' && printer.name.trim() && printer.name.trim()) ||
         (typeof body.name === 'string' && body.name.trim() && body.name.trim()) || ''
-      const hostIp = (typeof body.hostIp === 'string' && body.hostIp.trim()) || (typeof printer.hostIp === 'string' && printer.hostIp.trim()) || ''
       if (!name) return c.json({ success: false, error: 'printer.name is required' }, 400)
+      // 0.6.124 — a host-side spooler queue (OneNote / PDF / XPS / fax) must
+      // never become a REGISTERED printer row: the field manager could save
+      // "Send To OneNote 16" before the 0.6.123 discovery filter existed and
+      // the ghost then haunted every printer selector. Reject at the door.
+      try {
+        const cfgName = typeof printer.cupsName === 'string' ? printer.cupsName : ''
+        if (scanner.isVirtualPrinterName(name) || (cfgName && scanner.isVirtualPrinterName(cfgName))) {
+          return c.json({ success: false, error: `"${name.slice(0, 80)}" is a virtual/software printer queue, not a physical printer — it cannot be registered` }, 422)
+        }
+      } catch { /* guard must never crash the route */ }
+      const hostIp = (typeof body.hostIp === 'string' && body.hostIp.trim()) || (typeof printer.hostIp === 'string' && printer.hostIp.trim()) || ''
       if (!hostIp) return c.json({ success: false, error: 'hostIp is required (which PC owns the USB printer?)' }, 400)
       const hostPort = optInt(body.hostPort, 1, 65535) || 3080
       // Idempotent: same host + same USB/CUPS identity updates the same row.
@@ -2458,7 +2512,14 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   // local entries by deviceFingerprint.
   app.get('/api/agency-devices/unpaired', authMiddleware, async (c) => {
     const db = c.get('db')
-    if (!requireAgencyId(c)) return
+    // 0.6.124 — CAPTURE the agency id: the tombstone filter further down
+    // scopes blocked fingerprints to the caller's agency and referenced a
+    // bare `agencyId` that never existed in this scope — every /unpaired
+    // poll with at least one deleted fingerprint threw
+    // `ReferenceError: agencyId is not defined` (one of the "multiple
+    // different errors" the manager showed while pairing in LAN mode).
+    const agencyId = requireAgencyId(c)
+    if (!agencyId) return
     try {
       // 0.6.113 — LOCAL-ONLY mode: BOTH cloud backstops and the cloud merge
       // below are skipped. Pairing state is healed by the LAN probe only and
@@ -2995,6 +3056,22 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
               body: JSON.stringify({ fingerprint: existing.deviceFingerprint }),
             }, { timeoutMs: 6000, attempts: 1 })
             cloudDeleted = !!(cloudRes && cloudRes.ok)
+            // 0.6.124 — REVOCATION PROPAGATION: when the direct delete could
+            // not land (cloud unreachable — the exact case where the deleted
+            // kiosk kept operating against its still-valid cloud row), push
+            // the whole local blocklist to the cloud merge route instead.
+            // Idempotent server-side; the LAN status reporter also pushes it
+            // every ~90s as a self-healing backstop.
+            if (!cloudDeleted) {
+              try {
+                const syncRes = await ctx.cloudFetch('/api/agency-devices/tombstones/sync', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+                  body: JSON.stringify({ tombstones: deviceTombstones.listDeviceTombstones().slice(0, 500) }),
+                }, { timeoutMs: 6000, attempts: 1 })
+                if (diagLog) diagLog('AGENCY-DEVICE delete tombstone-sync fallback applied: ' + !!(syncRes && syncRes.ok))
+              } catch { /* offline — the periodic reporter retries later */ }
+            }
           }
         } catch { /* offline — the local tombstone still blocks locally */ }
       }
@@ -3747,9 +3824,26 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const db = kioskLocalDb()
     if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
     try {
+      // 0.6.124 — REVOCATION ENFORCEMENT (field fault: "unpair/delete should
+      // revoke device access but the kiosk can connect normally after been
+      // deleted"). The old route let ANY caller join: an unauthenticated
+      // request only had to pass the IP rate limit, and an authenticated
+      // orphan (agencyId null — exactly what a kiosk becomes after the
+      // manager deletes/unpairs its row) was silently AUTO-BOUND to the
+      // requested agency. A deleted kiosk therefore kept issuing tickets
+      // forever. Now a ticket may only be issued by a device row that STILL
+      // exists in THIS store AND is paired to THIS agency — unpair/delete
+      // cuts both the row and the service in the same stroke.
       const device = await kioskDeviceAuth(db, c)
-      if (!device && !kioskRateLimitOk(c)) {
-        return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
+      if (!device) {
+        if (!kioskRateLimitOk(c)) {
+          return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
+        }
+        return c.json({
+          success: false,
+          error: 'Device not authenticated — this kiosk must be paired with the branch desktop before it can issue tickets',
+          code: 'DEVICE_AUTH_REQUIRED',
+        }, 401)
       }
       const body = await c.req.json().catch(() => ({}))
       const agencyId = typeof body.agencyId === 'string' ? body.agencyId : ''
@@ -3758,18 +3852,13 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       if (!agencyId) return c.json({ success: false, error: 'Agency ID is required' }, 400)
       if (!serviceId) return c.json({ success: false, error: 'Service ID is required' }, 400)
 
-      // C1 — cross-agency guard + orphan auto-bind (cloud 0.6.95 parity): a
-      // freshly discovered kiosk has agencyId null and joins immediately; a
-      // device bound to ANOTHER agency may never join this one.
-      if (device && !device.agencyId) {
-        try {
-          await db.agencyDevice.update({ where: { id: device.id }, data: { agencyId } })
-          device.agencyId = agencyId
-        } catch (bindErr) {
-          if (diagLog) diagLog('AGENCY-DEVICE kiosk join auto-bind failed: ' + (bindErr && bindErr.message))
-        }
-      } else if (device && agencyId !== device.agencyId) {
-        return c.json({ success: false, error: 'Device not authorized for this agency' }, 403)
+      // C1 — cross-agency guard (STRICT, no auto-bind): a device bound to
+      // ANOTHER agency may never join this one, and an unpaired device
+      // (agencyId null — deleted, unpaired, or freshly registered) must be
+      // paired by the manager first. It stays discoverable in the unpaired
+      // strip so the manager can approve it.
+      if (agencyId !== device.agencyId) {
+        return c.json({ success: false, error: 'Device not authorized for this agency', code: 'DEVICE_NOT_PAIRED' }, 403)
       }
 
       // Open / paused / full gates — the SAME helper the staff walk-in route

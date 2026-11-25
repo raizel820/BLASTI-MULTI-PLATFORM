@@ -1840,6 +1840,7 @@ const ar = {
   kioskPrinterDefaultSaved: 'تم حفظ الطابعة الافتراضية لهذا الكيوسك',
   kioskPrinterDefaultSaveFailed: 'فشل حفظ الطابعة الافتراضية',
   kioskPrinterNeedsPairing: 'اربط هذا الكيوسك بوكالة أولاً — الربط يمنحه الوصول إلى الطابعات المسجلة.',
+  kioskPairingRequired: 'هذا الكيوسك غير مرتبط بحاسوب الفرع — اطلب من المسؤول ربطه من مدير الأجهزة ثم أعد الاتصال.',
   kioskPrinterCurrent: 'تُطبع الوصلات على',
   kioskPrinterAgencyDefaultHint: 'الطابعة المحفوظة كافتراضية للوكالة',
   kioskPrinterRegisterHint: 'سجّل الطابعات من مدير الأجهزة على حاسوب الفرع أولاً',

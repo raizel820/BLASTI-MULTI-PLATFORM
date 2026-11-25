@@ -44,7 +44,11 @@ import {
   addDeviceTombstone,
   clearDeviceTombstone,
   listDeviceTombstones,
+  mergeDeviceTombstones,
 } from '../lib/device-tombstones'
+// 0.6.124 — host-side spooler queues (OneNote / PDF / XPS / fax) must never
+// appear as discovered/registered printers on any cloud surface either.
+import { isVirtualPrinterName, filterVirtualPrinterDevices } from '../lib/virtual-printers'
 import {
   runDiscoveryScan,
   getLocalSubnets,
@@ -507,11 +511,22 @@ app.post('/public/register', async (c) => {
 })
 
 // ─── POST /public/join-queue — Walk-in customer joins queue ────────────────
-// (dual auth: deviceToken OR IP rate-limit)
+// (0.6.124 — KIOSK DEVICE AUTH REQUIRED: paired device rows only; anonymous
+//  callers are answered 401 DEVICE_AUTH_REQUIRED. See the route body.)
 
 app.post('/public/join-queue', async (c) => {
   let clientIp: string | undefined
   try {
+    // 0.6.124 — REVOCATION ENFORCEMENT (field fault: "unpair/delete should
+    // revoke device access but the kiosk can connect normally after been
+    // deleted"). The kiosk-only join route used to admit ANY caller: an
+    // unauthenticated request passed the IP rate limit, and an authenticated
+    // orphan (agencyId null — exactly what remains after a manager deletes or
+    // unpairs the device) was silently AUTO-BOUND to the requested agency, so
+    // a deleted kiosk kept issuing tickets forever. Tickets now require a
+    // device row that STILL exists in this store AND is paired to THIS
+    // agency. Walk-in customers keep their own channels (staff walk-in,
+    // QR import, mobile app) — this route is the kiosk's.
     const device = await requireDeviceAuth(c)
     let deviceId: string | undefined = undefined
 
@@ -520,6 +535,11 @@ app.post('/public/join-queue', async (c) => {
       console.log(`[DEVICE/PUBLIC/JOIN] Trusted device: ${device.name} (${device.id})`)
     } else {
       clientIp = enforceRateLimit(c, KIOSK_RATE_LIMIT)
+      return c.json({
+        success: false,
+        error: 'Device not authenticated — this kiosk must be paired with the branch desktop before it can issue tickets',
+        code: 'DEVICE_AUTH_REQUIRED',
+      }, 401)
     }
 
     const body = await c.req.json()
@@ -531,29 +551,14 @@ app.post('/public/join-queue', async (c) => {
 
     const { agencyId, serviceId, customerName } = validation.data
 
-    // C1: Cross-Agency Queue Join — a device already bound to a DIFFERENT
-    // agency may never join this one.
-    // 0.6.95 — orphan auto-bind (the "Kiosk join failed: Device not
-    // authorized for this agency" CRITICAL from the field logs): a freshly
-    // discovered kiosk registers with agencyId=null (status PAIRING) and
-    // immediately joins the queue it was launched for. The old strict check
-    // 403'd every such join — the kiosk rendered it as a permissions failure
-    // and pairing never completed. Bind the orphan to the requested agency
-    // instead (it stays PAIRING until the manager approves), while a device
-    // already bound elsewhere stays rejected.
-    if (device && !device.agencyId) {
-      try {
-        await db.agencyDevice.update({
-          where: { id: device.id },
-          data: { agencyId, updatedAt: new Date() },
-        })
-        device.agencyId = agencyId
-        console.log(`[DEVICE/PUBLIC/JOIN] Orphan device ${device.name} (${device.id}) auto-bound to agency ${agencyId} (still PAIRING)`)
-      } catch (bindErr) {
-        console.error('[DEVICE/PUBLIC/JOIN] orphan auto-bind failed:', bindErr)
-      }
-    } else if (device && agencyId !== device.agencyId) {
-      return c.json({ success: false, error: 'Device not authorized for this agency' }, 403)
+    // C1: Cross-Agency Queue Join — STRICT pairing gate (no auto-bind).
+    // 0.6.95 had bound orphan rows to the requested agency on first join;
+    // that auto-bind is precisely the revocation hole. A device bound to a
+    // DIFFERENT agency is rejected, and an unpaired device (deleted,
+    // unpaired, freshly registered) must be paired by the manager first —
+    // it stays visible in /unpaired so the manager can approve it.
+    if (agencyId !== device.agencyId) {
+      return c.json({ success: false, error: 'Device not authorized for this agency', code: 'DEVICE_NOT_PAIRED' }, 403)
     }
 
     const agency = await db.agency.findUnique({
@@ -2972,6 +2977,39 @@ app.post('/tombstones/clear', async (c) => {
   }
 })
 
+// ─── POST /tombstones/sync — branch → cloud blocklist merge (0.6.124) ─────
+// A manager can delete a device while the branch desktop is OFFLINE: the
+// desktop tombstones locally and its delete-by-fingerprint relay fails, so
+// the cloud store never learns about the deletion and the kiosk's token
+// stays valid against its cloud row ("the kiosk can connect normally after
+// been deleted"). The branch desktop now pushes its full blocklist (LAN
+// status reporter tick + right after a failed delete relay); this route
+// MERGES it idempotently (newest deletedAt wins — replays are safe). Scoped
+// to the caller's agency so one branch can never blocklist another's
+// fingerprints: only entries whose meta.agencyId is null or matches.
+app.post('/tombstones/sync', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const body = await c.req.json().catch(() => ({})) as { tombstones?: Array<Record<string, unknown>> }
+    const incoming = Array.isArray(body.tombstones) ? body.tombstones : []
+    const scoped = incoming.filter((t) => {
+      if (!t || typeof t.fingerprint !== 'string' || !t.fingerprint.trim()) return false
+      if (typeof t.agencyId === 'string' && t.agencyId && user.agencyId && t.agencyId !== user.agencyId) return false
+      return true
+    }).map((t) => ({
+      ...t,
+      // Stamp the caller's agency on unscoped entries so the blocklist stays
+      // attributable (the desktop always sends its own agencyId).
+      agencyId: typeof t.agencyId === 'string' && t.agencyId ? t.agencyId : (user.agencyId || undefined),
+    }))
+    const applied = await mergeDeviceTombstones(scoped as any)
+    return c.json({ success: true, received: scoped.length, applied })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ─── POST /:id/pair — Initiate pairing (regenerate pairing code + token) ──
 
 app.post('/:id/pair', async (c) => {
@@ -3737,6 +3775,16 @@ async function devicesResponseWithRegistry(
   agencyId: string | null | undefined,
 ) {
   const base = devicesResponse(category, status)
+  // 0.6.124 — strip host-side spooler queues from the scan/cache side too
+  // (cloud-saved discovery snapshots may pre-date the 0.6.123 filter).
+  const scanDeviceStr = (d: ScanDeviceRecord, key: string): string | null => {
+    const v = (d as unknown as Record<string, unknown>)[key]
+    return typeof v === 'string' ? v : null
+  }
+  base.devices = base.devices.filter((d) => {
+    const nameCandidates = [d.name, scanDeviceStr(d, 'cupsName'), scanDeviceStr(d, 'model'), scanDeviceStr(d, 'httpTitle')]
+    return !nameCandidates.some((s) => isVirtualPrinterName(s))
+  })
   if (!agencyId) return base
   try {
     const onlineWindow = new Date(Date.now() - 90 * 1000)
@@ -3766,6 +3814,10 @@ async function devicesResponseWithRegistry(
     )
     const registryCards = registryDevices
       .filter((dev: { ipAddress?: string | null }) => !(dev.ipAddress && blastiIps.has(dev.ipAddress)))
+      // 0.6.124 — rows saved BEFORE the virtual-printer guard (a manager
+      // could register "Send To OneNote 16" back then) must not resurface as
+      // discovery cards; the register route now blocks new ones.
+      .filter((dev: { name?: string | null }) => !isVirtualPrinterName(dev.name))
       .map((dev: typeof registryDevices[number]) => {
         const isOnline = !!dev.lastHeartbeatAt && dev.lastHeartbeatAt >= onlineWindow
         const type = ['TV', 'KIOSK', 'DISPLAY', 'PRINTER'].includes(dev.type)
@@ -4480,6 +4532,16 @@ app.post('/discovery/register-peripheral', async (c) => {
       (typeof printer.hostIp === 'string' && printer.hostIp.trim() ? printer.hostIp.trim() : '')
     if (!name) return c.json({ success: false, error: 'printer.name is required' }, 400)
     if (!hostIp) return c.json({ success: false, error: 'hostIp is required (which PC owns the USB printer?)' }, 400)
+    // 0.6.124 — a host-side spooler queue ("Send To OneNote 16", "OneNote for
+    // Windows 10", PDF/XPS/fax writers) must never become a REGISTERED
+    // printer row in the cloud store. Same rule as the desktop register
+    // route (0.6.123 discovery filter + 0.6.124 register guard).
+    {
+      const cfgName = typeof printer.cupsName === 'string' ? printer.cupsName : ''
+      if (isVirtualPrinterName(name) || (cfgName && isVirtualPrinterName(cfgName))) {
+        return c.json({ success: false, error: `"${name.slice(0, 80)}" is a virtual/software printer queue, not a physical printer — it cannot be registered` }, 422)
+      }
+    }
     // 0.6.122 — the compat print port default comes from the PRESET registry
     // (LAN_HTTP_API_PORT, @blasti/core/lan-protocol) — never a bare literal.
     const hostPort = Number(body.hostPort) > 0 ? Math.min(65535, Math.max(1, Math.floor(Number(body.hostPort)))) : LAN_HTTP_API_PORT

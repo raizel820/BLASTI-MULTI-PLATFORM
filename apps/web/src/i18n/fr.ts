@@ -1828,6 +1828,7 @@ const fr: Record<TranslationKeys, string> = {
   kioskPrinterDefaultSaved: 'Imprimante par défaut enregistrée pour ce kiosque',
   kioskPrinterDefaultSaveFailed: "Échec de l'enregistrement de l'imprimante par défaut",
   kioskPrinterNeedsPairing: "Connectez d'abord ce kiosque à une agence — le jumelage lui donne accès aux imprimantes enregistrées.",
+  kioskPairingRequired: "Ce kiosque n'est pas jumelé avec le PC de l'agence — demandez à l'administrateur de le jumeler depuis le Gestionnaire d'appareils, puis reconnectez-le.",
   kioskPrinterCurrent: 'Les reçus s\'impriment sur',
   kioskPrinterAgencyDefaultHint: "L'imprimante enregistrée comme valeur par défaut de l'agence",
   kioskPrinterRegisterHint: "enregistrez d'abord les imprimantes depuis le Gestionnaire d'appareils sur le PC de l'agence",

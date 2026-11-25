@@ -545,9 +545,48 @@ export function DeviceKiosk() {
           body: JSON.stringify({ appVersion: APP_VERSION, ipAddress: kioskIp || lanServer?.ip || undefined }),
         });
         if (res.status === 401) {
-          console.warn('[Kiosk] Heartbeat 401 — token invalid, clearing credentials');
-          handleForgetDevice();
-          return;
+          // 0.6.124 — CROSS-STORE 401 HARDENING (the field fault: a kiosk
+          // paired on the branch desktop still beat the CLOUD while unpinned;
+          // the cloud rightly rejected the desktop-minted token, the kiosk
+          // cleared its credentials and the next print died with
+          // AUTH_NO_TOKEN). Before destroying the session, retry the beat
+          // DIRECTLY against the known LAN desktop — if it accepts the same
+          // token, the token is healthy and the pin was simply missing: pin
+          // the base and keep the session (device-to-device from now on).
+          const retryBase = getKioskLanBase();
+          let rescued = false;
+          if (!retryBase) {
+            try {
+              const { getGlobalLanServer } = await import('@/hooks/use-lan-mode');
+              const g = getGlobalLanServer();
+              if (g?.ip && g?.port) {
+                const base = `http://${g.ip}:${g.port}`;
+                const ctl = new AbortController();
+                const timer = setTimeout(() => ctl.abort(), 5000);
+                const retryRes = await fetch(`${base}/api/agency-devices/device/heartbeat`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                  body: JSON.stringify({ appVersion: APP_VERSION, ipAddress: kioskIp || g.ip }),
+                  signal: ctl.signal,
+                });
+                clearTimeout(timer);
+                if (retryRes.ok) {
+                  rescued = true;
+                  if (getKioskLanBase() !== base) {
+                    setKioskLanBase(base);
+                    repointRealtimeToLanBase(base);
+                  }
+                  console.warn('[Kiosk] Heartbeat 401 on the cloud base — the pinned LAN desktop accepts this token; session kept (device-to-device)');
+                  try { logDevice('kiosk_token_rescued', 'Heartbeat 401 on the cloud base — the branch desktop accepts this token; session kept and LAN base pinned', { deviceType: 'KIOSK', status: 'ONLINE' }); } catch { /* never block */ }
+                }
+              }
+            } catch { /* rescue is best-effort */ }
+          }
+          if (!rescued) {
+            console.warn('[Kiosk] Heartbeat 401 — token invalid, clearing credentials');
+            handleForgetDevice();
+            return;
+          }
         }
         if (res.ok) {
           const body = await res.json().catch(() => null);
@@ -978,60 +1017,30 @@ export function DeviceKiosk() {
   // ─── Join Queue ────────────────────────────────────────────
   const joiningRef = useRef(false);
 
-  // 0.6.95 — self-heal for the join 403 ("Device not authorized for this
-  // agency"): the persisted token can belong to an orphan registration (a
-  // different store, an old agency, or a pre-pairing discovery). Instead of
-  // surfacing a permissions error, clear the stale credentials, register a
-  // FRESH device against the CURRENT API base, and retry the join once.
-  const reregisterAndRetryJoin = async (
-    agencyId: string,
-    serviceId: string,
-    customerName: string | undefined,
-  ): Promise<{ ok: boolean; data?: any }> => {
-    try {
-      removeDeviceToken();
-      lastHeartbeatTokenRef.current = '';
-      setDeviceToken('');
-      setDeviceId('');
-      setIsDeviceRegistered(false);
-      const regRes = await apiFetch('/api/agency-devices/public/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          agencyCode: agency.customCode || agencyCodeRef.current || '',
-          deviceName: 'BLASTI Kiosk',
-          deviceType: 'KIOSK',
-          connectionType: lanServer ? 'LAN' : 'WIFI',
-          deviceFingerprint: getStableKioskFingerprint(),
-        }),
-      });
-      const regData = await regRes.json();
-      // 0.6.119 — join self-heal must respect the removed-device tombstone:
-      // 409 = the manager deleted this device — clear the branch code and
-      // refuse to mint a replacement row.
-      if (regRes.status === 409 || regData?.removed) {
-        removeAgencyCode();
-        try { logDevice('device_removed_by_manager', 'join self-heal register blocked by the removed-device tombstone — branch code cleared', { deviceType: 'KIOSK', status: 'REMOVED' }, 'warn'); } catch { /* never block */ }
-        return { ok: false };
-      }
-      if (!regData?.success || !regData.deviceToken) return { ok: false };
-      setDeviceToken(regData.deviceToken);
-      setDeviceId(regData.device?.id || '');
-      setIsDeviceRegistered(true);
-      saveDeviceToken(regData.deviceToken);
-      if (regData.device?.id) saveDeviceId(regData.device.id);
-      startDeviceHeartbeat(regData.deviceToken);
-      const retry = await apiFetch('/api/agency-devices/public/join-queue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${regData.deviceToken}` },
-        body: JSON.stringify({ agencyId, serviceId, customerName }),
-      });
-      const retryData = await retry.json();
-      return retryData?.success ? { ok: true, data: retryData } : { ok: false };
-    } catch {
-      return { ok: false };
+  // 0.6.124 — JOIN AUTH GATE (replaces the 0.6.95 re-register-and-retry
+  // self-heal). Servers now REQUIRE a PAIRED device row for every join —
+  // the old self-heal silently re-registered + auto-bound orphan rows,
+  // which is exactly the hole that let a DELETED kiosk keep issuing tickets
+  // ("unpair/delete should revoke device access but the kiosk can connect
+  // normally after been deleted"). Now:
+  //   401 (no/unknown token)  → credentials are stale — forget and return
+  //                             to onboarding (the manager re-pairs).
+  //   403 DEVICE_NOT_PAIRED   → this kiosk is NOT paired with the agency
+  //                             (deleted / unpaired / never approved) —
+  //                             show the pairing-required state. NO silent
+  //                             re-registration, NO retry.
+  // A network-level failure keeps the 0.6.107 offline path (cache join).
+  const handleJoinAuthFailure = useCallback((status: number, code: string, message: string) => {
+    if (status === 401) {
+      try { logDevice('kiosk_join_unauthenticated', 'Join rejected — stored device token is no longer valid on this store; credentials cleared for re-pairing', { deviceType: 'KIOSK', status: 'INVALID' }, 'warn'); } catch { /* never block */ }
+      handleForgetDevice();
+      removeAgencyCode();
+      setError(t('kioskPairingRequired') || 'This kiosk is not paired with the branch desktop — ask the administrator to pair it from the Device Manager, then reconnect.');
+      return;
     }
-  };
+    try { logDevice('kiosk_join_not_paired', `Join rejected — device not paired (code ${code || 'DEVICE_NOT_PAIRED'})`, { deviceType: 'KIOSK', status: 'PAIRING' }, 'warn'); } catch { /* never block */ }
+    setError(message || t('kioskPairingRequired') || 'This kiosk is not paired with the branch desktop — ask the administrator to pair it from the Device Manager, then reconnect.');
+  }, [t, handleForgetDevice]);
 
   const handleJoinQueue = async () => {
     if (!agency || !selectedService) return;
@@ -1051,40 +1060,11 @@ export function DeviceKiosk() {
       });
       const data = await res.json();
       if (!data.success) {
-        // 0.6.95 — self-heal: a 403 "Device not authorized for this agency"
-        // means the persisted device token is stale/orphaned/cross-agency.
-        // Re-register against the CURRENT base and retry once instead of
-        // showing the kiosk a permissions failure (the field-log CRITICAL).
-        if (res.status === 403 && /not authorized/i.test(String(data.error || ''))) {
-          const healed = await reregisterAndRetryJoin(agency.id, selectedService, undefined);
-          if (healed.ok && healed.data) {
-            const rd = healed.data;
-            try {
-              logQueue('ticket_created_kiosk', `Kiosk ticket ${rd.reservation?.ticketNumber || ''} issued (self-healed registration)`.trim(), {
-                agencyId: agency.id,
-                serviceId: selectedService,
-                deviceId: rd.deviceId || deviceId || undefined,
-                ticketId: rd.reservation?.id,
-                ticketNumber: rd.reservation?.ticketNumber,
-                source: 'kiosk',
-              });
-            } catch { /* never block */ }
-            setTicket(rd.reservation);
-            setStep('ticket');
-            setInactivitySeconds(0);
-            setShowQrDetail(false);
-            if (rd.reservation?.importToken) {
-              // 0.6.110 — resolve a phone-reachable claim base (desktop LAN IP
-              // via the /api/discover beacon, else the current origin, else
-              // the cloud URL) instead of the kiosk window's loopback origin.
-              const claimUrl = await buildClaimUrl(rd.reservation.importToken);
-              const qrUrl = await generateQRDataURL(claimUrl, { width: 200 });
-              setTicketQrUrl(qrUrl);
-            } else { setTicketQrUrl(null); }
-            setShowConfetti(true);
-            setTimeout(() => setShowConfetti(false), 3500);
-            return;
-          }
+        // 0.6.124 — strict pairing gate on the CLIENT too: no more silent
+        // re-register + retry (see handleJoinAuthFailure above).
+        if (res.status === 401 || (res.status === 403 && (/not authorized/i.test(String(data.error || '')) || data.code === 'DEVICE_NOT_PAIRED'))) {
+          handleJoinAuthFailure(res.status, String(data.code || ''), String(data.error || ''));
+          return;
         }
         // Queue event log — kiosk join failed (endpoint error included).
         try { logQueue('ticket_created_kiosk', `Kiosk join failed: ${data.error || 'rejected'}`, { agencyId: agency.id, serviceId: selectedService, deviceId: data.deviceId || deviceId || undefined, source: 'kiosk' }, 'error'); } catch { /* never block */ }
@@ -1169,9 +1149,15 @@ export function DeviceKiosk() {
     // and delivers by host-forward (USB printer on a branch PC), os-print
     // (locally attached) or raw TCP/ESC-POS (network printer).
     let serverError = '';
+    // 0.6.124 — token from STATE first, storage second: a heartbeat-401 race
+    // can clear state between the fetches; the persisted credential still
+    // authorizes the print on the paired desktop (the field fault: the LAN
+    // print leg died with AUTH_NO_TOKEN although the kiosk was paired).
+    const tokenForPrint = deviceToken || loadDeviceToken() || '';
     const printHeaders = {
       'Content-Type': 'application/json',
-      ...(deviceToken ? { 'X-Device-Token': deviceToken } : {}),
+      ...(tokenForPrint ? { 'X-Device-Token': tokenForPrint } : {}),
+      ...(tokenForPrint ? { 'Authorization': `Bearer ${tokenForPrint}` } : {}),
     };
     const printBody = JSON.stringify({
       // 0.6.104 — the kiosk's device id lets the desktop print route resolve
@@ -1233,7 +1219,13 @@ export function DeviceKiosk() {
             return;
           }
           // A REAL answer from the LAN desktop (route exists, print refused):
-          // remember it as the most specific error and stop walking LAN bases.
+          // remember it as the most specific error. 0.6.124 — an AUTH answer
+          // (401/403) must NOT stop the walk: this desktop may simply not
+          // hold this kiosk's row/token (store split), and the next pinned
+          // base or the cloud leg may still print the receipt.
+          if (lanRes.status === 401 || lanRes.status === 403) {
+            continue;
+          }
           if (lanData && typeof lanData.error === 'string' && lanData.error) {
             serverError = lanData.error;
             break;

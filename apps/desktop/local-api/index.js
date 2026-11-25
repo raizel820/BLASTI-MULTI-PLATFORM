@@ -76,6 +76,16 @@ const CORS_ORIGINS = [
 
 let db = null
 let httpServer = null
+// 0.6.124 — the ACTUAL local API HTTP port, mirrored here at module scope.
+// WHY: the agency-device routes (registered at module scope, before
+// startLocalApi runs) embed `ctx.getHttpPort()` in every device-to-device
+// pairing offer. The callback used to close over `port` — a parameter of
+// startLocalApi that does NOT exist in that scope — so the FIRST pairing
+// click threw `ReferenceError: port is not defined` and the route answered
+// 500 before any UDP/LAN offer left the machine (field fault 2026-11-25:
+// "LAN/Wi-Fi only mode — cannot send pairing request, multiple different
+// errors"). startLocalApi mirrors the real port here on every boot.
+let localApiHttpPort = 3080
 // 0.6.117 — UDP :3082 device-to-device pairing receiver (PC-side offer intake).
 let pairingOfferUdpReceiver = null
 // 0.6.118 — dedicated print-relay listener (:3083) + runtime refs.
@@ -13580,7 +13590,10 @@ function createApp() {
     // this desktop's LAN address + local API port in every offer so the
     // discovered device can accept DIRECTLY over the LAN (no cloud hop).
     getLanIp: () => (LAN_ENABLED ? bestLanIp() : null),
-    getHttpPort: () => port,
+    // 0.6.124 — was `() => port` (ReferenceError at module scope — see the
+    // localApiHttpPort declaration). Every pairing offer now carries the
+    // real listening port again.
+    getHttpPort: () => localApiHttpPort,
     // 0.6.104 — kiosk public routes (local-first): the module's new
     // /public/join-queue issues tickets with the SAME queue-issuance plumbing
     // the staff walk-in route above uses — branch queue write lock, outbox
@@ -13708,6 +13721,9 @@ function createApp() {
 async function startLocalApi(dbPath, port, options) {
   port = port || DEFAULT_PORT
   options = options || {}
+  // 0.6.124 — mirror the live port for the module-scope route context
+  // (see the localApiHttpPort declaration above).
+  localApiHttpPort = port
 
   // ── Authoritative local DB startup (spec §3/§28) ────────────────────────
   // Resolves the single authoritative path, migrates a legacy database if
@@ -13811,6 +13827,14 @@ async function startLocalApi(dbPath, port, options) {
       // pauses when the Device Manager switch puts this branch in strict
       // LAN/Wi-Fi-only mode (the cloud is not part of the device protocol).
       isCloudAllowed: () => require('./lib/connection-mode').isCloudAllowed(db),
+      // 0.6.124 — push the deleted-device blocklist to the cloud (~every 90s
+      // of successful reports) so a delete made while offline STILL revokes
+      // the device's cloud-store access (join/heartbeat/print).
+      listTombstones: () => {
+        try {
+          return require('./lib/device-tombstones').listDeviceTombstones()
+        } catch { return [] }
+      },
       diag: diagLog,
     })
     // 0.6.100 — the master machine ASKS ITS OPERATOR: when an unknown device

@@ -42,6 +42,9 @@ let opts = {
   // 0.6.100 — cloud join-verdict relay + USB peripheral reporting
   applyJoinVerdicts: null, // (verdicts[]) => Promise<number>
   getPeripherals: null,    // () => [{ kind:'printer', name, cupsName, ... }]
+  // 0.6.124 — branch → cloud deleted-fingerprint blocklist push (revocation
+  // propagation for deletes that happened while offline).
+  listTombstones: null,    // () => [{ fingerprint, deletedAt, name, type, ipAddress, agencyId }]
   diag: null,              // (msg) => void
   // 0.6.113 — LOCAL-ONLY connection mode: when the Device Manager switch is
   // set to "Local only (LAN/Wi-Fi)", the cloud is NEVER part of the device
@@ -175,6 +178,22 @@ async function reportOnce() {
 
   ticks += 1
   const duePull = ticks % PREFERENCE_PULL_EVERY === 1
+  // 0.6.124 — every 3rd successful report (~90s) push the deleted-device
+  // blocklist so deletes that happened while offline STILL revoke the
+  // device's cloud-store access (idempotent merge server-side).
+  if (typeof opts.listTombstones === 'function' && ticks % PREFERENCE_PULL_EVERY === 0) {
+    try {
+      const tombstones = opts.listTombstones()
+      if (Array.isArray(tombstones) && tombstones.length > 0) {
+        const syncRes = await postJson(base + '/agency-devices/tombstones/sync', session.token, {
+          tombstones: tombstones.slice(0, 500),
+        })
+        if (syncRes && syncRes.success === true) {
+          log(`tombstone sync merged: ${syncRes.applied}/${syncRes.received}`)
+        }
+      }
+    } catch { /* offline — normal, retried next tick */ }
+  }
   // 0.6.100 — join verdicts are pulled EVERY report (~30s): the owner's
   // Accept/Reject from the web Device Manager must reach this master fast.
   if (typeof opts.applyJoinVerdicts === 'function') {

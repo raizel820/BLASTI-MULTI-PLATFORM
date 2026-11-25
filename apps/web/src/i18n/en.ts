@@ -1838,6 +1838,7 @@ const en: Record<TranslationKeys, string> = {
   kioskPrinterDefaultSaved: 'Default printer saved for this kiosk',
   kioskPrinterDefaultSaveFailed: 'Failed to save the default printer',
   kioskPrinterNeedsPairing: 'Connect this kiosk to an agency first — pairing gives it access to the registered printers.',
+  kioskPairingRequired: 'This kiosk is not paired with the branch desktop — ask the administrator to pair it from the Device Manager, then reconnect.',
   kioskPrinterCurrent: 'Receipts print on',
   kioskPrinterAgencyDefaultHint: 'The printer saved as the agency default',
   kioskPrinterRegisterHint: 'register printers from the Device Manager on the branch PC first',

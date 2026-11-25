@@ -417,6 +417,27 @@ export function DeviceManager() {
     [discoveredDevices, dismissedIds, unpairedKeys, registeredKeys],
   );
   const hasDiscoveryContent = scanState.scanning || visibleDiscovered.length > 0 || unpairedDevices.length > 0;
+  // 0.6.124 — ROW SPLIT (field fault: "in LAN/Wi-Fi only mode the manager
+  // discovers the phone running BLASTI but shows it in the SAME row as
+  // printers"). The discovered grid mixed app cards and hardware cards in
+  // one flex grid; which row a card landed in was pure DOM luck. Split by
+  // identity: cards that ANSWERED a BLASTI signal (beacon/registry — a phone,
+  // kiosk shell or desktop app running BLASTI) render in their OWN labeled
+  // row ABOVE the hardware row (printers/TVs/peripherals) — matching the
+  // cloud-mode layout where the kiosk appears in the upper strip.
+  const isBlastiAppCard = useCallback((d: RealDiscoveredDevice) => {
+    const cat = String(d.category || '').toUpperCase();
+    const type = String(d.type || '').toUpperCase();
+    const src = String(d.source || '').toLowerCase();
+    const appish = cat === 'BLASTI' || !!d.blastiMode || !!d.blastiInfo
+      || src === 'udp-beacon' || src === 'live-beacon' || src === 'database';
+    // Registry printer rows (cloud BLASTI_PRINTER cards) and TV/display rows
+    // stay in the HARDWARE row — only phones/kiosks/PC-apps go up top.
+    const hardwareType = type === 'PRINTER' || type === 'BLASTI_PRINTER' || type === 'TV' || type === 'DISPLAY';
+    return appish && !hardwareType;
+  }, []);
+  const discoveredBlastiApps = useMemo(() => visibleDiscovered.filter(isBlastiAppCard), [visibleDiscovered, isBlastiAppCard]);
+  const discoveredHardware = useMemo(() => visibleDiscovered.filter((d) => !isBlastiAppCard(d)), [visibleDiscovered, isBlastiAppCard]);
 
   const filteredDevices = useMemo(() => {
     switch (filter) {
@@ -1565,8 +1586,9 @@ export function DeviceManager() {
                 </div>
               )}
 
-              {/* Discovered network devices */}
-              {visibleDiscovered.length > 0 && (
+              {/* Discovered network devices — 0.6.124: BLASTI-app row first,
+                  hardware row below (no more phones mixed into the printer row). */}
+              {(discoveredBlastiApps.length > 0 || discoveredHardware.length > 0) && (
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -1592,34 +1614,79 @@ export function DeviceManager() {
                       </select>
                     </label>
                   </div>
-                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                    {visibleDiscovered.map((d) => (
-                      <DiscoveredCard
-                        key={d.id}
-                        device={d}
-                        lang={lang}
-                        busy={busyDeviceId === d.id}
-                        tvSaved={savedTvIps.has(d.ip)}
-                        isDefaultPrinter={!!defaultPrinterIp && defaultPrinterIp === d.ip}
-                        connecting={connectingId === d.id}
-                        connectVerified={connectResults[d.id]}
-                        printingTest={printingTestId === d.id}
-                        registeredPeripheral={registeredPeripheralKeys.has(d.id)}
-                        savedAsDevice={(() => { const k = printerDeviceKey(d); return !!k && savedPrinterKeys.has(k); })()}
-                        onSaveTv={() => handleSaveTv(d)}
-                        onCast={() => handleCastTv(d)}
-                        onPair={() => handlePairByIdentity(d)}
-                        pairRequested={pairRequestedIds.has(d.id)}
-                        onSavePrinter={() => handleSavePrinter(d)}
-                        onSavePrinterAsDevice={() => handleSavePrinterAsDevice(d)}
-                        onRegisterPeripheral={() => handleRegisterPeripheral(d)}
-                        onTestPrinter={() => handleTestPrinter(d)}
-                        onPrintTest={() => handlePrintTestPage(d)}
-                        onConnect={() => handleConnectDevice(d)}
-                        onDismiss={() => setDismissedIds((prev) => new Set(prev).add(d.id))}
-                      />
-                    ))}
-                  </div>
+                  {/* 0.6.124 — UPPER ROW: devices running the BLASTI app
+                      (phones / kiosk shells / desktop apps). */}
+                  {discoveredBlastiApps.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                        {getLocalizedString('أجهزة تشغّل بلاصتي', 'Appareils exécutant BLASTI', 'Devices running BLASTI', lang)} ({discoveredBlastiApps.length})
+                      </p>
+                      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                        {discoveredBlastiApps.map((d) => (
+                          <DiscoveredCard
+                            key={d.id}
+                            device={d}
+                            lang={lang}
+                            busy={busyDeviceId === d.id}
+                            tvSaved={savedTvIps.has(d.ip)}
+                            isDefaultPrinter={!!defaultPrinterIp && defaultPrinterIp === d.ip}
+                            connecting={connectingId === d.id}
+                            connectVerified={connectResults[d.id]}
+                            printingTest={printingTestId === d.id}
+                            registeredPeripheral={registeredPeripheralKeys.has(d.id)}
+                            savedAsDevice={(() => { const k = printerDeviceKey(d); return !!k && savedPrinterKeys.has(k); })()}
+                            onSaveTv={() => handleSaveTv(d)}
+                            onCast={() => handleCastTv(d)}
+                            onPair={() => handlePairByIdentity(d)}
+                            pairRequested={pairRequestedIds.has(d.id)}
+                            onSavePrinter={() => handleSavePrinter(d)}
+                            onSavePrinterAsDevice={() => handleSavePrinterAsDevice(d)}
+                            onRegisterPeripheral={() => handleRegisterPeripheral(d)}
+                            onTestPrinter={() => handleTestPrinter(d)}
+                            onPrintTest={() => handlePrintTestPage(d)}
+                            onConnect={() => handleConnectDevice(d)}
+                            onDismiss={() => setDismissedIds((prev) => new Set(prev).add(d.id))}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {/* 0.6.124 — HARDWARE ROW: printers, TVs and peripherals. */}
+                  {discoveredHardware.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-medium text-muted-foreground">
+                        {getLocalizedString('طابعات وشاشات وأجهزة', 'Imprimantes, écrans et matériels', 'Printers, TVs & hardware', lang)} ({discoveredHardware.length})
+                      </p>
+                      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                        {discoveredHardware.map((d) => (
+                          <DiscoveredCard
+                            key={d.id}
+                            device={d}
+                            lang={lang}
+                            busy={busyDeviceId === d.id}
+                            tvSaved={savedTvIps.has(d.ip)}
+                            isDefaultPrinter={!!defaultPrinterIp && defaultPrinterIp === d.ip}
+                            connecting={connectingId === d.id}
+                            connectVerified={connectResults[d.id]}
+                            printingTest={printingTestId === d.id}
+                            registeredPeripheral={registeredPeripheralKeys.has(d.id)}
+                            savedAsDevice={(() => { const k = printerDeviceKey(d); return !!k && savedPrinterKeys.has(k); })()}
+                            onSaveTv={() => handleSaveTv(d)}
+                            onCast={() => handleCastTv(d)}
+                            onPair={() => handlePairByIdentity(d)}
+                            pairRequested={pairRequestedIds.has(d.id)}
+                            onSavePrinter={() => handleSavePrinter(d)}
+                            onSavePrinterAsDevice={() => handleSavePrinterAsDevice(d)}
+                            onRegisterPeripheral={() => handleRegisterPeripheral(d)}
+                            onTestPrinter={() => handleTestPrinter(d)}
+                            onPrintTest={() => handlePrintTestPage(d)}
+                            onConnect={() => handleConnectDevice(d)}
+                            onDismiss={() => setDismissedIds((prev) => new Set(prev).add(d.id))}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </CardContent>
