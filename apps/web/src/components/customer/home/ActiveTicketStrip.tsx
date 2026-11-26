@@ -1,20 +1,18 @@
 'use client';
 
 /**
- * Task 79-a — ACTIVE TICKET STRIP.
+ * ACTIVE TICKET STRIP — SIMPLIFIED (customer UX simplification round).
  *
- * Replaces the giant two-stacked reservation cards of the old home with ONE
- * compact single card: status dot + agency/service on the left, big queue
- * position + "now serving" + estimated-wait chip on the right, and a thin
- * progress rail along the bottom. Tap → queue view. Multiple active
- * reservations show the most urgent one plus a "+N more" chip.
+ * One plain bordered card: agency + service on the left, ticket number +
+ * wait on the right, tap → queue view. Multiple active reservations show
+ * the most urgent one plus a "+N more" chip. The old gradient hero with
+ * the animated progress rail and pulsing dots is gone.
  *
  * Data comes from the same GET /api/reservations/active?userId=… polling the
  * home view already ran (fields are additive extractions, endpoint unchanged).
  */
 
-import { motion } from 'framer-motion';
-import { ChevronRight, Clock, TicketCheck, Users } from 'lucide-react';
+import { ChevronRight, Clock, TicketCheck } from 'lucide-react';
 import type { TranslationKeys } from '@/i18n';
 
 export interface ActiveTicket {
@@ -43,30 +41,26 @@ interface ActiveTicketStripProps {
 }
 
 export function ActiveTicketStrip({ tickets, t, lang, onOpenQueue, onFindAgency }: ActiveTicketStripProps) {
-  // ── Empty state: slim emerald CTA card ──
+  // ── Empty state: plain CTA card ──
   if (tickets.length === 0) {
     return (
-      <motion.button
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.25 }}
-        whileTap={{ scale: 0.98 }}
+      <button
         onClick={onFindAgency}
-        className="w-full flex items-center gap-3 rounded-2xl border border-emerald-200/70 dark:border-emerald-800/40 bg-emerald-50/70 dark:bg-emerald-900/15 px-4 py-3 text-start hover:bg-emerald-50 dark:hover:bg-emerald-900/25 transition-colors"
+        className="w-full flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 text-start hover:bg-muted/40 transition-colors"
       >
-        <span className="h-9 w-9 rounded-xl bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center flex-shrink-0">
+        <span className="h-9 w-9 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center flex-shrink-0">
           <TicketCheck className="h-[18px] w-[18px] text-emerald-600 dark:text-emerald-400" />
         </span>
         <span className="flex-1 min-w-0">
-          <span className="block text-sm font-semibold text-emerald-800 dark:text-emerald-300 truncate">
+          <span className="block text-sm font-semibold text-foreground truncate">
             {t('noActiveTicket')}
           </span>
-          <span className="block text-xs text-emerald-700/70 dark:text-emerald-400/70 truncate">
+          <span className="block text-xs text-muted-foreground truncate">
             {t('noActiveTicketCta')}
           </span>
         </span>
-        <ChevronRight className="h-4 w-4 text-emerald-600 dark:text-emerald-400 rtl:rotate-180 flex-shrink-0" />
-      </motion.button>
+        <ChevronRight className="h-4 w-4 text-muted-foreground rtl:rotate-180 flex-shrink-0" />
+      </button>
     );
   }
 
@@ -91,109 +85,65 @@ export function ActiveTicketStrip({ tickets, t, lang, onOpenQueue, onFindAgency 
     : hero.serviceName;
 
   const displayNumber = hero.queueNumber || `#${hero.position}`;
-  const progress = hero.position <= 1 ? 90 : Math.max(8, Math.min(90, 100 - hero.position * 7));
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25 }}
-      className="relative"
+    <button
+      onClick={onOpenQueue}
+      aria-label={t('tapToViewQueue')}
+      className={`w-full rounded-xl border bg-card px-4 py-3 text-start transition-colors hover:bg-muted/40 ${
+        isCalled
+          ? 'border-emerald-400 dark:border-emerald-600 ring-1 ring-emerald-200 dark:ring-emerald-800'
+          : 'border-border'
+      }`}
     >
-      <motion.button
-        whileTap={{ scale: 0.985 }}
-        onClick={onOpenQueue}
-        aria-label={t('tapToViewQueue')}
-        className={`w-full rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/20 text-start overflow-hidden relative ${
-          isCalled ? 'ring-2 ring-amber-300 dark:ring-amber-400' : ''
-        }`}
-      >
-        <div className="px-4 pt-3 pb-3.5">
-          <div className="flex items-center gap-3">
-            {/* Status dot */}
-            <span className="relative flex-shrink-0">
-              <motion.span
-                animate={isCalled ? { scale: [1, 1.35, 1] } : { opacity: [0.6, 1, 0.6] }}
-                transition={{ duration: isCalled ? 1 : 2, repeat: Infinity, ease: 'easeInOut' }}
-                className={`block h-2.5 w-2.5 rounded-full ${isCalled ? 'bg-amber-300' : 'bg-emerald-300'}`}
-              />
-            </span>
-
-            {/* Agency + service */}
-            <span className="flex-1 min-w-0">
-              <span className="flex items-center gap-1.5">
-                <span className="text-[13px] font-bold truncate">{name}</span>
-                {isCalled && (
-                  <span className="text-[9px] font-bold bg-amber-300/90 text-emerald-900 px-1.5 py-0.5 rounded-full flex-shrink-0">
-                    {t('yourTurn')}
-                  </span>
-                )}
-              </span>
-              <span className="block text-[11px] text-emerald-100/90 truncate">
-                {service || t('activeTicket')}
-              </span>
-              {/* r21-8 — counter pointer once the ticket is CALLED */}
-              {isCalled && hero.counterName && (
-                <span className="mt-0.5 inline-flex items-center gap-1 max-w-full text-[10px] font-bold text-amber-100 bg-amber-400/25 rounded-full px-1.5 py-0.5">
-                  <span className="h-1.5 w-1.5 rounded-full bg-amber-300 flex-shrink-0" />
-                  <span className="truncate">{t('goCounterName', { name: hero.counterName })}</span>
-                </span>
-              )}
-            </span>
-
-            {/* Numbers */}
-            <span className="flex items-center gap-3 flex-shrink-0">
-              <span className="text-center">
-                <span className="block text-xl font-black leading-none tracking-tight">
-                  {displayNumber.startsWith('#') ? displayNumber : `#${hero.position}`}
-                </span>
-                <span className="block text-[9px] text-emerald-100/80 mt-0.5">{t('queuePosition')}</span>
-              </span>
-              {hero.currentServingNumber && hero.currentServingNumber !== '0' && (
-                <span className="text-center hidden sm:block">
-                  <span className="block text-sm font-bold leading-none">{hero.currentServingNumber}</span>
-                  <span className="block text-[9px] text-emerald-100/80 mt-0.5">{t('currentServing')}</span>
-                </span>
-              )}
-              {!isCalled && !!hero.estimatedWait && hero.estimatedWait > 0 && (
-                <span className="flex items-center gap-1 bg-white/15 rounded-full px-2 py-1">
-                  <Clock className="h-3 w-3" />
-                  <span className="text-[10px] font-semibold whitespace-nowrap">~{hero.estimatedWait} {t('min')}</span>
-                </span>
-              )}
-            </span>
-          </div>
-
-          {/* Progress rail */}
-          <div className="mt-2.5 h-1 w-full rounded-full bg-white/20 overflow-hidden">
-            <motion.div
-              initial={{ width: 0 }}
-              animate={{ width: `${progress}%` }}
-              transition={{ duration: 0.8, ease: 'easeOut' }}
-              className="h-full rounded-full bg-white/80"
-            />
-          </div>
-
-          {/* Bottom row: more chip + hint */}
-          <div className="mt-1.5 flex items-center justify-between">
-            <span className="flex items-center gap-1 text-[10px] text-emerald-100/80">
-              <Users className="h-3 w-3" />
-              {t('tapToViewQueue')}
-            </span>
-            {moreCount > 0 && (
-              <span
-                role="button"
-                tabIndex={0}
-                onClick={(e) => { e.stopPropagation(); onOpenQueue(); }}
-                onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onOpenQueue(); } }}
-                className="text-[10px] font-bold bg-white/20 hover:bg-white/30 rounded-full px-2 py-0.5 transition-colors"
-              >
-                {t('moreActiveTickets').replace('{n}', String(moreCount))}
+      <div className="flex items-center gap-3">
+        {/* Agency + service */}
+        <span className="flex-1 min-w-0">
+          <span className="flex items-center gap-1.5">
+            <span className="text-[13px] font-bold text-foreground truncate">{name}</span>
+            {isCalled && (
+              <span className="text-[9px] font-bold bg-emerald-600 text-white px-1.5 py-0.5 rounded-full flex-shrink-0">
+                {t('yourTurn')}
               </span>
             )}
-          </div>
+          </span>
+          <span className="block text-[11px] text-muted-foreground truncate">
+            {service || t('activeTicket')}
+          </span>
+          {/* r21-8 — counter pointer once the ticket is CALLED */}
+          {isCalled && hero.counterName && (
+            <span className="mt-0.5 inline-flex items-center gap-1 max-w-full text-[10px] font-semibold text-amber-700 dark:text-amber-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500 flex-shrink-0" />
+              <span className="truncate">{t('goCounterName', { name: hero.counterName })}</span>
+            </span>
+          )}
+        </span>
+
+        {/* Numbers */}
+        <span className="flex items-center gap-3 flex-shrink-0">
+          {!isCalled && !!hero.estimatedWait && hero.estimatedWait > 0 && (
+            <span className="flex items-center gap-1 text-muted-foreground">
+              <Clock className="h-3 w-3" />
+              <span className="text-[10px] font-semibold whitespace-nowrap">~{hero.estimatedWait} {t('min')}</span>
+            </span>
+          )}
+          <span className="text-center">
+            <span className="block text-xl font-black leading-none tracking-tight text-foreground">
+              {displayNumber.startsWith('#') ? displayNumber : `#${hero.position}`}
+            </span>
+            <span className="block text-[9px] text-muted-foreground mt-0.5">{t('queuePosition')}</span>
+          </span>
+        </span>
+      </div>
+
+      {/* More chip */}
+      {moreCount > 0 && (
+        <div className="mt-2 pt-2 border-t border-border flex justify-end">
+          <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+            {t('moreActiveTickets').replace('{n}', String(moreCount))}
+          </span>
         </div>
-      </motion.button>
-    </motion.div>
+      )}
+    </button>
   );
 }

@@ -1,24 +1,29 @@
 'use client';
 
 /**
- * Task 79-a — CustomerHome v2 ("find agency → get reservation" daily flow).
+ * CustomerHome — SIMPLIFIED (customer UX simplification round).
  *
- * Complete visual/structural rebuild per the Task 79 DESIGN SYSTEM v2 spec.
- * 100% of the pre-rebuild behavior is preserved (endpoints, store flows,
- * dialogs, offline handling); only the presentation changed:
+ * The old home was a design-system showcase stacked five rails deep:
+ * active-ticket gradient hero, quick-actions grid, a horizontal CardSwiper
+ * of wide agency cards, plus below-the-fold "recently visited" and
+ * "recent activity" sections. All removed.
  *
- *   1. One-line header strip: greeting + avatar/initials → profile.
- *   2. ACTIVE TICKET STRIP — ONE compact card (was two giant stacked cards).
- *   3. Search bar + inline QR scan + compact agency-code / walk-in row.
- *   4. Category chips (CategoryFilters — built-ins + custom categories).
- *   5. Quick actions: Scan QR · Favorites · History · Notifications.
- *   6. Compact agency grid (2 cols mobile / 3 md / 4 lg).
- *   7. Below the fold: Recently visited + Recent activity feed.
+ * What the screen is now, top to bottom:
+ *   1. Compact header strip: greeting + avatar → profile.
+ *   2. Active ticket strip (one plain card, tap → queue).
+ *   3. Search bar (suggestions + recent searches kept) with inline QR scan.
+ *   4. Agency-code join row.
+ *   5. Category filter chips.
+ *   6. Branch search results (when searching) — plain rows.
+ *   7. Agency list — one simple bordered card per agency in a plain grid.
+ *   8. In-page agency detail (join flow) — plain card.
  *
- * Endpoints (unchanged): GET /api/agencies, GET /api/agencies/code/{code},
+ * Endpoints and flows are UNCHANGED: GET /api/agencies,
+ * GET /api/agencies/code/{code}, GET /api/agencies/branches,
  * GET /api/favorites?userId, POST /api/favorites, POST /api/reservations,
- * GET /api/reservations/active?userId (with offline backoff),
- * GET /api/reviews?agencyId (reviews preview).
+ * GET /api/reservations/active?userId (offline backoff), GET /api/reviews.
+ * IndexedDB cache-first paint (Task 84) and resume revalidation (0.6.16)
+ * are kept as-is.
  */
 
 import { apiFetch } from '@/lib/api-fetch';
@@ -46,13 +51,10 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { ErrorState } from '@/components/shared/error-state';
 import { AgencyRatingDisplay } from '@/components/shared/agency-rating-display';
-import { RecentActivityFeed } from '@/components/customer/home/RecentActivityFeed';
-import { RecentlyVisited } from '@/components/customer/home/RecentlyVisited';
 import {
   Search,
   MapPin,
   QrCode,
-  Star,
   ChevronRight,
   Users,
   Loader2,
@@ -64,16 +66,13 @@ import {
   X,
   ScanLine,
   History,
-  Bell,
   Building2,
-  Zap,
   RefreshCw,
-  Navigation,
-  MessageCircle,
   Briefcase,
   CheckCircle2,
+  MessageCircle,
+  Star,
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import type { TranslationKeys } from '@/i18n';
 import {
@@ -86,14 +85,12 @@ import {
 } from '@/components/ui/dialog';
 import { Calendar } from '@/components/ui/calendar';
 import { CustomerQrScanner } from '@/components/customer/customer-qr-scanner';
-import { getAgencyName, getCategoryLabel, type AgencyListItem, type AgencyDetail } from './home/types';
+import { getAgencyName, getCategoryLabel, isOpenNow, type AgencyListItem, type AgencyDetail } from './home/types';
 import { CategoryFilters } from './home/CategoryFilters';
-import { AgencyCardWide } from './home/AgencyCardWide';
-import { BranchCard, type BranchListItem } from './home/BranchCard';
-import { CardSwiper } from './home/CardSwiper';
+import type { BranchListItem } from './home/BranchCard';
 import { useCustomerLocation } from '@/hooks/use-customer-location';
 import { useDebounce } from '@/hooks/use-debounce';
-import { haversineDistanceKm } from '@/lib/geo';
+import { haversineDistanceKm, formatDistance } from '@/lib/geo';
 import { ActiveTicketStrip, type ActiveTicket } from './home/ActiveTicketStrip';
 
 /**
@@ -151,7 +148,6 @@ export function CustomerHome() {
   const [searchFocused, setSearchFocused] = useState(false);
   const [recentSearches, setRecentSearches] = useState<string[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const searchSectionRef = useRef<HTMLDivElement>(null);
   const [showSuggestions, setShowSuggestions] = useState(false);
 
   // Task 83-c-1 — branch-level search results (GET /api/agencies/branches,
@@ -252,7 +248,7 @@ export function CustomerHome() {
     // away, then revalidate. A dead/slow API no longer blank the home screen
     // (the old "30s skeleton, sometimes never" bug).
     const agencyKey = cacheKeyFor('/api/agencies');
-    const cachedAgencies = await cacheGet<{ agencies?: typeof agencies }>(agencyKey);
+    const cachedAgencies = await cacheGet<{ agencies?: AgencyListItem[] }>(agencyKey);
     if (cachedAgencies?.data?.agencies?.length) {
       setAgencies(cachedAgencies.data.agencies);
       setLoading(false);
@@ -465,23 +461,10 @@ export function CustomerHome() {
   };
 
   // Task 83-c-1 — branch profile navigation (store plumbing from Task 83-a,
-  // consumed — not modified). Mirrors the AgencyCard.onViewProfile pattern.
+  // consumed — not modified).
   const handleSelectBranch = (branch: BranchListItem) => {
     useAppStore.getState().setBranchProfileId(branch.id);
     setView('customer-branch-profile');
-  };
-
-  // Quick join: go straight to date picker without showing agency detail
-  const handleQuickJoin = (agencyId: string, serviceId?: string) => {
-    if (!user?.id) {
-      toast.error(t('error'));
-      return;
-    }
-    setPendingJoin({ agencyId, serviceId });
-    setPendingServices([]);
-    setPendingServiceId(null);
-    setSelectedDate(undefined);
-    setDateDialogOpen(true);
   };
 
   const handleJoinQueue = (agencyId: string, serviceId?: string) => {
@@ -626,21 +609,6 @@ export function CustomerHome() {
     }
   };
 
-  const isOpenNow = (start: string, end: string) => {
-    if (!start || !end) return null;
-    const now = new Date();
-    const [sh, sm] = start.split(':').map(Number);
-    const [eh, em] = end.split(':').map(Number);
-    const cur = now.getHours() * 60 + now.getMinutes();
-    const startMin = sh * 60 + sm;
-    const endMin = eh * 60 + em;
-    // Handle overnight hours (e.g. 22:00 - 06:00)
-    if (startMin > endMin) {
-      return cur >= startMin || cur < endMin;
-    }
-    return cur >= startMin && cur < endMin;
-  };
-
   // Greeting helpers
   const firstName = user?.fullName?.split(' ')[0] || '';
   const getTimeGreeting = () => {
@@ -710,8 +678,15 @@ export function CustomerHome() {
     // and immediately fetches fresh active tickets (no 30s wait).
   }, [user?.id, resumeNonce]);
 
-  // Compute quick stats
-  const openAgencyCount = useMemo(() => agencies.filter(a => a.isQueueOpen && !a.isPaused).length, [agencies]);
+  // Compute category counts for filter badges
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    agencies.forEach(a => {
+      const cat = a.category.toUpperCase();
+      counts[cat] = (counts[cat] || 0) + 1;
+    });
+    return counts;
+  }, [agencies]);
 
   // Task 82 — agencyId → straight-line km from the customer's position.
   const distanceByAgencyId = useMemo(() => {
@@ -725,7 +700,6 @@ export function CustomerHome() {
     return map;
   }, [customerPosition, agencies]);
 
-  // Task 83-c-1 — branchId → straight-line km (same pattern as agencies).
   const distanceByBranchId = useMemo(() => {
     if (!customerPosition) return null as Record<string, number> | null;
     const map: Record<string, number> = {};
@@ -736,16 +710,6 @@ export function CustomerHome() {
     });
     return map;
   }, [customerPosition, branchResults]);
-
-  // Compute category counts for filter badges
-  const categoryCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
-    agencies.forEach(a => {
-      const cat = a.category.toUpperCase();
-      counts[cat] = (counts[cat] || 0) + 1;
-    });
-    return counts;
-  }, [agencies]);
 
   const dateDialogContent = (
     <Dialog open={dateDialogOpen} onOpenChange={(open) => { setDateDialogOpen(open); if (!open) { setPendingJoin(null); setSelectedDate(undefined); setPendingServiceId(null); } }}>
@@ -835,7 +799,7 @@ export function CustomerHome() {
           {selectedDate && (
             <div className="mt-3 text-center">
               <p className="text-sm text-emerald-600 dark:text-emerald-400 font-medium">
-                📅 {t('reservedFor')} {selectedDate.toLocaleDateString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                {t('reservedFor')} {selectedDate.toLocaleDateString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
               </p>
             </div>
           )}
@@ -874,8 +838,9 @@ export function CustomerHome() {
                 <button
                   onClick={() => { setPreferredTime(''); setFixedTimeEnabled(false); }}
                   className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  aria-label={t('clearSearch')}
                 >
-                  ✕
+                  <X className="h-3.5 w-3.5" />
                 </button>
               )}
             </div>
@@ -898,7 +863,7 @@ export function CustomerHome() {
     </Dialog>
   );
 
-  // Agency Detail View — compact restyle of the same in-component page
+  // Agency Detail View — simplified plain card
   if (loadingDetail) {
     return (
       <>
@@ -916,176 +881,149 @@ export function CustomerHome() {
     const estWaitMin = Math.max(1, Math.round(estWait * 0.75));
     const estWaitMax = Math.round(estWait * 1.3);
     return (
-      <>
-        <motion.div
-          initial={{ opacity: 0, x: 12 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: 0.25 }}
-          className="px-4 py-3 pb-24 lg:pb-8 max-w-5xl mx-auto"
+      <div className="px-4 py-3 pb-24 lg:pb-8 max-w-2xl mx-auto">
+        <button
+          onClick={() => setSelectedAgency(null)}
+          className="text-sm text-emerald-600 dark:text-emerald-400 font-medium mb-3 flex items-center gap-1 hover:underline"
         >
-          <button
-            onClick={() => setSelectedAgency(null)}
-            className="text-sm text-emerald-600 dark:text-emerald-400 font-medium mb-3 flex items-center gap-1 hover:underline"
-          >
-            <ArrowLeft className="h-4 w-4 rtl:rotate-180" /> {t('back')}
-          </button>
+          <ArrowLeft className="h-4 w-4 rtl:rotate-180" /> {t('back')}
+        </button>
 
-          <div className="rounded-2xl bg-white dark:bg-gray-900/80 border border-border shadow-sm overflow-hidden">
-            {/* Header image band */}
-            <div className="h-20 bg-gradient-to-r from-emerald-600 to-teal-600 relative">
-              <div className="absolute inset-0 opacity-[0.07]" style={{
-                backgroundImage: 'radial-gradient(circle at 1px 1px, white 1px, transparent 0)',
-                backgroundSize: '18px 18px',
-              }} />
-            </div>
-            <div className="p-4 -mt-8">
-              <div className="h-14 w-14 rounded-2xl bg-white dark:bg-gray-800 shadow-md flex items-center justify-center mb-2.5 border-4 border-white dark:border-gray-800">
-                <TicketCheck className="h-6 w-6 text-emerald-600" />
-              </div>
-              <h2 className="text-lg font-bold text-foreground mb-0.5">
-                {getAgencyName(selectedAgency, lang)}
-              </h2>
-              <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2.5">
-                <MapPin className="h-3.5 w-3.5" />
-                <span className="truncate">{selectedAgency.address}</span>
-              </div>
-              <div className="flex items-center gap-1.5 flex-wrap mb-3">
-                <Badge variant="outline" className="text-[10px]">
-                  {getCategoryLabel(selectedAgency.category, t)}
-                </Badge>
-                {selectedAgency.subscriptionStatus !== 'ACTIVE' && (
-                  <Badge variant="outline" className="text-[10px] bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 border-amber-200">
-                    {t('inactiveAgency')}
-                  </Badge>
-                )}
+        <div className="rounded-xl border border-border bg-card p-4">
+          <h2 className="text-lg font-bold text-foreground mb-0.5">
+            {getAgencyName(selectedAgency, lang)}
+          </h2>
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2.5">
+            <MapPin className="h-3.5 w-3.5" />
+            <span className="truncate">{selectedAgency.address}</span>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap mb-3">
+            <Badge variant="outline" className="text-[10px]">
+              {getCategoryLabel(selectedAgency.category, t)}
+            </Badge>
+            {selectedAgency.subscriptionStatus !== 'ACTIVE' && (
+              <Badge variant="outline" className="text-[10px] bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 border-amber-200">
+                {t('inactiveAgency')}
+              </Badge>
+            )}
+            <Badge
+              variant="outline"
+              className={
+                selectedAgency.isQueueOpen && !selectedAgency.isPaused
+                  ? 'text-[10px] bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-200'
+                  : 'text-[10px] bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-200'
+              }
+            >
+              {selectedAgency.isPaused ? t('paused') : selectedAgency.isQueueOpen ? t('openNow') : t('closed')}
+            </Badge>
+            {selectedAgency.workingHoursStart && selectedAgency.workingHoursEnd && (() => {
+              const open = isOpenNow(selectedAgency.workingHoursStart, selectedAgency.workingHoursEnd);
+              return (
                 <Badge
                   variant="outline"
                   className={
-                    selectedAgency.isQueueOpen && !selectedAgency.isPaused
+                    open
                       ? 'text-[10px] bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-200'
                       : 'text-[10px] bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-200'
                   }
                 >
-                  {selectedAgency.isPaused ? t('paused') : selectedAgency.isQueueOpen ? t('openNow') : t('closed')}
+                  <Clock className="h-2.5 w-2.5 me-1" />
+                  {open
+                    ? `${t('openUntil')} ${selectedAgency.workingHoursEnd}`
+                    : selectedAgency.isPaused
+                      ? t('paused')
+                      : `${t('closedNow')} · ${t('openFrom')} ${selectedAgency.workingHoursStart}`
+                  }
                 </Badge>
-                {selectedAgency.workingHoursStart && selectedAgency.workingHoursEnd && (() => {
-                  const open = isOpenNow(selectedAgency.workingHoursStart, selectedAgency.workingHoursEnd);
-                  return (
-                    <Badge
-                      variant="outline"
-                      className={
-                        open
-                          ? 'text-[10px] bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-200'
-                          : 'text-[10px] bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-200'
-                      }
-                    >
-                      <Clock className="h-2.5 w-2.5 me-1" />
-                      {open
-                        ? `${t('openUntil')} ${selectedAgency.workingHoursEnd}`
-                        : selectedAgency.isPaused
-                          ? t('paused')
-                          : `${t('closedNow')} · ${t('openFrom')} ${selectedAgency.workingHoursStart}`
-                      }
-                    </Badge>
-                  );
-                })()}
+              );
+            })()}
+          </div>
+
+          {/* 2-stat queue info row */}
+          <div className="grid grid-cols-2 gap-2.5 mb-3">
+            <div className="bg-muted/60 rounded-xl p-2.5 text-center">
+              <div className="flex items-center justify-center gap-1 mb-0.5">
+                <Users className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                <span className="text-[10px] text-muted-foreground">{t('currentlyWaiting')}</span>
               </div>
-
-              {/* 2-stat queue info row */}
-              <div className="grid grid-cols-2 gap-2.5 mb-3">
-                <div className="bg-emerald-50 dark:bg-emerald-900/20 rounded-xl p-2.5 text-center">
-                  <div className="flex items-center justify-center gap-1 mb-0.5">
-                    <Users className="h-3.5 w-3.5 text-emerald-600" />
-                    <span className="text-[10px] text-muted-foreground">{t('currentlyWaiting')}</span>
-                  </div>
-                  <p className="text-xl font-bold text-emerald-700 dark:text-emerald-400">
-                    {totalWaiting}
-                  </p>
-                </div>
-                <div className="bg-teal-50 dark:bg-teal-900/20 rounded-xl p-2.5 text-center">
-                  <div className="flex items-center justify-center gap-1 mb-0.5">
-                    <Clock className="h-3.5 w-3.5 text-teal-600" />
-                    <span className="text-[10px] text-muted-foreground">{t('avgWaitTime')}</span>
-                  </div>
-                  <p className="text-xl font-bold text-teal-700 dark:text-teal-400">
-                    {estWaitMin < estWaitMax ? `${estWaitMin}–${estWaitMax}` : `~${estWait}`} {t('min')}
-                  </p>
-                </div>
+              <p className="text-xl font-bold text-foreground">
+                {totalWaiting}
+              </p>
+            </div>
+            <div className="bg-muted/60 rounded-xl p-2.5 text-center">
+              <div className="flex items-center justify-center gap-1 mb-0.5">
+                <Clock className="h-3.5 w-3.5 text-teal-600 dark:text-teal-400" />
+                <span className="text-[10px] text-muted-foreground">{t('avgWaitTime')}</span>
               </div>
-
-              {/* Queue Unavailable Message for Inactive Subscriptions */}
-              {selectedAgency.subscriptionStatus !== 'ACTIVE' && (
-                <div className="mb-3 p-2.5 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
-                  <p className="text-xs text-amber-700 dark:text-amber-300 font-medium">{t('queueUnavailable')}</p>
-                </div>
-              )}
-
-              {/* Services — same join flow (date dialog) */}
-              {selectedAgency.services.length > 0 && (
-                <div className="mb-3">
-                  <h3 className="text-sm font-semibold text-foreground mb-2">{t('selectService')}</h3>
-                  <div className="space-y-1.5">
-                    {selectedAgency.services.map((svc) => (
-                      <motion.button
-                        key={svc.id}
-                        whileTap={{ scale: 0.98 }}
-                        onClick={() => handleJoinQueue(selectedAgency.id, svc.id)}
-                        disabled={selectedAgency.isPaused || !selectedAgency.isQueueOpen || selectedAgency.subscriptionStatus !== 'ACTIVE'}
-                        className="w-full flex items-center justify-between p-2.5 rounded-xl border border-border hover:border-emerald-300 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-colors disabled:opacity-50"
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className="text-[13px] font-medium truncate">
-                            {lang === 'ar' && svc.nameAr ? svc.nameAr : lang === 'fr' && svc.nameFr ? svc.nameFr : svc.name}
-                          </span>
-                          {svc.waitingCount > 0 && (
-                            <Badge variant="secondary" className="text-[9px] flex-shrink-0">
-                              {svc.waitingCount} {t('waiting')}
-                            </Badge>
-                          )}
-                        </div>
-                        <ChevronRight className="h-4 w-4 text-muted-foreground rtl:rotate-180 flex-shrink-0" />
-                      </motion.button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Join Queue (no services) */}
-              {selectedAgency.services.length === 0 && (
-                <Button
-                  className="w-full h-11 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl"
-                  onClick={() => handleJoinQueue(selectedAgency.id)}
-                  disabled={selectedAgency.isPaused || !selectedAgency.isQueueOpen || selectedAgency.subscriptionStatus !== 'ACTIVE'}
-                >
-                  {selectedAgency.subscriptionStatus !== 'ACTIVE' ? t('queueUnavailable') : selectedAgency.isQueueOpen ? t('joinQueue') : t('closed')}
-                </Button>
-              )}
-
-              {/* Reviews preview (same endpoint + logic) */}
-              <AgencyReviewsPreview agencyId={selectedAgency.id} averageRating={selectedAgency.averageRating} reviewCount={selectedAgency.reviewCount} />
+              <p className="text-xl font-bold text-foreground">
+                {estWaitMin < estWaitMax ? `${estWaitMin}–${estWaitMax}` : `~${estWait}`} {t('min')}
+              </p>
             </div>
           </div>
-        </motion.div>
+
+          {/* Queue Unavailable Message for Inactive Subscriptions */}
+          {selectedAgency.subscriptionStatus !== 'ACTIVE' && (
+            <div className="mb-3 p-2.5 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
+              <p className="text-xs text-amber-700 dark:text-amber-300 font-medium">{t('queueUnavailable')}</p>
+            </div>
+          )}
+
+          {/* Services — same join flow (date dialog) */}
+          {selectedAgency.services.length > 0 && (
+            <div className="mb-3">
+              <h3 className="text-sm font-semibold text-foreground mb-2">{t('selectService')}</h3>
+              <div className="space-y-1.5">
+                {selectedAgency.services.map((svc) => (
+                  <button
+                    key={svc.id}
+                    onClick={() => handleJoinQueue(selectedAgency.id, svc.id)}
+                    disabled={selectedAgency.isPaused || !selectedAgency.isQueueOpen || selectedAgency.subscriptionStatus !== 'ACTIVE'}
+                    className="w-full flex items-center justify-between p-2.5 rounded-xl border border-border hover:border-emerald-300 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-colors disabled:opacity-50"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-[13px] font-medium truncate">
+                        {lang === 'ar' && svc.nameAr ? svc.nameAr : lang === 'fr' && svc.nameFr ? svc.nameFr : svc.name}
+                      </span>
+                      {svc.waitingCount > 0 && (
+                        <Badge variant="secondary" className="text-[9px] flex-shrink-0">
+                          {svc.waitingCount} {t('waiting')}
+                        </Badge>
+                      )}
+                    </div>
+                    <ChevronRight className="h-4 w-4 text-muted-foreground rtl:rotate-180 flex-shrink-0" />
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Join Queue (no services) */}
+          {selectedAgency.services.length === 0 && (
+            <Button
+              className="w-full h-11 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl"
+              onClick={() => handleJoinQueue(selectedAgency.id)}
+              disabled={selectedAgency.isPaused || !selectedAgency.isQueueOpen || selectedAgency.subscriptionStatus !== 'ACTIVE'}
+            >
+              {selectedAgency.subscriptionStatus !== 'ACTIVE' ? t('queueUnavailable') : selectedAgency.isQueueOpen ? t('joinQueue') : t('closed')}
+            </Button>
+          )}
+
+          {/* Reviews preview (same endpoint + logic) */}
+          <AgencyReviewsPreview agencyId={selectedAgency.id} averageRating={selectedAgency.averageRating} reviewCount={selectedAgency.reviewCount} />
+        </div>
         {dateDialogContent}
-      </>
+      </div>
     );
   }
 
   // ─── Home ──────────────────────────────────────────────────────────────
-  const quickActions: { key: string; label: string; icon: React.ElementType; onClick: () => void; active?: boolean }[] = [
-    { key: 'scan', label: t('scanQrCode'), icon: ScanLine, onClick: () => setQrScannerOpen(true) },
-    { key: 'favorites', label: t('favorites'), icon: Heart, onClick: () => setView('customer-favorites') },
-    { key: 'history', label: t('history'), icon: History, onClick: () => setView('customer-history') },
-    { key: 'notifications', label: t('notifications'), icon: Bell, onClick: () => setView('customer-notifications') },
-  ];
-
   return (
-    <div className="px-4 py-3 pb-24 lg:pb-8 max-w-5xl mx-auto">
-      {/* ── 1. Compact header strip (one line, ~44px) ── */}
+    <div className="px-4 py-3 pb-24 lg:pb-8 max-w-3xl mx-auto">
+      {/* ── 1. Compact header strip ── */}
       <div className="flex items-center gap-2.5 mb-3 min-h-[44px]">
         <button
           onClick={() => setView('customer-profile')}
-          className="h-10 w-10 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center overflow-hidden flex-shrink-0 shadow-sm"
+          className="h-10 w-10 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center overflow-hidden flex-shrink-0"
           aria-label={t('profile')}
         >
           {user?.avatarUrl ? (
@@ -1105,14 +1043,9 @@ export function CustomerHome() {
             {getTimeGreeting()}{firstName ? `, ${firstName}` : ''}
           </h1>
         </div>
-        {openAgencyCount > 0 && (
-          <Badge variant="outline" className="ms-auto text-[10px] flex-shrink-0 border-emerald-200 text-emerald-700 dark:border-emerald-800 dark:text-emerald-400">
-            {openAgencyCount} {t('openNow')}
-          </Badge>
-        )}
       </div>
 
-      {/* ── 2. Active ticket strip (ONE compact card) ── */}
+      {/* ── 2. Active ticket strip (ONE plain card) ── */}
       <div className="mb-3">
         <ActiveTicketStrip
           tickets={activeReservations}
@@ -1120,14 +1053,13 @@ export function CustomerHome() {
           lang={lang}
           onOpenQueue={() => setView('customer-queue')}
           onFindAgency={() => {
-            searchSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
             searchInputRef.current?.focus();
           }}
         />
       </div>
 
-      {/* ── 3. Search bar + inline QR + code row ── */}
-      <div ref={searchSectionRef} className="relative mb-2">
+      {/* ── 3. Search bar + inline QR ── */}
+      <div className="relative mb-2">
         <Search className="absolute start-3.5 top-1/2 -translate-y-1/2 h-[18px] w-[18px] text-muted-foreground z-10 pointer-events-none" />
         <Input
           ref={searchInputRef}
@@ -1143,16 +1075,9 @@ export function CustomerHome() {
           }}
           onBlur={handleSearchBlur}
           onKeyDown={handleSearchKeyDown}
-          className={`ps-11 pe-24 h-11 text-sm rounded-2xl border-border bg-white dark:bg-gray-900/80 shadow-sm transition-all ${
-            searchFocused ? 'ring-2 ring-emerald-500/20 border-emerald-300' : ''
-          }`}
+          className="ps-11 pe-24 h-11 text-sm rounded-xl border-border bg-card transition-all"
         />
         <div className="absolute end-2 top-1/2 -translate-y-1/2 flex items-center gap-1 z-10">
-          {searchQuery.trim() && !showSuggestions && (
-            <span className="text-[10px] text-muted-foreground font-medium">
-              {filteredAgencies.length} {t('searchResultsCount')}
-            </span>
-          )}
           {searchQuery && (
             <button
               onClick={() => { setSearchQuery(''); setSearchFocused(false); setShowSuggestions(false); }}
@@ -1164,7 +1089,7 @@ export function CustomerHome() {
           )}
           <button
             onClick={() => setQrScannerOpen(true)}
-            className="h-8 w-8 rounded-xl flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white transition-colors"
+            className="h-8 w-8 rounded-lg flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white transition-colors"
             aria-label={t('scanQrCode')}
           >
             <ScanLine className="h-4 w-4" />
@@ -1173,7 +1098,7 @@ export function CustomerHome() {
 
         {/* Search Suggestions Dropdown */}
         {(searchFocused || showSuggestions) && (searchSuggestions.length > 0 || (searchQuery === '' && recentSearches.length > 0)) && (
-          <div className="absolute top-full mt-1 start-0 end-0 z-[60] bg-white dark:bg-gray-900 border border-border rounded-2xl shadow-lg overflow-hidden">
+          <div className="absolute top-full mt-1 start-0 end-0 z-[60] bg-card border border-border rounded-xl shadow-lg overflow-hidden">
             {searchQuery === '' && recentSearches.length > 0 ? (
               <>
                 <div className="flex items-center justify-between px-3 py-2 border-b border-border">
@@ -1183,7 +1108,7 @@ export function CustomerHome() {
                   </div>
                   <button
                     onClick={clearAllRecentSearches}
-                    className="text-[10px] text-teal-600 dark:text-teal-400 hover:underline font-medium"
+                    className="text-[10px] text-emerald-600 dark:text-emerald-400 hover:underline font-medium"
                   >
                     {t('clearAll')}
                   </button>
@@ -1192,7 +1117,7 @@ export function CustomerHome() {
                   <button
                     key={term}
                     onClick={() => handleSearchSelect(term)}
-                    className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors text-start"
+                    className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-muted/50 transition-colors text-start"
                   >
                     <div className="flex items-center gap-2 min-w-0">
                       <Search className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
@@ -1217,9 +1142,9 @@ export function CustomerHome() {
                   <button
                     key={agency.id}
                     onClick={() => handleSearchSelect(getAgencyName(agency, lang))}
-                    className="w-full flex items-center gap-2 px-3 py-2.5 hover:bg-emerald-50 dark:hover:bg-emerald-900/10 transition-colors text-start"
+                    className="w-full flex items-center gap-2 px-3 py-2.5 hover:bg-muted/50 transition-colors text-start"
                   >
-                    <div className="h-8 w-8 rounded-xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center flex-shrink-0">
+                    <div className="h-8 w-8 rounded-lg bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center flex-shrink-0">
                       <TicketCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
                     </div>
                     <div className="min-w-0">
@@ -1234,7 +1159,7 @@ export function CustomerHome() {
         )}
       </div>
 
-      {/* Agency code + walk-in (compact row) */}
+      {/* Agency code join row */}
       <div className="flex flex-wrap gap-2 mb-3">
         <Input
           placeholder={t('enterAgencyCode')}
@@ -1252,14 +1177,6 @@ export function CustomerHome() {
           <QrCode className="h-4 w-4 me-1.5" />
           {t('joinQueue')}
         </Button>
-        <Button
-          variant="outline"
-          className="h-10 px-3.5 rounded-xl border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20"
-          onClick={() => setQrScannerOpen(true)}
-        >
-          <Zap className="h-4 w-4 me-1.5" />
-          {t('walkInQuickAction')}
-        </Button>
       </div>
 
       {/* ── 4. Category chips ── */}
@@ -1272,37 +1189,12 @@ export function CustomerHome() {
         />
       </div>
 
-      {/* ── 5. Quick actions row ── */}
-      <div className="grid grid-cols-4 gap-2 mb-4">
-        {quickActions.map((action, idx) => {
-          const Icon = action.icon;
-          return (
-            <motion.button
-              key={action.key}
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.05 + idx * 0.04 }}
-              whileTap={{ scale: 0.96 }}
-              onClick={action.onClick}
-              className="flex flex-col items-center justify-center gap-1.5 rounded-2xl border border-border bg-white dark:bg-gray-900/80 py-3 hover:border-emerald-200 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 dark:hover:border-emerald-800/50 transition-colors"
-            >
-              <span className="h-8 w-8 rounded-xl bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center">
-                <Icon className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-              </span>
-              <span className="text-[10px] font-medium text-foreground leading-tight text-center px-1 truncate w-full">
-                {action.label}
-              </span>
-            </motion.button>
-          );
-        })}
-      </div>
-
-      {/* ── 5.5 Branch search results (Task 83-c-1) — rendered ONLY while a
+      {/* ── 5. Branch search results (Task 83-c-1) — rendered ONLY while a
           search query is active. Empty results AND failed fetches render
           nothing (silent degrade — the agency results below are primary). ── */}
       {searchActive && (branchesLoading || branchResults.length > 0) && (
         <div className="mb-4">
-          <div className="flex items-center justify-between mb-2.5">
+          <div className="flex items-center justify-between mb-2">
             <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
               <Building2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
               {t('branchResults')}
@@ -1314,51 +1206,61 @@ export function CustomerHome() {
             )}
           </div>
           {branchesLoading ? (
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-              {[...Array(4)].map((_, i) => (
-                <div key={i} className="rounded-2xl border border-border/40 bg-white dark:bg-gray-900/80 p-3.5 space-y-2.5">
-                  <div className="flex items-start justify-between">
-                    <div className="h-9 w-9 rounded-xl bg-emerald-100/80 dark:bg-emerald-900/30 animate-pulse" />
-                    <div className="h-3 w-10 rounded-full bg-emerald-50 dark:bg-emerald-900/20 animate-pulse" />
-                  </div>
-                  <div className="space-y-1.5">
-                    <div className="h-3.5 w-3/4 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse" />
-                    <div className="h-2.5 w-1/2 rounded-full bg-gray-50 dark:bg-gray-800/50 animate-pulse" />
-                  </div>
-                  <div className="h-4 w-20 rounded-full bg-teal-50 dark:bg-teal-900/20 animate-pulse" />
+            <div className="space-y-2">
+              {[...Array(3)].map((_, i) => (
+                <div key={i} className="rounded-xl border border-border/40 bg-card p-3 space-y-2">
+                  <div className="h-3.5 w-3/4 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse" />
+                  <div className="h-2.5 w-1/2 rounded-full bg-gray-50 dark:bg-gray-800/50 animate-pulse" />
                 </div>
               ))}
             </div>
           ) : (
-            <CardSwiper
-              ariaLabel={t('branchResults')}
-              itemClassName="w-[calc(50%-6px)] md:w-[calc(33.333%-8px)] lg:w-[calc(25%-9px)]"
-            >
-              {branchResults.map((branch, idx) => (
-                <BranchCard
-                  key={branch.id}
-                  branch={branch}
-                  index={idx}
-                  lang={lang}
-                  t={t}
-                  onSelectBranch={handleSelectBranch}
-                  distanceKm={distanceByBranchId?.[branch.id] ?? null}
-                />
-              ))}
-            </CardSwiper>
+            <div className="space-y-2">
+              {branchResults.map((branch) => {
+                const branchName =
+                  (lang === 'ar' && branch.nameAr) || branch.specialName || (lang === 'fr' && branch.nameFr) || branch.name;
+                const parentName =
+                  (lang === 'ar' && branch.agency?.nameAr) || (lang === 'fr' && branch.agency?.nameFr) || branch.agency?.name || '';
+                const loc = branch.address || branch.city || branch.wilaya || '';
+                const km = distanceByBranchId?.[branch.id];
+                return (
+                  <button
+                    key={branch.id}
+                    onClick={() => handleSelectBranch(branch)}
+                    className="w-full flex items-center gap-2.5 rounded-xl border border-border bg-card px-3.5 py-2.5 text-start hover:bg-muted/40 transition-colors"
+                  >
+                    <span className="h-8 w-8 rounded-lg bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center flex-shrink-0">
+                      <Building2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                    </span>
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-[13px] font-semibold text-foreground truncate">{branchName}</span>
+                      <span className="block text-[10px] text-muted-foreground truncate">
+                        {parentName}{loc ? ` · ${loc}` : ''}
+                      </span>
+                    </span>
+                    {km != null && (
+                      <span className="text-[10px] text-muted-foreground flex-shrink-0">
+                        {formatDistance(km).value} {formatDistance(km).unit}
+                      </span>
+                    )}
+                    <ChevronRight className="h-4 w-4 text-muted-foreground rtl:rotate-180 flex-shrink-0" />
+                  </button>
+                );
+              })}
+            </div>
           )}
         </div>
       )}
 
-      {/* ── 6. Agency grid ── */}
+      {/* ── 6. Agency list — one simple card per agency ── */}
       <div className="flex items-center justify-between mb-2.5">
         <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
-          <Navigation className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+          <MapPin className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
           {t('nearbyAgencies')}
         </h2>
         <button
           onClick={fetchAgencies}
-          className="h-8 w-8 rounded-xl flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors"
+          className="h-8 w-8 rounded-lg flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors"
           aria-label={t('refresh')}
         >
           <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
@@ -1366,18 +1268,12 @@ export function CustomerHome() {
       </div>
 
       {loading ? (
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-          {[...Array(6)].map((_, i) => (
-            <div key={i} className="rounded-2xl border border-border/40 bg-white dark:bg-gray-900/80 p-3.5 space-y-2.5">
-              <div className="flex items-start justify-between">
-                <div className="h-9 w-9 rounded-xl bg-emerald-100/80 dark:bg-emerald-900/30 animate-pulse" />
-                <div className="h-3 w-10 rounded-full bg-emerald-50 dark:bg-emerald-900/20 animate-pulse" />
-              </div>
-              <div className="space-y-1.5">
-                <div className="h-3.5 w-3/4 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse" />
-                <div className="h-2.5 w-1/2 rounded-full bg-gray-50 dark:bg-gray-800/50 animate-pulse" />
-              </div>
-              <div className="h-4 w-20 rounded-full bg-teal-50 dark:bg-teal-900/20 animate-pulse" />
+        <div className="space-y-2">
+          {[...Array(5)].map((_, i) => (
+            <div key={i} className="rounded-xl border border-border/40 bg-card p-3.5 space-y-2.5">
+              <div className="h-3.5 w-3/4 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse" />
+              <div className="h-2.5 w-1/2 rounded-full bg-gray-50 dark:bg-gray-800/50 animate-pulse" />
+              <div className="h-4 w-24 rounded-full bg-muted animate-pulse" />
             </div>
           ))}
         </div>
@@ -1389,65 +1285,83 @@ export function CustomerHome() {
           hasCategoryFilter={selectedCategory !== 'ALL'}
           t={t}
           onClear={() => { setSearchQuery(''); setSelectedCategory('ALL'); }}
-          onExplore={() => { setSearchQuery(''); setSelectedCategory('ALL'); searchSectionRef.current?.scrollIntoView({ behavior: 'smooth' }); }}
+          onExplore={() => { setSearchQuery(''); setSelectedCategory('ALL'); searchInputRef.current?.focus(); }}
           onRetry={fetchAgencies}
         />
       ) : (
-        /* Full-width detail cards in a swipeable rail (nearby + search results
-           share this section — the rail covers both, per the field request). */
-        <div className="-mx-4 px-4">
-          <CardSwiper
-            ariaLabel={t('nearbyAgencies')}
-            itemClassName="w-full md:w-[calc(50%-6px)] lg:w-[calc(33.333%-8px)]"
-          >
-            {filteredAgencies.map((agency, idx) => (
-              <AgencyCardWide
+        <div className="grid gap-2 sm:grid-cols-2">
+          {filteredAgencies.map((agency) => {
+            const open = agency.workingHoursStart && agency.workingHoursEnd
+              ? isOpenNow(agency.workingHoursStart, agency.workingHoursEnd)
+              : null;
+            const km = distanceByAgencyId?.[agency.id];
+            return (
+              <div
                 key={agency.id}
-                agency={agency}
-                index={idx}
-                lang={lang}
-                isFavorite={favoriteIds.has(agency.id)}
-                toggling={togglingFav === agency.id}
-                t={t}
-                onSelect={handleSelectAgency}
-                onToggleFavorite={toggleFavorite}
-                onQuickJoin={(agencyId) => handleQuickJoin(agencyId)}
-                distanceKm={distanceByAgencyId?.[agency.id] ?? null}
-                onViewProfile={(agency) => {
-                  useAppStore.getState().setAgencyProfileId(agency.id);
-                  setView('customer-agency-profile');
-                }}
-              />
-            ))}
-          </CardSwiper>
+                className="rounded-xl border border-border bg-card p-3.5 flex items-start gap-2.5 hover:bg-muted/40 transition-colors"
+              >
+                <button
+                  onClick={() => handleSelectAgency(agency)}
+                  className="flex-1 min-w-0 text-start"
+                  aria-label={getAgencyName(agency, lang)}
+                >
+                  <p className="text-sm font-semibold text-foreground truncate">
+                    {getAgencyName(agency, lang)}
+                  </p>
+                  <p className="text-xs text-muted-foreground truncate mt-0.5">
+                    {agency.address}
+                  </p>
+                  <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                    <Badge variant="outline" className="text-[10px]">
+                      {getCategoryLabel(agency.category, t)}
+                    </Badge>
+                    <Badge
+                      variant="outline"
+                      className={
+                        agency.isQueueOpen && !agency.isPaused
+                          ? 'text-[10px] bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-200'
+                          : 'text-[10px] bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-200'
+                      }
+                    >
+                      {agency.isPaused ? t('paused') : agency.isQueueOpen ? t('openNow') : t('closed')}
+                    </Badge>
+                    {agency.waitingCount > 0 && (
+                      <span className="text-[10px] text-muted-foreground flex items-center gap-0.5">
+                        <Users className="h-3 w-3" />
+                        {agency.waitingCount} {t('waiting')}
+                      </span>
+                    )}
+                    {km != null && (
+                      <span className="text-[10px] text-muted-foreground">
+                        {formatDistance(km).value} {formatDistance(km).unit}
+                      </span>
+                    )}
+                    {open === false && agency.workingHoursStart && (
+                      <span className="text-[10px] text-muted-foreground">
+                        {t('openFrom')} {agency.workingHoursStart}
+                      </span>
+                    )}
+                  </div>
+                </button>
+                <button
+                  onClick={(e) => toggleFavorite(e, agency.id)}
+                  className="h-8 w-8 rounded-lg flex items-center justify-center flex-shrink-0 hover:bg-muted transition-colors"
+                  aria-label={t('favorites')}
+                  disabled={togglingFav === agency.id}
+                >
+                  <Heart
+                    className={`h-4 w-4 ${
+                      favoriteIds.has(agency.id)
+                        ? 'fill-red-500 text-red-500'
+                        : 'text-muted-foreground'
+                    }`}
+                  />
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
-
-      {/* ── 7. Below the fold: recently visited + recent activity ── */}
-      <div className="mt-6">
-        <RecentlyVisited
-          t={t}
-          lang={lang}
-          onSelectAgency={handleSelectAgency}
-          agencies={agencies}
-          favoriteIds={favoriteIds}
-          togglingFav={togglingFav}
-          onToggleFavorite={toggleFavorite}
-          onQuickJoin={(agencyId) => handleQuickJoin(agencyId)}
-          distanceByAgencyId={distanceByAgencyId}
-          onViewProfile={(agency) => {
-            useAppStore.getState().setAgencyProfileId(agency.id);
-            setView('customer-agency-profile');
-          }}
-          onNavigateHistory={() => setView('customer-history')}
-        />
-
-        <RecentActivityFeed
-          t={t}
-          lang={lang}
-          onViewHistory={() => setView('customer-history')}
-        />
-      </div>
 
       {/* Date Picker Dialog */}
       {dateDialogContent}
@@ -1472,24 +1386,13 @@ function EmptyAgenciesState({ searchQuery, hasCategoryFilter, t, onClear, onExpl
   onRetry: () => void;
 }) {
   return (
-    <motion.div
-      initial={{ opacity: 0, scale: 0.97 }}
-      animate={{ opacity: 1, scale: 1 }}
-      className="flex flex-col items-center justify-center py-10 text-center"
-    >
-      <div className="relative mb-5">
-        <motion.div
-          animate={{ scale: [1, 1.15, 1], opacity: [0.15, 0.05, 0.15] }}
-          transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-200 dark:bg-emerald-800"
-        />
-        <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-100 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/20 ring-1 ring-emerald-200/60 dark:ring-emerald-800/60">
-          {searchQuery.trim() ? (
-            <Search className="h-7 w-7 text-emerald-500" />
-          ) : (
-            <TicketCheck className="h-7 w-7 text-emerald-500" />
-          )}
-        </div>
+    <div className="flex flex-col items-center justify-center py-10 text-center px-4">
+      <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-emerald-50 dark:bg-emerald-900/20 mb-4">
+        {searchQuery.trim() ? (
+          <Search className="h-6 w-6 text-emerald-500" />
+        ) : (
+          <TicketCheck className="h-6 w-6 text-emerald-500" />
+        )}
       </div>
       {searchQuery.trim() ? (
         <>
@@ -1541,11 +1444,11 @@ function EmptyAgenciesState({ searchQuery, hasCategoryFilter, t, onClear, onExpl
           </Button>
         </>
       )}
-    </motion.div>
+    </div>
   );
 }
 
-// ─── Agency Reviews Preview (same endpoint + logic, restyled) ────────────────
+// ─── Agency Reviews Preview (same endpoint + logic, simplified) ──────────────
 function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agencyId: string; averageRating?: number; reviewCount?: number }) {
   const { t, lang } = useLanguage();
   const [reviews, setReviews] = useState<Array<{
@@ -1625,63 +1528,45 @@ function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agency
       </div>
 
       <div className="space-y-2">
-        <AnimatePresence>
-          {displayReviews.map((review, idx) => {
-            // Fresh-account safety: a review row can arrive with the user
-            // relation absent (deleted user / partial sync payload). Guard
-            // instead of crashing on null.split.
-            const reviewerName: string = review.user?.fullName || 'Customer';
-            const initials = reviewerName
-              .split(' ')
-              .map((n: string) => n[0])
-              .filter(Boolean)
-              .slice(0, 2)
-              .join('')
-              .toUpperCase();
-            const colors = ['bg-emerald-500', 'bg-teal-500', 'bg-amber-500', 'bg-rose-500', 'bg-violet-500'];
-            const colorClass = colors[reviewerName.length % colors.length];
-
-            return (
-              <motion.div
-                key={review.id}
-                initial={{ opacity: 0, y: 5 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: idx * 0.05 }}
-                className="flex items-start gap-2.5 p-2.5 rounded-xl bg-gray-50 dark:bg-gray-800/50"
-              >
-                <div className={`h-8 w-8 rounded-full ${colorClass} flex items-center justify-center flex-shrink-0`}>
-                  <span className="text-[10px] font-bold text-white">{initials || '?'}</span>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-semibold text-foreground">{reviewerName}</span>
-                    <div className="flex gap-0.5">
-                      {[1, 2, 3, 4, 5].map((star) => (
-                        <Star
-                          key={star}
-                          className={`h-2.5 w-2.5 ${
-                            star <= review.rating
-                              ? 'fill-amber-400 text-amber-400'
-                              : 'fill-gray-200 text-gray-200 dark:fill-gray-600 dark:text-gray-600'
-                          }`}
-                        />
-                      ))}
-                    </div>
+        {displayReviews.map((review) => {
+          // Fresh-account safety: a review row can arrive with the user
+          // relation absent (deleted user / partial sync payload). Guard
+          // instead of crashing on null.split.
+          const reviewerName: string = review.user?.fullName || 'Customer';
+          return (
+            <div
+              key={review.id}
+              className="flex items-start gap-2.5 p-2.5 rounded-xl bg-muted/40"
+            >
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-semibold text-foreground">{reviewerName}</span>
+                  <div className="flex gap-0.5">
+                    {[1, 2, 3, 4, 5].map((star) => (
+                      <Star
+                        key={star}
+                        className={`h-2.5 w-2.5 ${
+                          star <= review.rating
+                            ? 'fill-amber-400 text-amber-400'
+                            : 'fill-gray-200 text-gray-200 dark:fill-gray-600 dark:text-gray-600'
+                        }`}
+                      />
+                    ))}
                   </div>
-                  {review.comment && (
-                    <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{review.comment}</p>
-                  )}
-                  <span className="text-[10px] text-muted-foreground/70">
-                    {new Date(review.createdAt).toLocaleDateString(
-                      lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US',
-                      { month: 'short', day: 'numeric' }
-                    )}
-                  </span>
                 </div>
-              </motion.div>
-            );
-          })}
-        </AnimatePresence>
+                {review.comment && (
+                  <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{review.comment}</p>
+                )}
+                <span className="text-[10px] text-muted-foreground/70">
+                  {new Date(review.createdAt).toLocaleDateString(
+                    lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US',
+                    { month: 'short', day: 'numeric' }
+                  )}
+                </span>
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       {reviews.length > 3 && (

@@ -172,6 +172,7 @@ const fr: Record<TranslationKeys, string> = {
   scanQR: "Scanner le code QR",
   yourQueueNumber: "Votre numéro",
   queueNumber: "Numéro de file",
+  timeRemaining: "Temps restant",
   memberSince: "Membre depuis",
   peopleAhead: "personnes devant vous",
   demoClinic: "Clinique Noor",

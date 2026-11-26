@@ -170,6 +170,7 @@ const ar = {
   scanQR: "امسح رمز QR",
   yourQueueNumber: "رقمك في الطابور",
   queueNumber: "رقم الدور",
+  timeRemaining: "الوقت المتبقي",
   memberSince: "عضو منذ",
   peopleAhead: "أمامك",
   demoClinic: "عيادة النور",

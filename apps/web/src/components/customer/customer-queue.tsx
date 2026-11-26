@@ -1,20 +1,28 @@
 'use client';
 
 /**
- * Task 79-a — CustomerQueue v2 (Design System v2 rebuild, logic preserved).
+ * Customer queue list — SIMPLIFIED (customer UX simplification round).
  *
- * Structure:
- *   1. Header: title + refresh + live/offline pill + settings (refresh cadence).
- *   2. Offline banner + smart-polling indicator (unchanged behavior).
- *   3. YOUR TURN alert (QueueTurnAlert, confetti + slide-to-confirm).
- *   4. THE active ticket — ONE compact hero card (display number + position +
- *      progress ring + agency/service + ETA + now-serving + actions).
- *   5. Other active reservations — slim expandable rows with the same actions.
- *   6. Past tickets — collapsed disclosure (rate flow kept) + link to history.
+ * The old screen was a design-system showcase: a hero ticket with a progress
+ * ring, an expandable-rows section, a wait-time predictor card, a position
+ * timeline, gradient status strips, a pulsing background, share/copy/QR
+ * action rows and a second destructive "leave queue" flow. All of that is
+ * gone.
  *
- * Everything else (endpoints, polling/backoff, realtime events, sounds,
- * sleep-state, localStorage caches, dialogs, toasts) is byte-for-byte the
- * pre-rebuild logic.
+ * What the screen is now — one plain CARD PER ACTIVE RESERVATION:
+ *   · agency name (+ service, reserved date, preferred time)
+ *   · ticket number (big)
+ *   · time remaining (~min, from the same ETA payload)
+ *   · basic queue facts (position, people ahead, now serving)
+ *   · buttons: Postpone + Cancel (WAITING only)
+ * A CALLED ticket keeps a highlighted card + the "go to counter" line, and
+ * the YOUR TURN alert (sound + slide-to-confirm) is unchanged — that is
+ * function, not decoration.
+ *
+ * Logic below the render is byte-for-byte the pre-simplification engine:
+ * smart polling with offline backoff, realtime subscriptions, turn-alert
+ * sleep state, localStorage caches, cancel/postpone/rate endpoints, queue
+ * event logs.
  */
 
 import { apiFetch } from '@/lib/api-fetch';
@@ -29,54 +37,33 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useRealtime } from '@/hooks/use-realtime';
-// Hotfix 0.6.12 — this import was missing, so the `useCategoryTermScope(...)`
-// call below threw a runtime ReferenceError that crashed the whole queue page
-// into the error boundary ("useCategoryTermScope is not defined", mobile
-// #/customer/queue). Every other consumer of the hook imports it; this file
-// was the only one relying on the (type-check-skipping) build to not catch it.
+// Hotfix 0.6.12 — per-category terminology scope (see original note below):
+// this import was missing once and the hook call threw a runtime
+// ReferenceError that crashed the whole queue page. Every consumer imports
+// it explicitly.
 import { useCategoryTermScope } from '@/hooks/use-category-terms';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Label } from '@/components/ui/label';
-import { SlideToConfirm } from '@/components/shared/slide-to-confirm';
 import { startNotificationSound, stopNotificationSound, playConfirmSound, markReservationConfirmed, isReservationConfirmed } from '@/lib/sounds';
 import { enterSleepMode, shouldShowAlert, clearSleep, subscribe, isReactivationDue, markReactivationShown, closeTurnNotifications } from '@/lib/turn-alert-sleep';
-import { CustomerQrPass } from '@/components/customer/customer-qr-pass';
 import {
   Users,
   Clock,
   TicketCheck,
-  Volume2,
-  VolumeX,
   XCircle,
   RefreshCw,
   Loader2,
   AlertTriangle,
   ChevronDown,
-  Share2,
-  QrCode,
   ShieldAlert,
   Star,
   ArrowDown,
-  WifiOff,
-  Copy,
-  Check,
-  Settings,
-  History,
   MapPin,
+  History,
 } from 'lucide-react';
-import { WaitTimePredictor } from '@/components/customer/WaitTimePredictor';
-import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import {
   Dialog,
   DialogContent,
@@ -95,15 +82,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover';
 import { QueueTurnAlert } from '@/components/customer/queue/QueueTurnAlert';
-import { QueueProgressRing } from '@/components/customer/queue/QueueProgressRing';
 import { QueueRatingDialog } from '@/components/customer/queue/QueueRatingDialog';
-import { QueueTimeline } from '@/components/customer/queue/QueueTimeline';
 import { QueueEmptyState } from '@/components/customer/queue/QueueEmptyState';
 
 interface Reservation {
@@ -159,19 +139,14 @@ export function CustomerQueue() {
   const [cancelling, setCancelling] = useState<string | null>(null);
   const [showTurnAlert, setShowTurnAlert] = useState(false);
   const [soundMuted, setSoundMuted] = useState(false);
-  const [refreshInterval, setRefreshInterval] = useState<number>(10000);
+  const [refreshInterval] = useState<number>(10000);
   // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
   const [resumeNonce, setResumeNonce] = useState(0);
   useResumeRefresh(() => setResumeNonce((n) => n + 1));
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [confettiKey, setConfettiKey] = useState(0);
-  const [qrDialogOpen, setQrDialogOpen] = useState(false);
-  const [qrReservation, setQrReservation] = useState<Reservation | null>(null);
-  const [leaveDialogOpen, setLeaveDialogOpen] = useState(false);
-  const [leaveTargetRes, setLeaveTargetRes] = useState<Reservation | null>(null);
   const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
   const [cancelResId, setCancelResId] = useState<string | null>(null);
-  const [shareCopied, setShareCopied] = useState<string | null>(null);
   const [userRating, setUserRating] = useState<Record<string, number>>({});
   const [submittingRating, setSubmittingRating] = useState<string | null>(null);
   const [feedbackComment, setFeedbackComment] = useState<Record<string, string>>({});
@@ -190,7 +165,6 @@ export function CustomerQueue() {
   const [isReconnecting, setIsReconnecting] = useState(false);
   const prevPeopleAheadRef = useRef<Record<string, number>>({});
   const connectionStatusWasConnected = useRef(false);
-  const [expandedRowId, setExpandedRowId] = useState<string | null>(null);
   const [showPast, setShowPast] = useState(false);
   // r21-8 — counter hints learned from realtime events (queue:called /
   // notification:your-turn carry counter { id, name, number }): keyed by
@@ -243,7 +217,7 @@ export function CustomerQueue() {
             isWalkIn: (r as Record<string, unknown>).isWalkIn === true,
             customerName: (r as Record<string, unknown>).walkInCustomerName as string || (r as Record<string, unknown>).customerName as string || undefined,
             // r21-8 — counter pointer when the payload carries one (the CALLED
-            // hero shows "head to counter: X").
+            // card shows "head to counter: X").
             counterName: counter?.name || undefined,
             counterNumber: typeof counter?.number === 'number' ? counter.number : undefined,
           } as Reservation;
@@ -452,7 +426,7 @@ export function CustomerQueue() {
     };
 
     // r21-8 — learn the counter pointer from the event payloads (the ticket
-    // hero then renders "head to counter: X" once the ticket is CALLED).
+    // card then renders "head to counter: X" once the ticket is CALLED).
     const learnCounterHint = (event: unknown) => {
       const d = ((event as { data?: Record<string, unknown> })?.data
         ?? (event as unknown as Record<string, unknown>)) as Record<string, unknown>;
@@ -587,21 +561,6 @@ export function CustomerQueue() {
     }
   }, [realtime.isConnected]);
 
-  // Time ago helper
-  const getTimeAgo = () => {
-    const diff = Math.floor((Date.now() - lastUpdated.getTime()) / 1000);
-    if (diff < 5) return t('justNow');
-    if (diff < 60) return `${diff}s`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m`;
-    return `${Math.floor(diff / 3600)}h`;
-  };
-  const [timeAgo, setTimeAgo] = useState('');
-  useEffect(() => {
-    setTimeAgo(getTimeAgo());
-    const interval = setInterval(() => setTimeAgo(getTimeAgo()), 5000);
-    return () => clearInterval(interval);
-  }, [lastUpdated, lang]);
-
   // ─── Handlers (unchanged logic) ──────────────────────────────────────
   const handleConfirmTurn = () => {
     const calledRes = reservations.find(r => r.status === 'CALLED');
@@ -703,73 +662,6 @@ export function CustomerQueue() {
     }
   };
 
-  const handleToggleFixedTime = async (resId: string, currentEnabled: boolean) => {
-    setCancelling(resId);
-    try {
-      const res = await apiFetch(`/api/reservations/${resId}/toggle-fixed-time`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: user?.id, fixedTimeEnabled: !currentEnabled }),
-      });
-      if (res.ok) {
-        // Queue event log — fixed-time preference toggled.
-        try {
-          const target = reservations.find((r) => r.id === resId);
-          logQueue('ticket_fixed_time_toggled', `Fixed time ${!currentEnabled ? 'enabled' : 'disabled'}`, {
-            agencyId: target?.agencyId || undefined,
-            ticketId: resId,
-            ticketNumber: target?.queueNumber || undefined,
-            enabled: !currentEnabled,
-          });
-        } catch { /* never block */ }
-        toast.success(!currentEnabled ? t('fixedTimeOn') : t('fixedTimeOff'));
-        fetchReservations();
-      } else {
-        const data = await res.json();
-        // Queue event log — fixed-time toggle failed (endpoint error included).
-        try { logQueue('ticket_fixed_time_toggled', `Fixed-time toggle failed: ${data?.error || 'rejected'}`, { ticketId: resId, enabled: !currentEnabled }, 'error'); } catch { /* never block */ }
-        toast.error(data.error || t('error'));
-      }
-    } catch {
-      // Queue event log — fixed-time toggle network failure.
-      try { logQueue('ticket_fixed_time_toggled', 'Fixed-time toggle failed — network error', { ticketId: resId, enabled: !currentEnabled }, 'error'); } catch { /* never block */ }
-      toast.error(t('error'));
-    } finally {
-      setCancelling(null);
-    }
-  };
-
-  const handleLeaveQueue = async () => {
-    clearSleep();
-    setCancelling('leaving');
-    try {
-      const res = await apiFetch(`/api/reservations/cancel-active?userId=${user?.id}`, {
-        method: 'DELETE',
-      });
-      if (res.ok) {
-        // Queue event log — customer left the queue (cancel-active clears
-        // every active ticket; no single ticket id applies here).
-        try { logQueue('ticket_cancelled', 'Customer left the queue', { ...(user?.id ? { userId: user.id } : {}) }); } catch { /* never block */ }
-        toast.success(t('queueLeft'));
-        setLeaveDialogOpen(false);
-        stopNotificationSound();
-        soundStartedRef.current = false;
-        setView('customer-home');
-      } else {
-        const data = await res.json();
-        // Queue event log — leave-queue failed (endpoint error included).
-        try { logQueue('ticket_cancelled', `Leave queue failed: ${data?.error || 'rejected'}`, { ...(user?.id ? { userId: user.id } : {}) }, 'error'); } catch { /* never block */ }
-        toast.error(data.error || t('error'));
-      }
-    } catch {
-      // Queue event log — leave-queue network failure.
-      try { logQueue('ticket_cancelled', 'Leave queue failed — network error', { ...(user?.id ? { userId: user.id } : {}) }, 'error'); } catch { /* never block */ }
-      toast.error(t('error'));
-    } finally {
-      setCancelling(null);
-    }
-  };
-
   const handleReclaim = async (id: string) => {
     setCancelling(id);
     try {
@@ -862,44 +754,7 @@ export function CustomerQueue() {
     }
   };
 
-  const handleSharePosition = (res: Reservation) => {
-    const agencyName = lang === 'ar' && res.agencyNameAr ? res.agencyNameAr : lang === 'fr' && res.agencyNameFr ? res.agencyNameFr : res.agencyName;
-    const serviceName = lang === 'ar' && res.serviceNameAr ? res.serviceNameAr : lang === 'fr' && res.serviceNameFr ? res.serviceNameFr : res.serviceName;
-    const shareText = t('queueShareText')
-      .replace('{position}', String(res.position))
-      .replace('{agency}', agencyName)
-      .replace('{service}', serviceName)
-      .replace('{number}', res.queueNumber);
-    if (navigator.share) {
-      navigator.share({ title: 'BLASTI', text: shareText, url: `${window.location.origin}/#ticket-${res.id}` }).catch(() => {});
-    } else {
-      navigator.clipboard.writeText(shareText + `\n${window.location.origin}/#ticket-${res.id}`).then(() => {
-        toast.success(t('copied'));
-      }).catch(() => {
-        toast.error(t('error'));
-      });
-    }
-  };
-
-  const handleCopyPosition = async (res: Reservation) => {
-    const agencyName = lang === 'ar' && res.agencyNameAr ? res.agencyNameAr : lang === 'fr' && res.agencyNameFr ? res.agencyNameFr : res.agencyName;
-    const serviceName = lang === 'ar' && res.serviceNameAr ? res.serviceNameAr : lang === 'fr' && res.serviceNameFr ? res.serviceNameFr : res.serviceName;
-    const statusText = `${t('yourQueueNumber')}: ${res.queueNumber}\n${t('positionInQueue')}: #${res.position}\n${agencyName} — ${serviceName}\n${t('peopleAhead')}: ${res.peopleAhead}\n${t('estimatedWait')}: ${res.estimatedWait} ${t('minutes')}`;
-    try {
-      await navigator.clipboard.writeText(statusText);
-      setShareCopied(res.id);
-      toast.success(t('copied'));
-      setTimeout(() => setShareCopied(null), 2000);
-    } catch {
-      toast.error(t('error'));
-    }
-  };
-
   // ─── Computed ─────────────────────────────────────────────────────────
-  const activeRes = reservations.find(
-    (r) => r.status === 'WAITING' || r.status === 'CALLED' || r.status === 'DEFERRED_OFFLINE'
-  );
-
   const getAgencyName = (r: Reservation) => {
     if (lang === 'ar' && r.agencyNameAr) return r.agencyNameAr;
     if (lang === 'fr' && r.agencyNameFr) return r.agencyNameFr;
@@ -912,8 +767,9 @@ export function CustomerQueue() {
     return r.serviceName;
   };
 
-  // Per-reservation ETA display
-  const getEtaDisplay = (res: Reservation): string => {
+  // Time remaining display ("time remaining" is the ONLY wait metric the
+  // simplified card shows — min–max range when the ETA payload has both).
+  const getTimeRemaining = (res: Reservation): string => {
     const etaMin = res.etaMin || 0;
     const etaMax = res.etaMax || res.estimatedWait || 0;
 
@@ -927,26 +783,6 @@ export function CustomerQueue() {
     return `~${max} ${t('minutes')}`;
   };
 
-  // Progress ring helpers
-  const ringRadius = 52;
-  const ringCircumference = 2 * Math.PI * ringRadius;
-
-  const getRingProgress = (res: Reservation) =>
-    res.peopleAhead <= 0
-      ? 100
-      : Math.max(5, Math.min(95, 100 - (res.peopleAhead / 20) * 100));
-
-  // Status gradient helper
-  const getStatusGradient = (status: string) => {
-    switch (status) {
-      case 'CALLED': return 'from-emerald-500 to-teal-500';
-      case 'WAITING': return 'from-amber-400 to-amber-500';
-      case 'DEFERRED_OFFLINE': return 'from-orange-400 to-orange-500';
-      case 'COMPLETED': return 'from-gray-400 to-gray-500';
-      default: return 'from-gray-300 to-gray-400';
-    }
-  };
-
   const getStatusLabel = (status: string) => {
     switch (status) {
       case 'CALLED': return t('statusCalled');
@@ -956,351 +792,52 @@ export function CustomerQueue() {
     }
   };
 
+  // Every active ticket is a card — CALLED first, then by position.
+  const statusRank = (s: string) => (s === 'CALLED' ? 0 : s === 'DEFERRED_OFFLINE' ? 2 : 1);
+  const activeList = reservations
+    .filter((r) => r.status === 'WAITING' || r.status === 'CALLED' || r.status === 'DEFERRED_OFFLINE')
+    .sort((a, b) => statusRank(a.status) - statusRank(b.status) || (a.position || 9999) - (b.position || 9999));
+  const calledRes = reservations.find(r => r.status === 'CALLED');
+  const pastRes = reservations.filter((r) => r.status === 'COMPLETED');
+
   // ─── Loading State ───────────────────────────────────────────────────
   if (loading) {
     return (
-      <div className="px-4 py-3 pb-24 lg:pb-8 max-w-3xl mx-auto">
+      <div className="px-4 py-3 pb-24 lg:pb-8 max-w-2xl mx-auto">
         <div className="flex items-center justify-between mb-4">
           <Skeleton className="h-7 w-28 rounded-lg" />
-          <div className="flex items-center gap-2">
-            <Skeleton className="h-8 w-8 rounded-xl" />
-            <Skeleton className="h-6 w-16 rounded-full" />
-          </div>
+          <Skeleton className="h-8 w-8 rounded-xl" />
         </div>
-        <Skeleton className="h-10 rounded-2xl mb-4" />
-        <Skeleton className="h-[300px] rounded-2xl" />
+        <Skeleton className="h-36 rounded-xl mb-3" />
+        <Skeleton className="h-36 rounded-xl" />
       </div>
     );
   }
 
   // ─── Empty State ─────────────────────────────────────────────────────
-  if (!activeRes && reservations.length === 0) {
+  if (activeList.length === 0 && reservations.length === 0) {
     return <QueueEmptyState />;
   }
 
-  const otherActive = reservations.filter(
-    (r) => r.id !== activeRes?.id && (r.status === 'WAITING' || r.status === 'CALLED' || r.status === 'DEFERRED_OFFLINE')
-  );
-  const pastRes = reservations.filter((r) => r.status === 'COMPLETED');
-
-  // ─── Ticket card body (hero + expanded rows share this) ──────────────
-  const renderTicketBody = (res: Reservation, isHero: boolean) => {
-    const isCalled = res.status === 'CALLED';
-    const isDeferredOffline = res.status === 'DEFERRED_OFFLINE';
-    const ringProgress = getRingProgress(res);
-    const ringDashOffset = ringCircumference - (ringProgress / 100) * ringCircumference;
-
-    return (
-      <CardContent className="p-3.5">
-        {/* Ring + identity, side by side (compact hero layout) */}
-        <div className="flex items-center gap-3 mb-3">
-          <QueueProgressRing
-            reservation={res}
-            isCalled={isCalled}
-            ringCircumference={ringCircumference}
-            ringRadius={ringRadius}
-            ringDashOffset={ringDashOffset}
-            compact={isHero}
-          />
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-semibold text-foreground truncate">
-              {getAgencyName(res)}
-            </p>
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground mt-0.5">
-              <span className="truncate">{getServiceName(res)}</span>
-              {res.reservedDate && (
-                <>
-                  <span>•</span>
-                  <span className="whitespace-nowrap">
-                    {new Date(res.reservedDate + 'T00:00:00').toLocaleDateString(
-                      lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US',
-                      { month: 'short', day: 'numeric' }
-                    )}
-                  </span>
-                </>
-              )}
-            </div>
-            {(res.customerName || res.isWalkIn) && (
-              <p className="text-xs text-emerald-600 dark:text-emerald-400 font-medium truncate mt-0.5">
-                👤 {res.customerName || res.queueNumber}
-              </p>
-            )}
-
-            {/* Fixed Time Toggle (conditional) */}
-            {res.status === 'WAITING' && res.preferredTime && (
-              <div className="flex items-center justify-between gap-2 p-2 rounded-xl bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200/50 dark:border-emerald-800/30 mt-2">
-                <div className="flex items-center gap-1.5 min-w-0">
-                  <Clock className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
-                  <div className="min-w-0">
-                    <p className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400 truncate">
-                      {res.fixedTimeEnabled ? t('fixedTimeOn') : t('fixedTimeOff')}
-                      {res.fixedTimeEnabled && res.preferredTime && (
-                        <span className="ms-1 font-normal opacity-70" dir="ltr">{res.preferredTime}</span>
-                      )}
-                    </p>
-                  </div>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 text-[10px] px-2 rounded-lg border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 flex-shrink-0"
-                  onClick={() => handleToggleFixedTime(res.id, res.fixedTimeEnabled || false)}
-                  disabled={cancelling === res.id}
-                >
-                  {t('toggleFixedTime')}
-                </Button>
-              </div>
-            )}
-
-            {/* Position progress mini-bar */}
-            <div className="mt-2">
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-[10px] text-muted-foreground">{t('queuePosition')}</span>
-                <span className="flex items-center gap-1">
-                  <motion.span
-                    key={res.position}
-                    initial={{ scale: 1.3 }}
-                    animate={{ scale: 1 }}
-                    transition={{ duration: 0.4 }}
-                    className="text-xs font-bold text-foreground"
-                  >
-                    #{res.position}
-                  </motion.span>
-                  <span className="text-[10px] text-muted-foreground">/ {res.peopleAhead + res.position}</span>
-                </span>
-              </div>
-              <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
-                <motion.div
-                  initial={{ width: 0 }}
-                  animate={{
-                    width: `${Math.max(5, Math.min(100, 100 - (res.peopleAhead / Math.max(res.peopleAhead + res.position, 1)) * 100))}%`,
-                  }}
-                  transition={{ duration: 0.8, ease: 'easeOut' }}
-                  className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-teal-400 to-emerald-500"
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* ─ Stats Row: 3 Columns ─ */}
-        <div className="grid grid-cols-3 gap-2 mb-3">
-          {/* People Ahead */}
-          <div className="bg-muted/60 rounded-xl p-2.5 text-center">
-            <Users className="h-3.5 w-3.5 mx-auto mb-0.5 text-teal-600 dark:text-teal-400" />
-            <p className="text-base font-bold text-teal-700 dark:text-teal-400">{res.peopleAhead}</p>
-            <p className="text-[9px] text-muted-foreground">{t('peopleAhead')}</p>
-          </div>
-          {/* ETA */}
-          <div className="bg-amber-50 dark:bg-amber-900/15 rounded-xl p-2.5 text-center">
-            <Clock className="h-3.5 w-3.5 mx-auto mb-0.5 text-amber-600 dark:text-amber-400" />
-            <p className="text-sm font-bold text-amber-700 dark:text-amber-400">
-              {!isCalled ? getEtaDisplay(res) : '—'}
-            </p>
-            {res.etaConfidence && !isCalled ? (
-              <div className={`flex items-center justify-center gap-0.5 mt-0.5 ${
-                res.etaConfidence === 'high' ? 'text-emerald-600' : res.etaConfidence === 'medium' ? 'text-amber-600' : 'text-red-600'
-              }`}>
-                <span className={`h-1 w-1 rounded-full ${
-                  res.etaConfidence === 'high' ? 'bg-emerald-500' : res.etaConfidence === 'medium' ? 'bg-amber-500' : 'bg-red-500'
-                }`} />
-                <span className="text-[8px] font-medium">{t(`confidence${res.etaConfidence.charAt(0).toUpperCase() + res.etaConfidence.slice(1)}` as Parameters<typeof t>[0])}</span>
-              </div>
-            ) : (
-              <p className="text-[9px] text-muted-foreground">{isCalled ? t('statusCalled') : ''}</p>
-            )}
-          </div>
-          {/* Now Serving */}
-          <div className="bg-emerald-50 dark:bg-emerald-900/15 rounded-xl p-2.5 text-center">
-            <TicketCheck className="h-3.5 w-3.5 mx-auto mb-0.5 text-emerald-600 dark:text-emerald-400" />
-            <p className="text-base font-bold text-emerald-700 dark:text-emerald-400">
-              {res.currentServingNumber}
-            </p>
-            <p className="text-[9px] text-muted-foreground">{t('currentServing')}</p>
-          </div>
-        </div>
-
-        {/* ─ CALLED Prominent Notice ─ */}
-        {isCalled && (() => {
-          // r21-8 — counter pointer: fetched row field first, then the
-          // realtime-learned hint.
-          const counterHint = res.counterName || calledCounterHints[res.id];
-          return (
-            <motion.div
-              animate={{ scale: [1, 1.01, 1] }}
-              transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-              className="mb-3"
-            >
-              <div className="w-full py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-semibold text-xs flex items-center justify-center gap-2">
-                <AlertTriangle className="h-3.5 w-3.5" />
-                {t('statusCalled')} — {getAgencyName(res)}
-              </div>
-              {counterHint && (
-                <div className="mt-1.5 w-full py-2 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/40 text-amber-800 dark:text-amber-300 font-semibold text-xs flex items-center justify-center gap-2">
-                  <MapPin className="h-3.5 w-3.5" />
-                  {t('goCounterName', { name: counterHint })}
-                </div>
-              )}
-            </motion.div>
-          );
-        })()}
-
-        {/* ─ Action Buttons Row 1: Cancel / Postpone / Leave (WAITING only) ─ */}
-        {res.status === 'WAITING' && (
-          <div className="flex gap-2 mb-2">
-            <Button
-              variant="outline"
-              size="sm"
-              className="flex-1 h-9 rounded-xl border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 text-xs gap-1"
-              onClick={() => { setCancelResId(res.id); setCancelDialogOpen(true); }}
-              disabled={cancelling === res.id}
-            >
-              {cancelling === res.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <XCircle className="h-3.5 w-3.5" />}
-              {t('cancelReservation')}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="flex-1 h-9 rounded-xl border-amber-200 dark:border-amber-800 text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 text-xs gap-1"
-              onClick={() => {
-                setPostponeResId(res.id);
-                setPostponePositions(1);
-                setPostponeDialogOpen(true);
-              }}
-            >
-              <ArrowDown className="h-3.5 w-3.5" />
-              {t('postponeTurn')}
-            </Button>
-            <Button
-              variant="destructive"
-              size="sm"
-              className="flex-1 h-9 rounded-xl text-xs gap-1 font-semibold"
-              onClick={() => { setLeaveTargetRes(res); setLeaveDialogOpen(true); }}
-            >
-              <XCircle className="h-3.5 w-3.5" />
-              {t('leaveQueue')}
-            </Button>
-          </div>
-        )}
-
-        {/* ─ Action Buttons Row 2: Share / Copy / QR pass ─ */}
-        <div className="flex gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="flex-1 h-9 rounded-xl text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 text-xs gap-1"
-            onClick={() => handleSharePosition(res)}
-          >
-            <Share2 className="h-3.5 w-3.5" />
-            {t('sharePosition')}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className={`flex-1 h-9 rounded-xl text-xs gap-1 ${
-              shareCopied === res.id
-                ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20'
-                : 'text-teal-600 dark:text-teal-400 hover:bg-teal-50 dark:hover:bg-teal-900/20'
-            }`}
-            onClick={() => handleCopyPosition(res)}
-          >
-            {shareCopied === res.id ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-            {shareCopied === res.id ? t('copied') : t('copyPosition')}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="flex-1 h-9 rounded-xl text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 text-xs gap-1"
-            onClick={() => {
-              setQrReservation(res);
-              setQrDialogOpen(true);
-            }}
-          >
-            <QrCode className="h-3.5 w-3.5" />
-            {t('shareTicket')}
-          </Button>
-        </div>
-
-        {/* ─ Skipped Reclaim (conditional) ─ */}
-        {res.skippedForNoShow && res.status === 'CALLED' && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="mt-3 space-y-2"
-          >
-            <div className="flex items-center gap-2 p-2.5 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200/50 dark:border-amber-800/30">
-              <AlertTriangle className="h-3.5 w-3.5 text-amber-500 flex-shrink-0" />
-              <span className="text-xs text-amber-700 dark:text-amber-400">{t('skippedWarning')}</span>
-            </div>
-            <Button
-              className="w-full h-10 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-semibold text-sm gap-2"
-              onClick={() => handleReclaim(res.id)}
-              disabled={cancelling === res.id}
-            >
-              {cancelling === res.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldAlert className="h-4 w-4" />}
-              {t('reclaimPosition')}
-            </Button>
-          </motion.div>
-        )}
-
-        {/* ─ Rating for COMPLETED ─ */}
-        {res.status === 'COMPLETED' && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="mt-3"
-          >
-            {feedbackSubmittedIds.has(res.id) || res.rating || userRating[res.id] ? (
-              <div className="flex items-center justify-center gap-2 py-2.5 rounded-xl bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200/50 dark:border-emerald-800/50">
-                <Star className="h-4 w-4 text-amber-500 fill-amber-500" />
-                <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">{t('ratingSubmitted')}</span>
-                {(res.rating || userRating[res.id]) && (
-                  <div className="flex items-center gap-0.5 ms-1">
-                    {[1, 2, 3, 4, 5].map((s) => (
-                      <Star key={s} className={`h-3 w-3 ${s <= (res.rating || userRating[res.id] || 0) ? 'text-amber-400 fill-amber-400' : 'text-gray-300 dark:text-gray-600'}`} />
-                    ))}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <Button
-                className="w-full h-10 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-semibold text-sm gap-2"
-                onClick={() => openRatingDialog(res.id)}
-              >
-                <Star className="h-4 w-4" />
-                {t('rateExperience')}
-              </Button>
-            )}
-          </motion.div>
-        )}
-
-        {/* ─ Position Timeline (collapsible) ─ */}
-        {(res.status === 'WAITING' || res.status === 'CALLED') && (
-          <QueueTimeline reservation={res} livePosition={res.position} />
-        )}
-      </CardContent>
-    );
-  };
-
   // ─── Main JSX ────────────────────────────────────────────────────────
   return (
-    <div className="px-4 py-3 pb-24 lg:pb-8 max-w-3xl mx-auto">
-      {/* Subtle background pulse when waiting */}
-      {activeRes && activeRes.status === 'WAITING' && (
-        <div className="fixed inset-0 pointer-events-none -z-10 overflow-hidden">
-          <motion.div
-            animate={{ scale: [1, 1.5, 1], opacity: [0.03, 0.01, 0.03] }}
-            transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-emerald-400 dark:bg-emerald-600"
-          />
-        </div>
-      )}
-
-      {/* ── 1. Header: Title + Connection + Settings ── */}
-      <div className="flex items-center justify-between mb-3">
+    <div className="px-4 py-3 pb-24 lg:pb-8 max-w-2xl mx-auto">
+      {/* ── 1. Header: Title + Refresh + Connection pill ── */}
+      <div className="flex items-center justify-between mb-4">
         <h1 className="text-lg font-bold">{t('myQueue')}</h1>
-        <div className="flex items-center gap-1.5">
-          {/* Manual refresh */}
+        <div className="flex items-center gap-2">
+          <div className={`flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-medium ${
+            realtime.isConnected
+              ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
+              : isReconnecting
+                ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
+                : 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+          }`}>
+            <span className={`h-1.5 w-1.5 rounded-full ${
+              realtime.isConnected ? 'bg-emerald-500' : isReconnecting ? 'bg-amber-500 animate-pulse' : 'bg-red-500'
+            }`} />
+            <span>{realtime.isConnected ? t('live') : isReconnecting ? t('reconnecting') : t('offline')}</span>
+          </div>
           <Button
             variant="ghost"
             size="icon"
@@ -1310,246 +847,195 @@ export function CustomerQueue() {
           >
             <RefreshCw className="h-4 w-4" />
           </Button>
-          {/* Connection indicator */}
-          <div className={`flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-medium ${
-            realtime.isConnected
-              ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
-              : isReconnecting
-                ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
-                : 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
-          }`}>
-            <span className={`h-1.5 w-1.5 rounded-full ${
-              realtime.isConnected ? 'bg-emerald-500 animate-pulse' : isReconnecting ? 'bg-amber-500 animate-pulse' : 'bg-red-500'
-            }`} />
-            <span>{realtime.isConnected ? t('live') : isReconnecting ? t('reconnecting') : t('offline')}</span>
-          </div>
-          {/* Settings gear — contains refresh interval selector */}
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button variant="ghost" size="icon" className="h-8 w-8 rounded-xl" aria-label={t('settings')}>
-                <Settings className="h-4 w-4" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent align="end" className="w-auto p-3 rounded-2xl space-y-3">
-              <div>
-                <p className="text-xs text-muted-foreground mb-1">{t('updatedAgo')}</p>
-                <p className="text-sm font-medium">{timeAgo}</p>
-              </div>
-              <div>
-                <p className="text-xs text-muted-foreground mb-1.5">{t('refreshEvery')}</p>
-                <Select value={String(refreshInterval)} onValueChange={(v) => setRefreshInterval(Number(v))}>
-                  <SelectTrigger className="h-8 w-full px-2.5 py-0 text-xs rounded-xl">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="5000">{t('seconds5')}</SelectItem>
-                    <SelectItem value="10000">{t('seconds10')}</SelectItem>
-                    <SelectItem value="30000">{t('seconds30')}</SelectItem>
-                    <SelectItem value="0">{t('off')}</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </PopoverContent>
-          </Popover>
         </div>
       </div>
 
-      {/* ── 2. Offline Banner ── */}
-      <AnimatePresence>
-        {!realtime.isConnected && reservations.length > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: -8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            className="mb-3"
-          >
-            <Card className="border-destructive/50 bg-destructive/5 rounded-2xl p-2.5">
-              <div className="flex items-center gap-2">
-                <AlertTriangle className="h-4 w-4 text-destructive flex-shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-semibold text-destructive">{t('offlineBanner')}</p>
-                  <p className="text-[10px] text-muted-foreground">
-                    {t('lastUpdatedOffline').replace('{time}', lastUpdated.toLocaleTimeString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', { hour: '2-digit', minute: '2-digit' }))}
+      {/* ── 2. Offline notice (only when tickets exist) ── */}
+      {!realtime.isConnected && reservations.length > 0 && (
+        <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/15 border border-red-200 dark:border-red-800/30">
+          <AlertTriangle className="h-4 w-4 text-red-600 dark:text-red-400 flex-shrink-0" />
+          <p className="text-xs text-red-700 dark:text-red-400">
+            {t('lastUpdatedOffline').replace('{time}', lastUpdated.toLocaleTimeString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', { hour: '2-digit', minute: '2-digit' }))}
+          </p>
+        </div>
+      )}
+
+      {/* ── 3. YOUR TURN alert (unchanged — function, not decoration) ── */}
+      <div ref={turnAlertRef}>
+        {showTurnAlert && calledRes && (
+          <QueueTurnAlert
+            showTurnAlert={showTurnAlert}
+            confettiKey={confettiKey}
+            activeRes={{
+              ...calledRes,
+              // r21-8 — surface the realtime-learned counter hint to the alert.
+              counterName: calledRes.counterName || calledCounterHints[calledRes.id],
+            }}
+            soundMuted={soundMuted}
+            agencyName={getAgencyName(calledRes)}
+            onConfirm={handleConfirmTurn}
+            onMute={handleMuteSound}
+            onUnmute={handleUnmuteSound}
+          />
+        )}
+      </div>
+
+      {/* ── 4. ONE SIMPLE CARD PER RESERVATION ── */}
+      <div className="space-y-3">
+        {activeList.length === 0 && (
+          <p className="text-sm text-muted-foreground text-center py-6">{t('noActiveReservations')}</p>
+        )}
+        {activeList.map((res) => {
+          const isCalled = res.status === 'CALLED';
+          const counterHint = res.counterName || calledCounterHints[res.id];
+          return (
+            <div
+              key={res.id}
+              className={`rounded-xl border bg-card p-4 ${
+                isCalled
+                  ? 'border-emerald-400 dark:border-emerald-600 ring-1 ring-emerald-200 dark:ring-emerald-800'
+                  : 'border-border'
+              }`}
+            >
+              {/* Agency + status */}
+              <div className="flex items-start justify-between gap-2 mb-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-foreground truncate">{getAgencyName(res)}</p>
+                  <p className="text-xs text-muted-foreground truncate">{getServiceName(res)}</p>
+                </div>
+                <Badge
+                  variant="outline"
+                  className={`flex-shrink-0 text-[10px] ${
+                    isCalled
+                      ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
+                      : res.status === 'DEFERRED_OFFLINE'
+                        ? 'bg-orange-50 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400 border-orange-200 dark:border-orange-800'
+                        : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 border-amber-200 dark:border-amber-800'
+                  }`}
+                >
+                  {getStatusLabel(res.status)}
+                </Badge>
+              </div>
+
+              {/* Ticket number + time remaining + position */}
+              <div className="flex items-center gap-5 mb-2">
+                <div className="min-w-[72px]">
+                  <p className="text-3xl font-black tracking-tight text-foreground leading-none">{res.queueNumber}</p>
+                  <p className="text-[10px] text-muted-foreground mt-1">{t('yourQueueNumber')}</p>
+                </div>
+                {!isCalled && (
+                  <div className="min-w-[72px]">
+                    <p className="text-sm font-semibold text-foreground leading-none mt-0.5">{getTimeRemaining(res)}</p>
+                    <p className="text-[10px] text-muted-foreground mt-1.5 flex items-center gap-1">
+                      <Clock className="h-3 w-3" />
+                      {t('timeRemaining')}
+                    </p>
+                  </div>
+                )}
+                <div className="min-w-[72px]">
+                  <p className="text-sm font-semibold text-foreground leading-none mt-0.5 flex items-center gap-1">
+                    <Users className="h-3.5 w-3.5 text-muted-foreground" />
+                    #{res.position}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground mt-1.5">{res.peopleAhead} {t('peopleAhead')}</p>
+                </div>
+              </div>
+
+              {/* Basic info line: now serving / reserved date / preferred time */}
+              {(res.currentServingNumber && res.currentServingNumber !== '0') && (
+                <p className="text-xs text-muted-foreground">
+                  {t('currentServing')}: <span className="font-semibold text-foreground">{res.currentServingNumber}</span>
+                </p>
+              )}
+              {res.reservedDate && (
+                <p className="text-xs text-muted-foreground">
+                  {new Date(res.reservedDate + 'T00:00:00').toLocaleDateString(
+                    lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US',
+                    { month: 'short', day: 'numeric' }
+                  )}
+                </p>
+              )}
+              {res.preferredTime && (
+                <p className="text-xs text-muted-foreground" dir="ltr">
+                  {res.fixedTimeEnabled ? t('fixedTimeOn') : t('fixedTimeOff')} · {res.preferredTime}
+                </p>
+              )}
+
+              {/* CALLED: go to counter */}
+              {isCalled && (
+                <div className="mt-2 flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800/40">
+                  <AlertTriangle className="h-4 w-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+                  <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+                    {t('statusCalled')} — {getAgencyName(res)}
                   </p>
                 </div>
-                {isReconnecting && (
-                  <span className="text-[10px] text-destructive font-medium flex items-center gap-1">
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    {t('reconnecting')}
-                  </span>
-                )}
-              </div>
-            </Card>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* ── 3. Smart Polling Indicator ── */}
-      <AnimatePresence>
-        {isFastPolling && activeRes?.status === 'WAITING' && (
-          <motion.div
-            initial={{ opacity: 0, y: -8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            className="mb-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/30"
-          >
-            <motion.div
-              animate={{ scale: [1, 1.4, 1], opacity: [0.5, 1, 0.5] }}
-              transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
-              className="h-2.5 w-2.5 rounded-full bg-amber-500"
-            />
-            <span className="text-xs font-medium text-amber-700 dark:text-amber-400">{t('smartPollingActive')}</span>
-            <span className="text-[10px] text-amber-600/70 dark:text-amber-400/70">· {t('smartPollingDesc')}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* ── 4. YOUR TURN Alert ── */}
-      <div ref={turnAlertRef}>
-        <AnimatePresence>
-          {showTurnAlert && activeRes?.status === 'CALLED' && (
-            <QueueTurnAlert
-              showTurnAlert={showTurnAlert}
-              confettiKey={confettiKey}
-              activeRes={{
-                ...activeRes,
-                // r21-8 — surface the realtime-learned counter hint to the alert.
-                counterName: activeRes.counterName || calledCounterHints[activeRes.id],
-              }}
-              soundMuted={soundMuted}
-              agencyName={getAgencyName(activeRes)}
-              onConfirm={handleConfirmTurn}
-              onMute={handleMuteSound}
-              onUnmute={handleUnmuteSound}
-            />
-          )}
-        </AnimatePresence>
-      </div>
-
-      {/* ── 5. Wait Time Predictor ── */}
-      {activeRes && activeRes.status === 'WAITING' && (
-        <motion.div
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25 }}
-          className="mb-3"
-        >
-          <WaitTimePredictor
-            currentPosition={activeRes.position || activeRes.peopleAhead + 1}
-            estimatedWaitMinutes={activeRes.etaMax || activeRes.estimatedWait || 0}
-            avgServiceTime={Math.max(1, Math.round((activeRes.estimatedWait || 10) / Math.max(1, activeRes.peopleAhead || 1)))}
-            totalWaiting={activeRes.peopleAhead || 0}
-            agencyName={getAgencyName(activeRes)}
-          />
-        </motion.div>
-      )}
-
-      {/* ── 6. THE active ticket — ONE compact hero card ── */}
-      {activeRes && (
-        <motion.div
-          key={activeRes.id}
-          layout
-          initial={{ opacity: 0, scale: 0.98 }}
-          animate={activeRes.status === 'CALLED'
-            ? { opacity: 1, scale: 1, x: [0, -2, 2, 0] }
-            : { opacity: 1, scale: 1 }}
-          transition={activeRes.status === 'CALLED'
-            ? { duration: 0.5, repeat: Infinity, repeatDelay: 2, ease: 'easeInOut' }
-            : { duration: 0.25 }}
-        >
-          <Card className="overflow-hidden rounded-2xl shadow-sm border-border">
-            {/* Slim status strip */}
-            <div className={`h-9 bg-gradient-to-r ${getStatusGradient(activeRes.status)} flex items-center px-3.5 gap-2 text-white`}>
-              {activeRes.status === 'CALLED' ? (
-                <motion.div animate={{ scale: [1, 1.15, 1] }} transition={{ duration: 1, repeat: Infinity, ease: 'easeInOut' }}>
-                  <Volume2 className="h-3.5 w-3.5" />
-                </motion.div>
-              ) : activeRes.status === 'DEFERRED_OFFLINE' ? (
-                <WifiOff className="h-3.5 w-3.5" />
-              ) : (
-                <Clock className="h-3.5 w-3.5" />
               )}
-              <Badge variant="secondary" className="bg-white/20 text-white border-0 text-[10px] px-1.5 py-0 h-[18px] hover:bg-white/30">
-                {getStatusLabel(activeRes.status)}
-              </Badge>
-              <span className="text-xs font-medium truncate flex-1">{getAgencyName(activeRes)}</span>
-              {activeRes.isWalkIn && (
-                <span className="text-[9px] font-semibold bg-white/20 px-1.5 py-0.5 rounded-full flex items-center gap-0.5 flex-shrink-0">
-                  {t('walkInBadge')}
-                </span>
+              {isCalled && counterHint && (
+                <div className="mt-1.5 flex items-center gap-2 px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/40">
+                  <MapPin className="h-4 w-4 text-amber-600 dark:text-amber-400 flex-shrink-0" />
+                  <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+                    {t('goCounterName', { name: counterHint })}
+                  </p>
+                </div>
+              )}
+
+              {/* Skipped: warning + reclaim */}
+              {res.skippedForNoShow && isCalled && (
+                <div className="mt-2 space-y-2">
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200/50 dark:border-amber-800/30">
+                    <AlertTriangle className="h-4 w-4 text-amber-500 flex-shrink-0" />
+                    <span className="text-xs text-amber-700 dark:text-amber-400">{t('skippedWarning')}</span>
+                  </div>
+                  <Button
+                    className="w-full h-10 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-semibold text-sm gap-2"
+                    onClick={() => handleReclaim(res.id)}
+                    disabled={cancelling === res.id}
+                  >
+                    {cancelling === res.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldAlert className="h-4 w-4" />}
+                    {t('reclaimPosition')}
+                  </Button>
+                </div>
+              )}
+
+              {/* Actions: Postpone + Cancel (WAITING only) */}
+              {res.status === 'WAITING' && (
+                <div className="flex gap-2 mt-3">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 h-10 rounded-xl border-amber-200 dark:border-amber-800 text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 text-xs gap-1"
+                    onClick={() => {
+                      setPostponeResId(res.id);
+                      setPostponePositions(1);
+                      setPostponeDialogOpen(true);
+                    }}
+                  >
+                    <ArrowDown className="h-3.5 w-3.5" />
+                    {t('postponeTurn')}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 h-10 rounded-xl border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 text-xs gap-1"
+                    onClick={() => { setCancelResId(res.id); setCancelDialogOpen(true); }}
+                    disabled={cancelling === res.id}
+                  >
+                    {cancelling === res.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <XCircle className="h-3.5 w-3.5" />}
+                    {t('cancelReservation')}
+                  </Button>
+                </div>
               )}
             </div>
-            {renderTicketBody(activeRes, true)}
-          </Card>
-        </motion.div>
-      )}
+          );
+        })}
+      </div>
 
-      {/* ── 7. Other active reservations — slim expandable rows ── */}
-      {otherActive.length > 0 && (
-        <div className="mt-4">
-          <h2 className="text-sm font-semibold text-foreground mb-2">{t('otherActiveTickets')}</h2>
-          <div className="space-y-2">
-            {otherActive.map((res) => {
-              const expanded = expandedRowId === res.id;
-              const isCalled = res.status === 'CALLED';
-              return (
-                <motion.div key={res.id} layout>
-                  <button
-                    onClick={() => setExpandedRowId(expanded ? null : res.id)}
-                    className={`w-full flex items-center gap-2.5 rounded-2xl border px-3.5 py-2.5 text-start transition-colors ${
-                      isCalled
-                        ? 'border-emerald-300 dark:border-emerald-700 bg-emerald-50/60 dark:bg-emerald-900/15'
-                        : 'border-border bg-white dark:bg-gray-900/80 hover:bg-muted/50'
-                    }`}
-                    aria-expanded={expanded}
-                  >
-                    <span className={`h-2 w-2 rounded-full flex-shrink-0 ${
-                      isCalled ? 'bg-emerald-500 animate-pulse' : res.status === 'DEFERRED_OFFLINE' ? 'bg-orange-500' : 'bg-amber-500'
-                    }`} />
-                    <span className="flex-1 min-w-0">
-                      <span className="block text-[13px] font-semibold text-foreground truncate">
-                        {getAgencyName(res)} · <span className="font-black">{res.queueNumber}</span>
-                      </span>
-                      <span className="block text-[10px] text-muted-foreground truncate">
-                        {getStatusLabel(res.status)} · #{res.position} · {getServiceName(res)}
-                      </span>
-                    </span>
-                    <ChevronDown className={`h-4 w-4 text-muted-foreground transition-transform flex-shrink-0 ${expanded ? 'rotate-180' : ''}`} />
-                  </button>
-                  <AnimatePresence initial={false}>
-                    {expanded && (
-                      <motion.div
-                        initial={{ opacity: 0, height: 0 }}
-                        animate={{ opacity: 1, height: 'auto' }}
-                        exit={{ opacity: 0, height: 0 }}
-                        transition={{ duration: 0.2 }}
-                        className="overflow-hidden"
-                      >
-                        <Card className="mt-2 overflow-hidden rounded-2xl shadow-sm border-border">
-                          <div className={`h-9 bg-gradient-to-r ${getStatusGradient(res.status)} flex items-center px-3.5 gap-2 text-white`}>
-                            <Badge variant="secondary" className="bg-white/20 text-white border-0 text-[10px] px-1.5 py-0 h-[18px] hover:bg-white/30">
-                              {getStatusLabel(res.status)}
-                            </Badge>
-                            <span className="text-xs font-medium truncate flex-1">{getAgencyName(res)}</span>
-                          </div>
-                          {renderTicketBody(res, false)}
-                        </Card>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </motion.div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* ── 8. Past tickets — collapsed disclosure (rate flow kept) ── */}
-      {(pastRes.length > 0 || reservations.length > 0) && (
-        <div className="mt-4">
+      {/* ── 5. Past tickets — collapsed disclosure (rate flow kept) ── */}
+      {reservations.length > 0 && (
+        <div className="mt-5">
           <button
             onClick={() => setShowPast(!showPast)}
-            className="w-full flex items-center gap-2.5 rounded-2xl border border-border bg-muted/40 dark:bg-gray-900/60 px-3.5 py-2.5 text-start hover:bg-muted/70 transition-colors"
+            className="w-full flex items-center gap-2.5 rounded-xl border border-border bg-muted/40 dark:bg-gray-900/60 px-3.5 py-2.5 text-start hover:bg-muted/70 transition-colors"
             aria-expanded={showPast}
           >
             <History className="h-4 w-4 text-muted-foreground flex-shrink-0" />
@@ -1562,146 +1048,64 @@ export function CustomerQueue() {
             <ChevronDown className={`h-4 w-4 text-muted-foreground transition-transform ${showPast ? 'rotate-180' : ''}`} />
           </button>
 
-          <AnimatePresence initial={false}>
-            {showPast && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                transition={{ duration: 0.2 }}
-                className="overflow-hidden"
-              >
-                <div className="mt-2 space-y-2">
-                  {pastRes.length === 0 ? (
-                    <p className="text-xs text-muted-foreground px-1 py-2">{t('noDataYet')}</p>
-                  ) : (
-                    pastRes.map((res) => (
-                      <div
-                        key={res.id}
-                        className="flex items-center gap-2.5 rounded-2xl border border-border bg-white dark:bg-gray-900/80 px-3.5 py-2.5"
-                      >
-                        <span className="h-8 w-8 rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center flex-shrink-0">
-                          <TicketCheck className="h-4 w-4 text-muted-foreground" />
-                        </span>
-                        <span className="flex-1 min-w-0">
-                          <span className="block text-[13px] font-semibold text-foreground truncate">
-                            {getAgencyName(res)} · {res.queueNumber}
-                          </span>
-                          <span className="block text-[10px] text-muted-foreground truncate">
-                            {getServiceName(res)}
-                            {res.reservedDate && (
-                              <> · {new Date(res.reservedDate + 'T00:00:00').toLocaleDateString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', { month: 'short', day: 'numeric' })}</>
-                            )}
-                          </span>
-                        </span>
-                        {feedbackSubmittedIds.has(res.id) || res.rating ? (
-                          <span className="flex items-center gap-0.5 flex-shrink-0">
-                            {[1, 2, 3, 4, 5].map((s) => (
-                              <Star key={s} className={`h-3 w-3 ${s <= (res.rating || 0) ? 'text-amber-400 fill-amber-400' : 'text-gray-300 dark:text-gray-600'}`} />
-                            ))}
-                          </span>
-                        ) : (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-8 text-[11px] gap-1 rounded-xl border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 flex-shrink-0"
-                            onClick={() => openRatingDialog(res.id)}
-                          >
-                            <Star className="h-3 w-3" />
-                            {t('rateExperience')}
-                          </Button>
-                        )}
-                      </div>
-                    ))
-                  )}
-
-                  {/* Full history lives in the dedicated history view */}
-                  <button
-                    onClick={() => setView('customer-history')}
-                    className="w-full flex items-center justify-center gap-1 rounded-2xl border border-dashed border-border px-3.5 py-2.5 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-colors"
+          {showPast && (
+            <div className="mt-2 space-y-2">
+              {pastRes.length === 0 ? (
+                <p className="text-xs text-muted-foreground px-1 py-2">{t('noDataYet')}</p>
+              ) : (
+                pastRes.map((res) => (
+                  <div
+                    key={res.id}
+                    className="flex items-center gap-2.5 rounded-xl border border-border bg-card px-3.5 py-2.5"
                   >
-                    {t('viewAllHistory')}
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+                    <span className="h-8 w-8 rounded-lg bg-gray-100 dark:bg-gray-800 flex items-center justify-center flex-shrink-0">
+                      <TicketCheck className="h-4 w-4 text-muted-foreground" />
+                    </span>
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-[13px] font-semibold text-foreground truncate">
+                        {getAgencyName(res)} · {res.queueNumber}
+                      </span>
+                      <span className="block text-[10px] text-muted-foreground truncate">
+                        {getServiceName(res)}
+                        {res.reservedDate && (
+                          <> · {new Date(res.reservedDate + 'T00:00:00').toLocaleDateString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', { month: 'short', day: 'numeric' })}</>
+                        )}
+                      </span>
+                    </span>
+                    {feedbackSubmittedIds.has(res.id) || res.rating ? (
+                      <span className="flex items-center gap-0.5 flex-shrink-0">
+                        {[1, 2, 3, 4, 5].map((s) => (
+                          <Star key={s} className={`h-3 w-3 ${s <= (res.rating || 0) ? 'text-amber-400 fill-amber-400' : 'text-gray-300 dark:text-gray-600'}`} />
+                        ))}
+                      </span>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8 text-[11px] gap-1 rounded-lg border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 flex-shrink-0"
+                        onClick={() => openRatingDialog(res.id)}
+                      >
+                        <Star className="h-3 w-3" />
+                        {t('rateExperience')}
+                      </Button>
+                    )}
+                  </div>
+                ))
+              )}
+
+              {/* Full history lives in the dedicated history view */}
+              <button
+                onClick={() => setView('customer-history')}
+                className="w-full flex items-center justify-center gap-1 rounded-xl border border-dashed border-border px-3.5 py-2.5 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-colors"
+              >
+                {t('viewAllHistory')}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
-      {/* ── 9. QR Pass Dialog ── */}
-      {qrReservation && (
-        <CustomerQrPass
-          open={qrDialogOpen}
-          onOpenChange={setQrDialogOpen}
-          reservationId={qrReservation.id}
-          displayNumber={qrReservation.queueNumber}
-          agencyName={qrReservation.agencyName}
-          agencyNameAr={qrReservation.agencyNameAr}
-          agencyNameFr={qrReservation.agencyNameFr}
-          serviceName={qrReservation.serviceName}
-          serviceNameAr={qrReservation.serviceNameAr}
-          serviceNameFr={qrReservation.serviceNameFr}
-          position={qrReservation.position}
-          status={qrReservation.status}
-        />
-      )}
-
-      {/* ── 10. Leave Queue Confirmation (SlideToConfirm) ── */}
-      <AlertDialog open={leaveDialogOpen} onOpenChange={setLeaveDialogOpen}>
-        <AlertDialogContent className="rounded-2xl">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="flex items-center gap-2 text-rose-600">
-              <XCircle className="h-5 w-5" />
-              {t('leaveQueueConfirm')}
-            </AlertDialogTitle>
-            <AlertDialogDescription asChild>
-              <div className="space-y-3">
-                <p className="text-sm text-muted-foreground">
-                  {t('leaveQueueWarning')}
-                </p>
-                {leaveTargetRes && (
-                  <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800/30">
-                    <p className="text-xs font-semibold text-rose-700 dark:text-rose-400 mb-1.5">{t('yourJourney')}:</p>
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-rose-400 flex-shrink-0" />
-                        {t('yourQueueNumber')}: <span className="font-bold">{leaveTargetRes.queueNumber}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-rose-400 flex-shrink-0" />
-                        {t('positionLabel')}: <span className="font-bold">#{leaveTargetRes.position}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-rose-400 flex-shrink-0" />
-                        {t('peopleAhead')}: <span className="font-bold">{leaveTargetRes.peopleAhead}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-rose-400 flex-shrink-0" />
-                        {t('estimatedWait')}: <span className="font-bold">{leaveTargetRes.estimatedWait} {t('minutes')}</span>
-                      </div>
-                    </div>
-                    <p className="text-[10px] text-rose-500/70 dark:text-rose-400/50 mt-2 italic">
-                      {t('leaveQueueIrreversible')}
-                    </p>
-                  </div>
-                )}
-              </div>
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter className="flex-col gap-3 sm:flex-row">
-            <AlertDialogCancel>{t('cancel')}</AlertDialogCancel>
-            <div className="flex-1">
-              <SlideToConfirm
-                onConfirm={handleLeaveQueue}
-                label={t('slideToLeave')}
-              />
-            </div>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      {/* ── 11. Cancel Reservation Confirmation ── */}
+      {/* ── 6. Cancel Reservation Confirmation ── */}
       <AlertDialog open={cancelDialogOpen} onOpenChange={setCancelDialogOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -1738,7 +1142,7 @@ export function CustomerQueue() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* ── 12. Postpone Turn Dialog ── */}
+      {/* ── 7. Postpone Turn Dialog ── */}
       <Dialog open={postponeDialogOpen} onOpenChange={setPostponeDialogOpen}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
@@ -1789,7 +1193,7 @@ export function CustomerQueue() {
         </DialogContent>
       </Dialog>
 
-      {/* ── 13. Rating Dialog (modular component) ── */}
+      {/* ── 8. Rating Dialog (modular component) ── */}
       <QueueRatingDialog
         open={ratingDialogOpen}
         onOpenChange={setRatingDialogOpen}
