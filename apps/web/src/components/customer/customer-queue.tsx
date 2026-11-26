@@ -180,7 +180,10 @@ export function CustomerQueue() {
       .filter(([, status]) => status === 'CALLED')
       .map(([id]) => id);
     try {
-      const res = await apiFetch(`/api/reservations/active?userId=${user.id}`);
+      // 0.6.126 — cacheTtl 0: the customer's live queue cards must move the
+      // moment a ticket is called/completed (realtime handlers refetch here);
+      // the 30s GET-cache fresh window was exactly the reported staleness.
+      const res = await apiFetch(`/api/reservations/active?userId=${user.id}`, { cacheTtl: 0 });
       if (res.ok) {
         const data = await res.json();
         const list = (data.reservations ?? []).map((r: Record<string, unknown>) => {

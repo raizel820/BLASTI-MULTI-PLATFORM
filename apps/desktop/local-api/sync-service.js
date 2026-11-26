@@ -836,6 +836,77 @@ async function _cloudPost(path, body, timeoutMs) {
   return response.json();
 }
 
+// ─── 0.6.126 — CLOUD TOMBSTONE PULL (offline-delete revocation backstop) ────
+// The realtime 'agency-device:revoked' push only reaches a CONNECTED desktop.
+// A manager can delete a device while the branch desktop is OFFLINE — the
+// desktop's mirror row then survived with the same canonical token and the
+// deleted kiosk kept heartbeating + issuing tickets device-to-device forever
+// (field fault: "the deleted devices from registered devices list still can
+// connect and access and create reservations normally"). On every socket
+// (re)connect the engine now PULLS the cloud blocklist and applies it: any
+// local row whose fingerprint is tombstoned in the cloud store is deleted
+// here too (commands wiped, row removed, local tombstone added so
+// discover-register can never mint it back).
+var _lastTombstonePullAt = 0;
+async function applyCloudTombstoneRevocations(force) {
+  var now = Date.now();
+  if (!force && now - _lastTombstonePullAt < 60 * 1000) return { applied: 0, skipped: 'throttled' };
+  _lastTombstonePullAt = now;
+  var db = _config && _config.localDb ? _config.localDb : null;
+  if (!db || !_authToken || !_config || !_config.cloudBaseUrl) return { applied: 0, skipped: 'not-ready' };
+  try {
+    var res = await fetch(_config.cloudBaseUrl + '/api/agency-devices/tombstones', {
+      headers: { 'Authorization': 'Bearer ' + _authToken, 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return { applied: 0, skipped: 'status-' + res.status };
+    var data = await res.json().catch(function() { return null; });
+    var tombstones = data && data.success && Array.isArray(data.tombstones) ? data.tombstones : [];
+    var applied = 0;
+    var tombstoneLib = require('./lib/device-tombstones');
+    for (var i = 0; i < tombstones.length; i++) {
+      var t = tombstones[i];
+      var fp = t && typeof t.fingerprint === 'string' ? t.fingerprint.trim() : '';
+      if (!fp) continue;
+      var rows = [];
+      try {
+        rows = await db.agencyDevice.findMany({ where: { deviceFingerprint: fp }, take: 5 });
+      } catch (rowErr) { rows = []; }
+      for (var r = 0; r < rows.length; r++) {
+        var row = rows[r];
+        try {
+          await db.deviceCommand.deleteMany({ where: { deviceId: row.id } });
+          await db.agencyDevice.delete({ where: { id: row.id } });
+          tombstoneLib.addDeviceTombstone(fp, {
+            name: row.name,
+            type: row.type,
+            ipAddress: row.ipAddress,
+            agencyId: row.agencyId,
+          });
+          try {
+            var lr = require('./local-realtime');
+            if (lr && typeof lr.broadcastLocalRealtime === 'function') {
+              lr.broadcastLocalRealtime('agency-device:disconnected', {
+                agencyId: row.agencyId || 'system',
+                deviceId: row.id,
+                deviceName: row.name,
+                deviceType: row.type,
+                reason: 'revoked-tombstone-pull',
+              });
+            }
+          } catch (_) { /* realtime optional */ }
+          console.log('[SyncService] tombstone-pull revoked local mirror device:', row.name || row.id);
+          applied += 1;
+        } catch (delErr) { /* row may already be gone — keep going */ }
+      }
+    }
+    if (applied > 0) console.log('[SyncService] tombstone-pull applied', applied, 'local revocation(s)');
+    return { applied: applied };
+  } catch (pullErr) {
+    return { applied: 0, skipped: 'error: ' + (pullErr && pullErr.message ? pullErr.message.slice(0, 120) : 'unknown') };
+  }
+}
+
 // ─── Backoff ──────────────────────────────────────────────────────────────────
 
 function _resetBackoff() { _backoffMs = 2000; _consecutiveFailures = 0; }
@@ -2543,6 +2614,12 @@ function _setupSocket() {
         });
         // Trigger a pull on (re)connect — catches changes missed while offline.
         _scheduleSocketPull(SOCKET_EVENT_DEBOUNCE_MS);
+        // 0.6.126 — offline-delete revocation: pull the cloud tombstone
+        // blocklist and delete matching local mirror rows (throttled to once
+        // per minute; the push event covers the connected case instantly).
+        applyCloudTombstoneRevocations(false).catch(function (tbErr) {
+          console.warn('[SyncService] tombstone pull failed (non-fatal):', tbErr && tbErr.message);
+        });
         // The connect itself is fresh reachability evidence — note it so the
         // push/pull fast paths skip their /api/health probe right after.
         _lastCloudOnline = true;
@@ -3538,6 +3615,8 @@ module.exports = {
   onSyncEvent: onSyncEvent,
   getConflicts: getConflicts,
   resolveConflict: resolveConflict,
+  // 0.6.126 — offline-delete revocation backstop (diagnostics + tests)
+  applyCloudTombstoneRevocations: function(force) { return applyCloudTombstoneRevocations(force); },
   // v2 additions
   onLocalMutation: onLocalMutation,
   setInitialCursor: setInitialCursor,

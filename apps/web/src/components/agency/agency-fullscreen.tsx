@@ -428,7 +428,8 @@ export function AgencyFullscreen() {
   const fetchCounters = useCallback(async () => {
     if (!agencyId) return;
     try {
-      const res = await apiFetch(`/api/agency/branches?agencyId=${encodeURIComponent(agencyId)}`);
+      // 0.6.126 — cacheTtl 0: the counter picker must reflect claims/leases instantly.
+      const res = await apiFetch(`/api/agency/branches?agencyId=${encodeURIComponent(agencyId)}`, { cacheTtl: 0 });
       if (!res.ok) return;
       const data = await res.json();
       // Task 45 root cause: apiClient's parseResponse auto-unwrap collapses
@@ -438,7 +439,7 @@ export function AgencyFullscreen() {
       const branchRows = unwrapListPayload<{ id: string; name: string }>(data, ['branches']);
       const allCounters: CounterOption[] = [];
       for (const branch of branchRows) {
-        const cRes = await apiFetch(`/api/agency/branches/${branch.id}/counters`);
+        const cRes = await apiFetch(`/api/agency/branches/${branch.id}/counters`, { cacheTtl: 0 });
         if (!cRes.ok) continue;
         const cData = await cRes.json();
         const list: Array<Record<string, unknown>> = unwrapListPayload(cData, ['counters', 'data']);
@@ -691,7 +692,11 @@ export function AgencyFullscreen() {
   const fetchQueue = useCallback(async () => {
     if (!agencyId) return;
     try {
-      const res = await apiFetch(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=WAITING,CALLED`);
+      // 0.6.126 — cacheTtl 0: the queue display must NEVER read the 30s GET
+      // cache. Realtime handlers + the 5s poll both land here; a cached hit
+      // meant the fullscreen only moved on the ~30s TTL cadence (field fault:
+      // "queue list in full screen mode not updating in Realtime").
+      const res = await apiFetch(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=WAITING,CALLED`, { cacheTtl: 0 });
       if (res.ok) {
         const data = await res.json();
         const rawEntries: QueueEntry[] = data.entries ?? data.reservations ?? [];
@@ -716,7 +721,8 @@ export function AgencyFullscreen() {
   const fetchStats = useCallback(async () => {
     if (!agencyId) return;
     try {
-      const res = await apiFetch(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`);
+      // 0.6.126 — cacheTtl 0 (see fetchQueue): live serving stats bypass the cache.
+      const res = await apiFetch(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`, { cacheTtl: 0 });
       if (res.ok) {
         const data = await res.json();
         setStats(data);
@@ -730,7 +736,7 @@ export function AgencyFullscreen() {
   const fetchServices = useCallback(async () => {
     if (!agencyId) return;
     try {
-      const res = await apiFetch(`/api/agency/services?agencyId=${encodeURIComponent(agencyId)}`);
+      const res = await apiFetch(`/api/agency/services?agencyId=${encodeURIComponent(agencyId)}`, { cacheTtl: 0 });
       if (res.ok) {
         const data = await res.json();
         setServices(data.services ?? []);

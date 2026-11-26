@@ -642,7 +642,9 @@ export function CustomerHome() {
             setActiveReservations(mapActiveReservations(cachedActive.data.reservations));
           }
         }
-        const res = await apiFetch(`/api/reservations/active?userId=${user.id}`);
+        // 0.6.126 — cacheTtl 0: the active-ticket strip is a live surface
+        // (called/next moves it) — never serve the 30s cached snapshot.
+        const res = await apiFetch(`/api/reservations/active?userId=${user.id}`, { cacheTtl: 0 });
         if (res.ok) {
           const data = await res.json();
           void cacheSet(activeKey, data);

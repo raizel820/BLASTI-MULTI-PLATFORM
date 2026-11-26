@@ -115,7 +115,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   const fetchMyCounter = useCallback(async () => {
     if (!agencyId || !user?.id) return;
     try {
-      const res = await apiFetch(`/api/agency/counters?agencyId=${encodeURIComponent(agencyId)}`);
+      const res = await apiFetch(`/api/agency/counters?agencyId=${encodeURIComponent(agencyId)}`, { cacheTtl: 0 });
       if (!res.ok) return;
       const data = await res.json();
       const rows = (data.counters ?? data.data ?? (Array.isArray(data) ? data : [])) as Array<Record<string, unknown>>;
@@ -324,9 +324,12 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
 
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
+      // 0.6.126 — cacheTtl 0: the serving dashboard must NEVER read the 30s
+      // GET cache. Realtime handlers + the 30s poll both land here; a cached
+      // hit meant called/next tickets only surfaced on the TTL cadence.
       const [statsRes, queueRes] = await Promise.all([
-        fetchWithRetry(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`),
-        fetchWithRetry(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=CALLED`),
+        fetchWithRetry(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`, { cacheTtl: 0 }),
+        fetchWithRetry(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=CALLED`, { cacheTtl: 0 }),
       ]);
 
       if (statsRes.ok) {

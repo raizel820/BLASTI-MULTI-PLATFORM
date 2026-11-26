@@ -36,6 +36,13 @@ export interface FetchWithRetryOptions {
   skipAuthCheck?: boolean;
   /** Credentials mode — passed to underlying fetch */
   credentials?: RequestCredentials;
+  /**
+   * cache-1 GET-cache TTL override (ms) — forwarded to apiFetch/apiClient.
+   * 0.6.126 — pass 0 for live surfaces (queue, stats, counters) that refetch
+   * on realtime events or fast polls: the default 30s fresh window served
+   * stale bytes to every event-driven refetch.
+   */
+  cacheTtl?: number;
 }
 
 // Track whether we've already triggered a session-expired redirect
@@ -282,6 +289,7 @@ export async function fetchWithRetry(
       body: fetchOptions.body ?? null,
       signal: fetchOptions.signal,
       credentials: fetchOptions.credentials,
+      ...(fetchOptions.cacheTtl !== undefined ? { cacheTtl: fetchOptions.cacheTtl } : {}),
     };
 
     try {

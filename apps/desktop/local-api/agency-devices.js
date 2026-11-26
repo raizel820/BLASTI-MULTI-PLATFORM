@@ -4487,21 +4487,51 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     const db = kioskLocalDb()
     if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
     try {
-      const device = await kioskDeviceAuth(db, c)
-      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      // 0.6.126 — BOOTSTRAP-TOLERANT AUTH (field log 2026-11-25/26: 112×
+      // "[LAN 401] POST /api/agency-devices/device/accept-pairing — Device
+      // not authenticated" — the manager's pairing request reached the
+      // device, the device accepted, and the DESKTOP still answered 401).
+      // Why: a FIRST-TIME device holds no token registered in THIS store
+      // (the offer's canonical token may be minted in a different store, or
+      // the row was re-paired and re-minted). The old gate resolved the
+      // caller by token ONLY, so the accept — the one request whose entire
+      // purpose is to ESTABLISH the token — failed forever.
+      // The bootstrap rule: a caller that presents the PAIRING_REQUEST
+      // command's own minted deviceToken IS the intended device — that
+      // token is a secret delivered exclusively inside the pairing offer.
+      // Body first (the auth fallback needs commandId), then token auth,
+      // then the command-payload token match.
       const body = await c.req.json().catch(() => ({}))
       const commandId = typeof body.commandId === 'string' ? body.commandId : ''
+      let device = await kioskDeviceAuth(db, c)
       let command = null
       let commandPayload = {}
-      if (commandId) {
+      if (!device && commandId) {
         command = await db.deviceCommand.findUnique({ where: { id: commandId } }).catch(() => null)
+        commandPayload = command ? parseJSON(command.payload) : {}
+        const header = c.req.header('authorization') || ''
+        const presented = header.startsWith('Bearer ') ? header.slice(7).trim()
+          : (c.req.header('x-device-token') || '').trim()
+        const minted = commandPayload && typeof commandPayload.deviceToken === 'string'
+          ? commandPayload.deviceToken
+          : ''
+        if (command && command.type === 'PAIRING_REQUEST' && command.status === 'PENDING'
+            && minted && presented && presented === minted) {
+          device = await db.agencyDevice.findUnique({ where: { id: command.deviceId } }).catch(() => null)
+        }
+      }
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
+      if (!command && commandId) {
+        command = await db.deviceCommand.findUnique({ where: { id: commandId } }).catch(() => null)
+        commandPayload = command ? parseJSON(command.payload) : {}
+      }
+      if (commandId) {
         if (!command || command.deviceId !== device.id || command.type !== 'PAIRING_REQUEST') {
           return c.json({ success: false, error: 'Pairing request not found' }, 404)
         }
         if (command.status !== 'PENDING') {
           return c.json({ success: false, error: 'Pairing request already processed' }, 409)
         }
-        commandPayload = parseJSON(command.payload)
       }
       const agencyId = (commandPayload && commandPayload.agencyId)
         || (typeof body.agencyId === 'string' ? body.agencyId : '')
@@ -4592,13 +4622,27 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   })
 
   // ─── 0.6.104-i — POST /device/reject-pairing (kiosk declines pairing) ─────
+  // 0.6.126 — bootstrap-tolerant auth, same rule as accept-pairing: the
+  // rejecting device may hold only the offer's minted token (not yet
+  // registered in THIS store), so resolve it through the command.
   app.post('/api/agency-devices/device/reject-pairing', async (c) => {
     const db = kioskLocalDb()
     if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
     try {
-      const device = await kioskDeviceAuth(db, c)
-      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
       const body = await c.req.json().catch(() => ({}))
+      let device = await kioskDeviceAuth(db, c)
+      if (!device && body && typeof body.commandId === 'string' && body.commandId) {
+        const cmd = await db.deviceCommand.findUnique({ where: { id: body.commandId } }).catch(() => null)
+        const payload = cmd ? parseJSON(cmd.payload) : {}
+        const header = c.req.header('authorization') || ''
+        const presented = header.startsWith('Bearer ') ? header.slice(7).trim()
+          : (c.req.header('x-device-token') || '').trim()
+        const minted = payload && typeof payload.deviceToken === 'string' ? payload.deviceToken : ''
+        if (cmd && cmd.type === 'PAIRING_REQUEST' && minted && presented && presented === minted) {
+          device = await db.agencyDevice.findUnique({ where: { id: cmd.deviceId } }).catch(() => null)
+        }
+      }
+      if (!device) return c.json({ success: false, error: 'Device not authenticated' }, 401)
       if (!body.commandId) return c.json({ success: false, error: 'commandId is required' }, 400)
       const result = await db.deviceCommand.updateMany({
         where: { id: body.commandId, deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING' },

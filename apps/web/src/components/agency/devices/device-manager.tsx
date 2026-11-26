@@ -416,7 +416,43 @@ export function DeviceManager() {
     ),
     [discoveredDevices, dismissedIds, unpairedKeys, registeredKeys],
   );
-  const hasDiscoveryContent = scanState.scanning || visibleDiscovered.length > 0 || unpairedDevices.length > 0;
+  // 0.6.126 — CROSS-SOURCE COLLAPSE: one card per physical app. A phone can
+  // be reported by the UDP beacon (fingerprint X) AND by an mDNS/TCP probe
+  // (fingerprint undefined) AND sit in the unpaired strip — three cards for
+  // one app. Collapse candidates by stable identity (fingerprint, then IP)
+  // keeping the RICHER card (BLASTI-announced > scan-probe). Field fault:
+  // "discovery still duplicate devices".
+  const collapsedDiscovered = useMemo(() => {
+    const byFp = new Map<string, RealDiscoveredDevice>();
+    const byIp = new Map<string, RealDiscoveredDevice>();
+    const blastiScore = (d: RealDiscoveredDevice) =>
+      (d.blastiMode ? 8 : 0) + (d.blastiInfo ? 4 : 0)
+      + (String(d.source || '').toLowerCase() === 'udp-beacon' ? 6 : 0)
+      + (d.fingerprint ? 2 : 0)
+      + (typeof d.confidence === 'number' ? d.confidence / 100 : 0);
+    const out: RealDiscoveredDevice[] = [];
+    for (const d of visibleDiscovered) {
+      const fp = (d.fingerprint || d.blastiInfo?.fingerprint || d.blastiInfo?.instanceId || '').toLowerCase();
+      const ipKey = d.ip && d.ip !== '127.0.0.1' ? d.ip.toLowerCase() : '';
+      const existingFp = fp ? byFp.get(fp) : undefined;
+      const existingIp = ipKey ? byIp.get(ipKey) : undefined;
+      const existing = existingFp || existingIp;
+      if (existing) {
+        // Keep the richer card; the loser disappears from the results.
+        if (blastiScore(d) > blastiScore(existing)) {
+          const idx = out.indexOf(existing);
+          if (idx >= 0) out[idx] = d;
+          if (existingFp && fp) byFp.set(fp, d);
+          if (existingIp && ipKey) byIp.set(ipKey, d);
+        }
+        continue;
+      }
+      out.push(d);
+      if (fp) byFp.set(fp, d);
+      if (ipKey) byIp.set(ipKey, d);
+    }
+    return out;
+  }, [visibleDiscovered]);
   // 0.6.124 — ROW SPLIT (field fault: "in LAN/Wi-Fi only mode the manager
   // discovers the phone running BLASTI but shows it in the SAME row as
   // printers"). The discovered grid mixed app cards and hardware cards in
@@ -425,19 +461,27 @@ export function DeviceManager() {
   // kiosk shell or desktop app running BLASTI) render in their OWN labeled
   // row ABOVE the hardware row (printers/TVs/peripherals) — matching the
   // cloud-mode layout where the kiosk appears in the upper strip.
+  // 0.6.126 — a PHONE is never hardware: an mDNS/TCP-discovered phone
+  // (category NETWORK, no beacon heard on a cross-subnet LAN) landed in the
+  // hardware row under printers. Types PHONE/APP/KIOSK always go to the app
+  // row; only printers/TVs/displays stay hardware.
   const isBlastiAppCard = useCallback((d: RealDiscoveredDevice) => {
     const cat = String(d.category || '').toUpperCase();
     const type = String(d.type || '').toUpperCase();
     const src = String(d.source || '').toLowerCase();
+    const sharedType = String(d.deviceTypeShared || '').toUpperCase();
     const appish = cat === 'BLASTI' || !!d.blastiMode || !!d.blastiInfo
+      || type === 'PHONE' || type === 'APP' || type === 'KIOSK'
+      || sharedType === 'PHONE' || sharedType === 'KIOSK'
       || src === 'udp-beacon' || src === 'live-beacon' || src === 'database';
     // Registry printer rows (cloud BLASTI_PRINTER cards) and TV/display rows
     // stay in the HARDWARE row — only phones/kiosks/PC-apps go up top.
     const hardwareType = type === 'PRINTER' || type === 'BLASTI_PRINTER' || type === 'TV' || type === 'DISPLAY';
     return appish && !hardwareType;
   }, []);
-  const discoveredBlastiApps = useMemo(() => visibleDiscovered.filter(isBlastiAppCard), [visibleDiscovered, isBlastiAppCard]);
-  const discoveredHardware = useMemo(() => visibleDiscovered.filter((d) => !isBlastiAppCard(d)), [visibleDiscovered, isBlastiAppCard]);
+  const discoveredBlastiApps = useMemo(() => collapsedDiscovered.filter(isBlastiAppCard), [collapsedDiscovered, isBlastiAppCard]);
+  const discoveredHardware = useMemo(() => collapsedDiscovered.filter((d) => !isBlastiAppCard(d)), [collapsedDiscovered, isBlastiAppCard]);
+  const hasDiscoveryContent = scanState.scanning || collapsedDiscovered.length > 0 || unpairedDevices.length > 0;
 
   const filteredDevices = useMemo(() => {
     switch (filter) {
@@ -859,6 +903,11 @@ export function DeviceManager() {
   // Accept/Reject cards, a PC pops a native dialog / lands in the master's
   // approval queue). This button only DELIVERS the request.
   const [pairRequestedIds, setPairRequestedIds] = useState<Set<string>>(new Set());
+  // 0.6.126 — the DELIVERY PROTOCOL per card id ('d2d' | 'lan' | 'cloud' | combined):
+  // user requirement "in discovery result and devices card add used protocol
+  // and whether its cloud or LAN/WIFI request and connection" — the chip on
+  // the card shows HOW the pairing request actually reached the device.
+  const [pairDeliveryById, setPairDeliveryById] = useState<Record<string, string>>({});
   const handlePairByIdentity = async (device: RealDiscoveredDevice) => {
     setBusyDeviceId(device.id);
     try {
@@ -886,6 +935,14 @@ export function DeviceManager() {
       const data = await res.json().catch(() => null);
       if (data?.success) {
         setPairRequestedIds((prev) => new Set(prev).add(device.id));
+        // 0.6.126 — remember the delivery protocol for the card badge.
+        {
+          const viaUdp = Boolean(data.delivery?.udpOffer);
+          const viaLan = Boolean(data.delivery?.lanOffer);
+          const viaCloud = Boolean(data.delivery?.cloudRelay);
+          const parts = [viaUdp ? 'device-to-device (UDP)' : null, viaLan ? 'LAN/WiFi (HTTP)' : null, viaCloud ? 'Cloud relay' : null].filter(Boolean);
+          setPairDeliveryById((prev) => ({ ...prev, [device.id]: parts.length > 0 ? parts.join(' + ') : 'sent' }));
+        }
         if (data.autoConnected) {
           toast.success(getLocalizedString(
             `تم الاتصال التلقائي بـ ${device.name}`,
@@ -1555,12 +1612,28 @@ export function DeviceManager() {
                         }`}>
                           {blocked ? <ShieldX className="h-4 w-4 text-red-500" /> : <StatusDot status="PAIRING" />}
                           <div className="min-w-0">
-                            <p className="text-sm font-medium truncate max-w-40">{getLocalizedName(d, lang)}</p>
-                            <p className="text-[11px] text-muted-foreground" dir="ltr">
-                              {blocked
-                                ? getLocalizedString('محذوف — إعادة التسجيل محظورة', 'Supprimé — réenregistrement bloqué', 'Removed — re-registration blocked', lang)
-                                : (d.ipAddress || d.deviceFingerprint?.slice(0, 12) || '—')}
-                            </p>
+                            {/* 0.6.126 — full device name (break-words, no more
+                                max-w-40 collapse for multi-word names). */}
+                            <p className="break-words text-sm font-medium leading-snug max-w-56" title={getLocalizedName(d, lang)}>{getLocalizedName(d, lang)}</p>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <p className="text-[11px] text-muted-foreground" dir="ltr">
+                                {blocked
+                                  ? getLocalizedString('محذوف — إعادة التسجيل محظورة', 'Supprimé — réenregistrement bloqué', 'Removed — re-registration blocked', lang)
+                                  : (d.ipAddress || d.deviceFingerprint?.slice(0, 12) || '—')}
+                              </p>
+                              {/* 0.6.126 — PROTOCOL chip: this strip row lives on
+                                  the LOCAL store (LAN) or was merged from the
+                                  CLOUD registry (cloudDevice rows). */}
+                              <span className={`rounded-full px-1.5 py-px text-[9px] font-medium ${
+                                d.cloudDevice
+                                  ? 'bg-amber-100 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400'
+                                  : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                              }`}>
+                                {d.cloudDevice
+                                  ? getLocalizedString('سحابة', 'Cloud', 'Cloud', lang)
+                                  : getLocalizedString('شبكة محلية', 'LAN/WiFi', 'LAN/WiFi', lang)}
+                              </span>
+                            </div>
                           </div>
                           {blocked ? (
                             <Button
@@ -1592,7 +1665,7 @@ export function DeviceManager() {
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                      {getLocalizedString('مكتشف على الشبكة', 'Découverts sur le réseau', 'Discovered on the network', lang)} ({visibleDiscovered.length})
+                      {getLocalizedString('مكتشف على الشبكة', 'Découverts sur le réseau', 'Discovered on the network', lang)} ({collapsedDiscovered.length})
                     </p>
                     {/* 0.6.119 — TV cast screen template: the design the cast
                         opens and the registered TV row stores. */}
@@ -1639,6 +1712,7 @@ export function DeviceManager() {
                             onCast={() => handleCastTv(d)}
                             onPair={() => handlePairByIdentity(d)}
                             pairRequested={pairRequestedIds.has(d.id)}
+                            pairDelivery={pairDeliveryById[d.id]}
                             onSavePrinter={() => handleSavePrinter(d)}
                             onSavePrinterAsDevice={() => handleSavePrinterAsDevice(d)}
                             onRegisterPeripheral={() => handleRegisterPeripheral(d)}
@@ -1675,6 +1749,7 @@ export function DeviceManager() {
                             onCast={() => handleCastTv(d)}
                             onPair={() => handlePairByIdentity(d)}
                             pairRequested={pairRequestedIds.has(d.id)}
+                            pairDelivery={pairDeliveryById[d.id]}
                             onSavePrinter={() => handleSavePrinter(d)}
                             onSavePrinterAsDevice={() => handleSavePrinterAsDevice(d)}
                             onRegisterPeripheral={() => handleRegisterPeripheral(d)}
@@ -2005,6 +2080,30 @@ function ManagerDeviceCard({
               <StatusDot status={device.status} />
               {getLocalizedLabel(statusCfg, lang)}
             </Badge>
+            {/* 0.6.126 — PROTOCOL BADGE (user requirement): whether this
+                registered device connects over the LAN/WiFi (device-to-device
+                against the branch desktop) or via the Cloud API server. */}
+            {(() => {
+              const ct = String(device.connectionType || '').toUpperCase();
+              const isLan = ct === 'LAN' || ct === 'WIFI';
+              return (
+                <span
+                  className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 ${
+                    isLan
+                      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                      : 'bg-amber-100 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400'
+                  }`}
+                  title={isLan
+                    ? getLocalizedString('جهاز إلى جهاز عبر الشبكة المحلية', 'Appareil à appareil via le réseau local', 'Device-to-device over the LAN/WiFi', lang)
+                    : getLocalizedString('عبر خادم السحابة', 'Via le serveur cloud', 'Via the Cloud API server', lang)}
+                >
+                  {isLan ? <Wifi className="h-3 w-3" /> : <Cloud className="h-3 w-3" />}
+                  {isLan
+                    ? getLocalizedString('شبكة محلية', 'LAN/WiFi', 'LAN/WiFi', lang)
+                    : getLocalizedString('سحابة', 'Cloud', 'Cloud', lang)}
+                </span>
+              );
+            })()}
             {device.ipAddress && (
               <span className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 font-mono" dir="ltr">
                 {device.connectionType === 'WIFI' ? <Wifi className="h-3 w-3" /> : <Cable className="h-3 w-3" />}
@@ -2125,7 +2224,7 @@ function DiscoveredTypeIcon({ device }: { device: RealDiscoveredDevice }) {
 
 function DiscoveredCard({
   device, lang, busy, tvSaved, isDefaultPrinter,
-  connecting, connectVerified, printingTest, pairRequested,
+  connecting, connectVerified, printingTest, pairRequested, pairDelivery,
   registeredPeripheral, savedAsDevice,
   onSaveTv, onCast, onPair, onSavePrinter, onSavePrinterAsDevice, onRegisterPeripheral, onTestPrinter, onPrintTest, onConnect, onDismiss,
 }: {
@@ -2139,6 +2238,8 @@ function DiscoveredCard({
   printingTest: boolean;
   /** 0.6.96 — pairing request already sent from this card. */
   pairRequested?: boolean;
+  /** 0.6.126 — the protocol the pairing request actually used (card badge). */
+  pairDelivery?: string;
   /** 0.6.100 — this USB peripheral printer is already registered. */
   registeredPeripheral?: boolean;
   /** 0.6.105 — this printer already exists as a registered PRINTER device. */
@@ -2174,15 +2275,35 @@ function DiscoveredCard({
   const typeCfg = device.type !== 'UNKNOWN' ? DEVICE_TYPE_CONFIG[device.type as keyof typeof DEVICE_TYPE_CONFIG] : null;
   const confidence = typeof device.confidence === 'number' ? device.confidence : undefined;
   const isBlasti = device.category === 'BLASTI';
+  // 0.6.126 — PROTOCOL BADGE (user requirement: "in discovery result and
+  // devices card add used protocol and whether its cloud or LAN/WIFI request
+  // and connection"). A scan card was reached over the LOCAL NETWORK — the
+  // transport protocol rides the source; the badge always names LAN/WiFi.
+  const protocol = 'LAN/WiFi';
+  const protocolDetail = (() => {
+    const src = String(device.source || '').toLowerCase();
+    if (src === 'udp-beacon' || src === 'live-beacon') return 'UDP beacon';
+    if (src.startsWith('mdns')) return 'mDNS';
+    if (src === 'ssdp' || src === 'upnp') return 'SSDP/UPnP';
+    if (src === 'ws-discovery') return 'WS-Discovery';
+    if (src === 'tcp-sweep' || src === 'tcp') return 'TCP probe';
+    if (src === 'ping' || src === 'arp') return 'ICMP/ARP';
+    if (src === 'peripheral-report') return 'USB (via host)';
+    return undefined;
+  })();
 
   return (
-    <div className={`flex items-center gap-2.5 rounded-xl border bg-background px-3 py-2.5 ${isBlasti ? 'border-emerald-300/60 dark:border-emerald-900/50' : ''}`}>
+    // 0.6.126 — flex-wrap + min-w-0 + break-words: a multi-word device name
+    // ("Canon G2010 series", "Xiaomi Redmi Note 13 Pro") squeezed the action
+    // buttons to a sliver and collapsed the card. The middle block now keeps
+    // a floor width and the name wraps instead of truncating to nothing.
+    <div className={`flex flex-wrap items-center gap-x-2.5 gap-y-2 rounded-xl border bg-background px-3 py-2.5 ${isBlasti ? 'border-emerald-300/60 dark:border-emerald-900/50' : ''}`}>
       <div className={`p-2 rounded-lg shrink-0 ${typeCfg?.color ?? sourceCfg?.color ?? 'bg-muted'}`}>
         <DiscoveredTypeIcon device={device} />
       </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5 min-w-0">
-          <p className="truncate text-sm font-medium">{device.name}</p>
+      <div className="flex-1 basis-48">
+        <div className="flex items-start gap-1.5 min-w-0">
+          <p className="break-words text-sm font-medium leading-snug" title={device.name}>{device.name}</p>
           {device.cached && device.status !== 'ONLINE' && (
             <span className="shrink-0 rounded-full bg-muted px-1.5 py-px text-[9px] text-muted-foreground">
               {getLocalizedString('سابق', 'cache', 'cached', lang)}
@@ -2236,6 +2357,16 @@ function DiscoveredCard({
           {device.platform && (
             <span className="rounded-full bg-muted px-1.5 py-px text-[9px] uppercase" dir="ltr">
               {device.platform}
+            </span>
+          )}
+          {/* 0.6.126 — PROTOCOL + TRANSPORT chip: how this card was reached and
+              over which network family (LAN/WiFi vs Cloud). */}
+          <span className="rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400 px-1.5 py-px text-[9px] font-medium">
+            {getLocalizedString('شبكة محلية', 'Réseau local', protocol, lang)}{protocolDetail ? ` · ${protocolDetail}` : ''}
+          </span>
+          {pairRequested && pairDelivery && (
+            <span className="rounded-full bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400 px-1.5 py-px text-[9px]" dir="ltr" title={pairDelivery}>
+              {getLocalizedString('عبر', 'via', 'via', lang)} {pairDelivery}
             </span>
           )}
           {/* 0.6.100 — CASCADE PERIPHERAL chip: this printer hangs off another PC */}

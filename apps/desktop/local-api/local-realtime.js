@@ -654,6 +654,17 @@ function setCloudPrintJobHandler(fn) {
   _cloudPrintJobHandler = typeof fn === 'function' ? fn : null
 }
 
+// 0.6.126 — CLOUD DEVICE REVOCATION. A device deleted/unpaired in the CLOUD
+// registry must die on the LAN too: the desktop keeps a MIRROR row with the
+// same canonical device token, and without this handler the deleted kiosk
+// kept heartbeating to the desktop and issuing tickets forever. The handler
+// (registered from index.js, where the Prisma client lives) deletes the
+// mirror row + tombstones the fingerprint BEFORE the event relays to the UI.
+let _cloudDeviceRevocationHandler = null
+function setCloudDeviceRevocationHandler(fn) {
+  _cloudDeviceRevocationHandler = typeof fn === 'function' ? fn : null
+}
+
 /**
  * Relay one event received on the SYNC ENGINE's cloud socket into the local
  * rooms. The cloud already routed the event to the agency room the engine
@@ -696,6 +707,14 @@ function relayCloudRealtime(eventName, args) {
   if (eventName === 'agency-device:print-job' && typeof _cloudPrintJobHandler === 'function') {
     try { _cloudPrintJobHandler(event) } catch (printErr) {
       warn('cloud print-job relay failed:', printErr && printErr.message)
+    }
+  }
+
+  // 0.6.126 — CLOUD DEVICE REVOCATION (before the relay: the UI refetch the
+  // relay triggers must already see the mirror row gone).
+  if (eventName === 'agency-device:revoked' && typeof _cloudDeviceRevocationHandler === 'function') {
+    try { _cloudDeviceRevocationHandler(event) } catch (revErr) {
+      warn('cloud device-revocation failed:', revErr && revErr.message)
     }
   }
 
@@ -743,6 +762,8 @@ module.exports = {
   setCloudWalkInMirror,
   // 0.6.105 — background receipt printing on the printer-host PC
   setCloudPrintJobHandler,
+  // 0.6.126 — deleted/unpaired-in-cloud devices die on the LAN mirror too
+  setCloudDeviceRevocationHandler,
   relayCloudRealtime,
   getLocalRealtimeStats,
   // 0.6.101 — pre-pairing delivery rooms (join sanitation + tests)

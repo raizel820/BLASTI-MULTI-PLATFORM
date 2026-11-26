@@ -1834,12 +1834,36 @@ app.get('/device/config', async (c) => {
 
 app.post('/device/accept-pairing', async (c) => {
   try {
-    const device = await requireDeviceAuth(c)
+    // 0.6.126 — BOOTSTRAP-TOLERANT AUTH (mirrors the desktop local API fix):
+    // 112× field 401s showed a first-time device CAN fail token-only auth on
+    // the one request whose purpose is to establish the token. A caller that
+    // presents the PAIRING_REQUEST command's own minted deviceToken (a
+    // secret delivered exclusively inside the pairing offer) IS the intended
+    // device — resolve it through the command when token lookup misses.
+    let device = await requireDeviceAuth(c)
+    const body = await c.req.json().catch(() => ({})) as { commandId?: string; agencyId?: string; branchId?: string }
+    if (!device && body.commandId) {
+      const cmd = await db.deviceCommand.findUnique({ where: { id: body.commandId } }).catch(() => null)
+      let minted = ''
+      if (cmd && cmd.type === 'PAIRING_REQUEST' && cmd.status === 'PENDING') {
+        try {
+          const payload = JSON.parse(cmd.payload || '{}') as { deviceToken?: string }
+          if (typeof payload.deviceToken === 'string') minted = payload.deviceToken
+        } catch { /* payload parse — stay unauthenticated */ }
+      }
+      const authHeader = c.req.header('Authorization') || ''
+      const presented = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : ''
+      if (cmd && minted && presented && presented === minted) {
+        device = await db.agencyDevice.findUnique({
+          where: { id: cmd.deviceId },
+          include: DEVICE_INCLUDE,
+        })
+      }
+    }
     if (!device) {
       return c.json({ success: false, error: 'Device not authenticated' }, 401)
     }
 
-    const body = await c.req.json().catch(() => ({}))
     const { commandId, agencyId, branchId } = body as { commandId?: string; agencyId?: string; branchId?: string }
 
     if (!agencyId) {
@@ -2910,6 +2934,19 @@ app.delete('/:id', async (c) => {
 
     // Emit realtime event
     emitAgencyDeviceEvent('agency-device:disconnected', existing.agencyId || 'system', { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type })
+    // 0.6.126 — REVOCATION PROPAGATION: the branch desktop mirrors this device
+    // in its OWN local store (same canonical token). Without an explicit
+    // revocation push the deleted kiosk kept working device-to-device against
+    // the desktop forever — the desktop relay (local-realtime) deletes the
+    // mirror row + tombstones the fingerprint when this event lands.
+    emitAgencyDeviceEvent('agency-device:revoked', existing.agencyId || 'system', {
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      deviceFingerprint: existing.deviceFingerprint || undefined,
+      ipAddress: existing.ipAddress || undefined,
+      reason: 'deleted',
+    })
 
     return c.json({ success: true, tombstoned: !!existing.deviceFingerprint })
   } catch (error: unknown) {
@@ -2947,6 +2984,18 @@ app.post('/delete-by-fingerprint', async (c) => {
     }
     if (rows[0]) {
       emitAgencyDeviceEvent('agency-device:disconnected', rows[0].agencyId || 'system', { deviceId: rows[0].id, deviceName: rows[0].name, deviceType: rows[0].type })
+      // 0.6.126 — REVOCATION PROPAGATION (see DELETE /:id): the deleting side
+      // is usually the desktop itself, but the cloud row can also exist
+      // independently (cloud-registered kiosk) — push the revocation so the
+      // desktop's mirror dies with it.
+      emitAgencyDeviceEvent('agency-device:revoked', rows[0].agencyId || 'system', {
+        deviceId: rows[0].id,
+        deviceName: rows[0].name,
+        deviceType: rows[0].type,
+        deviceFingerprint: fingerprint,
+        ipAddress: rows[0].ipAddress || undefined,
+        reason: 'deleted-by-fingerprint',
+      })
     }
     return c.json({ success: true, deleted, tombstoned: true })
   } catch (error: unknown) {
@@ -2971,6 +3020,26 @@ app.post('/tombstones/clear', async (c) => {
     }
     const cleared = await clearDeviceTombstone(fingerprint)
     return c.json({ success: true, cleared })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── GET /tombstones — cloud blocklist → branch desktop pull (0.6.126) ────
+// The realtime 'agency-device:revoked' push only reaches a CONNECTED desktop.
+// When the branch was offline at delete time, its mirror row survived and
+// the deleted kiosk kept working device-to-device. The desktop now PULLS
+// this list on every (re)connect of its sync socket and applies it locally —
+// the offline-delete hole closes with the same data the push used.
+app.get('/tombstones', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const all = await listDeviceTombstones()
+    // Agency scoping mirrors /tombstones/sync: unscoped entries are global
+    // (an agency-less device row), agency-scoped entries only go home.
+    const visible = all.filter((t) => !t.agencyId || !user.agencyId || t.agencyId === user.agencyId)
+    return c.json({ success: true, tombstones: visible })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -3224,6 +3293,16 @@ app.post('/:id/unpair', async (c) => {
       deviceId: existing.id,
       deviceName: existing.name,
       deviceType: existing.type,
+      reason: 'unpaired',
+    })
+    // 0.6.126 — REVOCATION PROPAGATION: the branch desktop's mirror row keeps
+    // the same canonical token — it must detach its copy too (see DELETE /:id).
+    emitAgencyDeviceEvent('agency-device:revoked', user.agencyId, {
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      deviceFingerprint: existing.deviceFingerprint || undefined,
+      ipAddress: existing.ipAddress || undefined,
       reason: 'unpaired',
     })
 

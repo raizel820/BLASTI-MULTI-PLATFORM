@@ -14407,6 +14407,66 @@ async function startLocalApi(dbPath, port, options) {
         } catch { /* log only */ }
       }
     })
+
+    // 0.6.126 — CLOUD DEVICE REVOCATION: a device deleted or unpaired in the
+    // CLOUD registry must lose access on the LAN too. The desktop keeps a
+    // MIRROR row with the SAME canonical token; without this handler the
+    // deleted kiosk kept heartbeating to the desktop and issuing tickets
+    // forever (field fault: "the deleted devices from registered devices list
+    // still can connect and access and create reservations normally"). The
+    // mirror row is deleted (commands wiped), the fingerprint tombstoned (a
+    // discover-register can never mint it again), and the manager UI is told
+    // instantly. The kiosk's next heartbeat 401s → it clears its credentials
+    // and returns to the waiting-for-pairing state.
+    localRealtime.setCloudDeviceRevocationHandler(async (event) => {
+      try {
+        if (!db || !event || typeof event !== 'object') return
+        const fingerprint = typeof event.deviceFingerprint === 'string' && event.deviceFingerprint ? event.deviceFingerprint : ''
+        const revokedId = typeof event.deviceId === 'string' && event.deviceId ? event.deviceId : ''
+        const revokedIp = typeof event.ipAddress === 'string' && event.ipAddress ? event.ipAddress : ''
+        const deviceName = typeof event.deviceName === 'string' ? event.deviceName : (revokedId || 'device')
+        const deviceType = typeof event.deviceType === 'string' ? event.deviceType : undefined
+        const reason = typeof event.reason === 'string' ? event.reason : 'revoked-in-cloud'
+        // Match the mirror row: the cloud row's id NEVER equals the local id,
+        // so the fingerprint is the primary key; token/ip/name are fallbacks.
+        let row = null
+        if (fingerprint) {
+          row = await db.agencyDevice.findFirst({ where: { deviceFingerprint: fingerprint } }).catch(() => null)
+        }
+        if (!row && revokedIp) {
+          row = await db.agencyDevice.findFirst({ where: { ipAddress: revokedIp, status: { not: 'DISABLED' } } }).catch(() => null)
+        }
+        if (!row) return // no local mirror — nothing to revoke here
+        const revokedAgencyId = row.agencyId || 'system'
+        await db.deviceCommand.deleteMany({ where: { deviceId: row.id } }).catch(() => null)
+        await db.agencyDevice.delete({ where: { id: row.id } }).catch(() => null)
+        if (fingerprint) {
+          try {
+            require('./lib/device-tombstones').addDeviceTombstone(fingerprint, {
+              name: row.name,
+              type: row.type,
+              ipAddress: row.ipAddress,
+              agencyId: row.agencyId,
+            })
+          } catch { /* tombstone best-effort */ }
+        }
+        localRealtime.broadcastLocalRealtime('agency-device:disconnected', {
+          agencyId: revokedAgencyId,
+          deviceId: revokedId,
+          deviceName: row.name || deviceName,
+          deviceType: deviceType || row.type,
+          reason: 'revoked-' + reason,
+        })
+        try {
+          require('./lib/device-event').deviceEvent('revoke_applied',
+            `Device revoked in the cloud — local mirror deleted: ${row.name || row.id}`,
+            { deviceId: row.id, deviceName: row.name || deviceName, deviceType: deviceType || row.type, agencyId: revokedAgencyId, status: 'REVOKED', reason })
+        } catch { /* log only */ }
+        if (diagLog) diagLog('AGENCY-DEVICE cloud revocation applied to local mirror: ' + (row.name || row.id))
+      } catch (revApplyErr) {
+        console.warn('[LocalAPI] cloud device-revocation handler failed (non-fatal):', revApplyErr && revApplyErr.message)
+      }
+    })
   } catch (rtErr) {
     console.warn('[LocalAPI] Local realtime init failed (non-fatal — interval sync unaffected):', rtErr.message)
   }

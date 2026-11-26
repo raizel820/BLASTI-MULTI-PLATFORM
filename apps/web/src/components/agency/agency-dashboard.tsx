@@ -384,9 +384,9 @@ export function AgencyDashboard() {
       // Use allSettled so a single section failure (e.g. analytics timeout)
       // never kills the entire dashboard — each section is independent.
       const results = await Promise.allSettled([
-        fetchWithRetry(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`, { maxRetries: 0 }),
-        fetchWithRetry(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=WAITING,CALLED`, { maxRetries: 0 }),
-        fetchWithRetry(`/api/agency/services?agencyId=${encodeURIComponent(agencyId)}`, { maxRetries: 0 }),
+        fetchWithRetry(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`, { maxRetries: 0, cacheTtl: 0 }),
+        fetchWithRetry(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=WAITING,CALLED`, { maxRetries: 0, cacheTtl: 0 }),
+        fetchWithRetry(`/api/agency/services?agencyId=${encodeURIComponent(agencyId)}`, { maxRetries: 0, cacheTtl: 0 }),
       ]);
 
       // Extract responses; rejected promises yield null

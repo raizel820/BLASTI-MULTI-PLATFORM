@@ -67,6 +67,15 @@ export async function apiFetch(
      * accurate error body never arrives.
      */
     timeout?: number;
+    /**
+     * cache-1 GET-cache TTL override (ms) — forwarded to apiClient.
+     * 0.6.126 — REALTIME FIX: live surfaces (queue list, fullscreen display,
+     * stats, counters) that refetch in response to realtime events or fast
+     * polls MUST pass 0 — the default 30s fresh window served STALE bytes to
+     * every realtime-triggered refetch, so the UI only moved every ~30s even
+     * though events fired instantly.
+     */
+    cacheTtl?: number;
   },
 ): Promise<ApiFetchResponse> {
   const method = (options?.method || 'GET').toUpperCase();
@@ -102,6 +111,7 @@ export async function apiFetch(
   const requestOptions = {
     ...(options?.signal ? { signal: options.signal } : {}),
     ...(options?.timeout ? { timeout: options.timeout } : {}),
+    ...(options?.cacheTtl !== undefined ? { cacheTtl: options.cacheTtl } : {}),
   };
 
   // 0.6.55 — "too many requests" observability: every 429 that reaches the

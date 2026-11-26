@@ -28,6 +28,7 @@ import { APP_VERSION } from '@/lib/version';
 // 0.6.106 — the same beacon lifecycle now also RECEIVES device-to-device
 // pairing offers (desktop → this device, UDP :3082, no cloud hop).
 import { startPairingBeacon, stopPairingBeacon, onLanPairingOffer, type LanPairingOffer } from '@/lib/pairing-beacon';
+import { getNativeDeviceName } from '@/lib/device-display-name';
 import { getLocalIp } from '@/lib/get-local-ip';
 import { flushLogsNow, logDevice, logQueue } from '@/lib/remote-logger';
 import type { ApiFetchResponse } from '@/lib/api-fetch';
@@ -193,6 +194,17 @@ export function DeviceKiosk() {
   const [deviceToken, setDeviceToken] = useState(() => loadDeviceToken());
   const [deviceId, setDeviceId] = useState(() => loadDeviceId());
   const [isDeviceRegistered, setIsDeviceRegistered] = useState(false);
+  // 0.6.126 — the REAL device name (owner-renamed → brand default) announced
+  // on the beacon + discover-register so the manager's cards show which
+  // physical device is waiting.
+  const kioskDeviceNameRef = useRef<string>('');
+  const [kioskDeviceName, setKioskDeviceName] = useState<string>('');
+  useEffect(() => {
+    getNativeDeviceName('BLASTI App').then((resolved) => {
+      kioskDeviceNameRef.current = resolved;
+      setKioskDeviceName(resolved);
+    }).catch(() => { /* fallback stays */ });
+  }, []);
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const agencyCodeRef = useRef(agencyCode);
   useEffect(() => { agencyCodeRef.current = agencyCode; }, [agencyCode]);
@@ -766,7 +778,7 @@ export function DeviceKiosk() {
           const regRes = await apiFetch('/api/agency-devices/public/register', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ agencyCode: code.trim(), deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
+            body: JSON.stringify({ agencyCode: code.trim(), deviceName: kioskDeviceNameRef.current || 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
           });
           // 0.6.119 — 409 = the manager deleted this device: drop the saved
           // branch code so the kiosk stops silently re-registering ghosts on
@@ -857,7 +869,9 @@ export function DeviceKiosk() {
       discoveryStatus !== 'verifying';
     if (!announcing) return;
     void startPairingBeacon({
-      name: 'BLASTI App',
+      // 0.6.126 — the REAL device name (owner-renamed → brand default) so
+      // the manager sees WHICH device is announcing, not 'BLASTI App'.
+      name: kioskDeviceNameRef.current || 'BLASTI App',
       uid: getStableKioskFingerprint(),
       status: 'ready-for-pairing',
       // 0.6.102 — audit fix: the kiosk beacon never carried its surface, so
@@ -867,7 +881,7 @@ export function DeviceKiosk() {
       mode: 'kiosk',
     });
     return () => { void stopPairingBeacon(); };
-  }, [step, discoveryStatus]);
+  }, [step, discoveryStatus, kioskDeviceName]);
 
 
   // Auto-fetch agency on mount if code was saved
@@ -1328,7 +1342,9 @@ export function DeviceKiosk() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal,
-      body: JSON.stringify({ deviceName: 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
+      // 0.6.126 — the REAL device name rides the register call so the
+      // manager's strip + pairing cards show which device is waiting.
+      body: JSON.stringify({ deviceName: kioskDeviceNameRef.current || 'BLASTI Kiosk', deviceType: 'KIOSK', connectionType: lanServer ? 'LAN' : 'WIFI', deviceFingerprint: getStableKioskFingerprint() }),
     });
   }, [lanServer]);
 
@@ -1666,7 +1682,10 @@ export function DeviceKiosk() {
           const directRes = await fetch(`${base}/api/agency-devices/device/accept-pairing`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${offerToken}` },
-            body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+            // 0.6.126 — fingerprint rides the accept so the desktop can match
+            // the offer's device row even when token lookup misses (bootstrap
+            // auth path) and the log vault can correlate the pair.
+            body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId, fingerprint: getStableKioskFingerprint() }),
             signal: ctl.signal,
           });
           clearTimeout(timer);
@@ -1692,7 +1711,7 @@ export function DeviceKiosk() {
         const res = await apiFetch('/api/agency-devices/device/accept-pairing', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${offerToken}` },
-          body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+          body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId, fingerprint: getStableKioskFingerprint() }),
           timeout: 8000,
         });
         const data = await res.json();
@@ -1792,7 +1811,7 @@ export function DeviceKiosk() {
             await fetch(`${orphanBase}/api/agency-devices/device/accept-pairing`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-              body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+              body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId, fingerprint: getStableKioskFingerprint() }),
               signal: bindCtl.signal,
             });
             try { logDevice('kiosk_orphan_bound', 'Kiosk-side orphan row bound after verified pairing — the pair now exists on BOTH stores', { deviceType: 'KIOSK', status: 'ONLINE' }); } catch { /* never block */ }

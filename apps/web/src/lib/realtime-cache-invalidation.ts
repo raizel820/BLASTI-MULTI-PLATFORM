@@ -66,7 +66,20 @@ export function handleRealtimeCacheEvent(event: string): void {
     const { apiClient } = await import('./api-client');
     // Same 0.6.49 static-through-instance fix as above — this bridge now
     // really runs, which is what lets mounted views update in place on
-    // live queue/reservation events instead of only on their own refetches.
-    apiClient.invalidatePrefixes(prefixes, { hard: false });
+    // live queue/reservation/notification events instead of only on their
+    // own refetches.
+    // 0.6.126 — HARD invalidation for LIVE families (queue, reservations,
+    // notifications): the old soft-stale path painted the PRE-EVENT bytes on
+    // the next read and pushed the fresh body only into the cache — no view
+    // re-rendered from it (ApiClient.subscribeCache has zero call sites), so
+    // realtime-driven surfaces effectively updated on the ~30s TTL cadence
+    // instead of instantly. Deleting outright forces the very next fetch
+    // (realtime handler refetch or poll tick) to a REAL network round-trip
+    // that lands new data in the caller's setState.
+    const hard = event.startsWith('queue:')
+      || event.startsWith('reservation:')
+      || event.startsWith('notification:')
+      || event === 'payment:completed';
+    apiClient.invalidatePrefixes(prefixes, { hard });
   })();
 }

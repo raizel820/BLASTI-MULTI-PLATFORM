@@ -281,6 +281,96 @@ public class BlastiNativeStatus extends Plugin {
         }
     }
 
+    // ═══ 0.6.126 — REAL DEVICE NAME (user requirement: "installed app the
+    // device should be able to get the device name and announce it in
+    // discovery"). Through 0.6.125 the phone announced the literal string
+    // "BLASTI App" on the UDP beacon and registered orphan rows named
+    // "BLASTI App (Phone)" — the manager's discovery cards could never show
+    // which physical phone was which. Resolution chain (first non-empty
+    // wins):
+    //   1. Settings.Global "device_name" — the owner-renamed device
+    //      (Settings → About phone → Device name; stock Android + most
+    //      brands honor it).
+    //   2. Settings.System "device_name" — some vendors store it there.
+    //   3. The Bluetooth adapter name — commonly user-personalized.
+    //   4. Build.MANUFACTURER + Build.MODEL — the brand default name
+    //      (e.g. "Xiaomi 2311DRK48G"), title-cased for display.
+    // NEVER a secret: display name only — safe to broadcast on the LAN.
+    @PluginMethod
+    public void getDeviceName(PluginCall call) {
+        JSObject result = new JSObject();
+        String name = "";
+        // 1 + 2 — the OS-level user-assigned name.
+        try {
+            android.content.Context ctx = getContext();
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            String global = android.provider.Settings.Global.getString(cr, "device_name");
+            if (global != null && !global.trim().isEmpty()) {
+                name = global.trim();
+            } else {
+                String sys = android.provider.Settings.System.getString(cr, "device_name");
+                if (sys != null && !sys.trim().isEmpty()) name = sys.trim();
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "getDeviceName: settings lookup failed", t);
+        }
+        // 3 — Bluetooth name (user-personalized on many devices).
+        if (name.isEmpty()) {
+            try {
+                android.bluetooth.BluetoothAdapter adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter();
+                if (adapter != null && adapter.isEnabled()) {
+                    String bt = adapter.getName();
+                    if (bt != null && !bt.trim().isEmpty()) name = bt.trim();
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "getDeviceName: bluetooth lookup failed", t);
+            }
+        }
+        // 4 — brand default name (manufacturer + model), title-cased.
+        String manufacturer = "";
+        String model = "";
+        try {
+            manufacturer = android.os.Build.MANUFACTURER == null ? "" : android.os.Build.MANUFACTURER.trim();
+            model = android.os.Build.MODEL == null ? "" : android.os.Build.MODEL.trim();
+        } catch (Throwable ignored) { }
+        if (name.isEmpty() && !manufacturer.isEmpty() && !model.isEmpty()) {
+            name = titleCaseDeviceName(manufacturer) + " " + titleCaseDeviceName(model);
+        } else if (name.isEmpty() && !model.isEmpty()) {
+            name = titleCaseDeviceName(model);
+        } else if (name.isEmpty()) {
+            name = "BLASTI App";
+        }
+        result.put("name", name);
+        result.put("manufacturer", manufacturer);
+        result.put("model", model);
+        call.resolve(result);
+    }
+
+    /** Title-case a brand/model segment ("XIAOMI" → "Xiaomi", "2311DRK48G" unchanged). */
+    private static String titleCaseDeviceName(String segment) {
+        if (segment == null || segment.isEmpty()) return "";
+        String lower = segment.toLowerCase(java.util.Locale.US);
+        String[] parts = lower.split("\\s+");
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < parts.length; i++) {
+            String p = parts[i];
+            if (p.isEmpty()) continue;
+            // Keep pure model codes as-is (e.g. "2311drk48g" → only the
+            // numeric prefix is real; leave alnum-heavy tokens untouched).
+            boolean looksLikeModelCode = p.replaceAll("[^a-z0-9]", "").length() >= 6
+                && p.replaceAll("[0-9]", "").length() <= 3;
+            if (looksLikeModelCode) {
+                if (out.length() > 0) out.append(' ');
+                out.append(p.toUpperCase(java.util.Locale.US));
+            } else {
+                if (out.length() > 0) out.append(' ');
+                out.append(Character.toUpperCase(p.charAt(0)));
+                if (p.length() > 1) out.append(p.substring(1));
+            }
+        }
+        return out.length() > 0 ? out.toString() : segment;
+    }
+
     /**
      * Reports whether FCM push is usable in this build. The web app's
      * push-registration.ts queries this before touching PushNotifications so

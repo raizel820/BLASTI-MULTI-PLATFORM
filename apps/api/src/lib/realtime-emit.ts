@@ -130,6 +130,12 @@ export type DeviceEventType =
   // its print job through the agency room to the active BLASTI desktop app
   // on the printer-host machine.
   | 'agency-device:print-job'
+  // 0.6.126 — REVOCATION PROPAGATION: a device deleted/unpaired in the CLOUD
+  // registry must die on the LAN too. The desktop's local store keeps its
+  // own mirror row (with the same canonical token) — without this event the
+  // deleted kiosk kept beating to the desktop and issuing tickets forever
+  // (field fault: "deleted devices still can connect and create reservations").
+  | 'agency-device:revoked'
 
 export type AdminEventType =
   | 'admin:stats-updated'

@@ -38,6 +38,7 @@ import { useLanguage } from '@/hooks/use-language';
 import { apiFetch } from '@/lib/api-fetch';
 import { getCloudApiBaseUrl } from '@/lib/api-client';
 import { startPairingBeacon, stopPairingBeacon, onLanPairingOffer, type LanPairingOffer } from '@/lib/pairing-beacon';
+import { getNativeDeviceName } from '@/lib/device-display-name';
 import { getStableDeviceFingerprint } from '@/components/devices/kiosk/kiosk-types';
 import { getLocalizedString } from '@/components/agency/devices/types';
 import { Button } from '@/components/ui/button';
@@ -139,6 +140,10 @@ export function PhonePairingAgent() {
   const active = isPhone && agencyOpen;
 
   const fingerprintRef = useRef<string>('');
+  // 0.6.126 — the REAL device name (resolved once per mount via the native
+  // plugin) that the beacon + discover-register announce to the manager.
+  const deviceNameRef = useRef<string>('');
+  const [deviceDisplayName, setDeviceDisplayName] = useState<string>('');
   const [paired, setPaired] = useState(false);
   const [pairBusy, setPairBusy] = useState<'accept' | 'reject' | null>(null);
   const [requests, setRequests] = useState<PhonePairingRequest[]>([]);
@@ -171,6 +176,15 @@ export function PhonePairingAgent() {
     let cancelled = false;
     fingerprintRef.current = getStableDeviceFingerprint();
 
+    // 0.6.126 — resolve the REAL device name (owner-renamed → Bluetooth name
+    // → brand default) BEFORE the beacon/register effects run. The resolved
+    // name is what discovery shows — never the generic 'BLASTI App' again.
+    getNativeDeviceName('BLASTI App').then((resolved) => {
+      if (cancelled) return;
+      deviceNameRef.current = resolved;
+      setDeviceDisplayName(resolved);
+    }).catch(() => { /* fallback name stays */ });
+
     async function boot() {
       const stored = loadStoredDevice();
       if (stored) {
@@ -190,12 +204,14 @@ export function PhonePairingAgent() {
       // Unpaired → register as a PHONE orphan so the manager's "waiting for
       // approval" strip + pairing channels can find this fingerprint even
       // without a scan (cloud-store parity with the UDP beacon).
+      // 0.6.126 — the orphan row carries the REAL device name so the strip
+      // and the scan cards all show "<Brand> <Model>" / the owner's name.
       try {
         const res = await apiFetch('/api/agency-devices/public/discover-register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            deviceName: 'BLASTI App (Phone)',
+            deviceName: deviceNameRef.current || 'BLASTI App (Phone)',
             deviceType: 'PHONE',
             connectionType: 'WIFI',
             deviceFingerprint: fingerprintRef.current,
@@ -214,16 +230,18 @@ export function PhonePairingAgent() {
   }, [active, startHeartbeat]);
 
   // ─── The discovery signal (rule 1): announce while the agency is open ─────
+  // 0.6.126 — the beacon carries the REAL device name (deviceNameRef), so
+  // the manager's scan card shows which phone is announcing.
   useEffect(() => {
     if (!active) return;
     void startPairingBeacon({
-      name: 'BLASTI App',
+      name: deviceNameRef.current || 'BLASTI App',
       uid: fingerprintRef.current || getStableDeviceFingerprint(),
       status: paired ? 'paired' : 'ready-for-pairing',
       mode: 'phone',
     });
     return () => { void stopPairingBeacon(); };
-  }, [active, paired]);
+  }, [active, paired, deviceDisplayName]);
 
   // ─── Pairing-request delivery: instant socket + 3s poll fallback ────────
   // 0.6.106 — THREE channels now: (1) the LAN UDP offer — the manager's
@@ -333,7 +351,8 @@ export function PhonePairingAgent() {
           const directRes = await fetch(`${base}/api/agency-devices/device/accept-pairing`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-            body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId }),
+            // 0.6.126 — fingerprint rides the accept (bootstrap auth path).
+            body: JSON.stringify({ commandId: request.id, agencyId: request.agencyId, fingerprint: fingerprintRef.current || getStableDeviceFingerprint() }),
             signal: ctl.signal,
           });
           clearTimeout(timer);
