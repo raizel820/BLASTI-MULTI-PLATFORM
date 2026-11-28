@@ -89,6 +89,15 @@ const DEFAULT_API_PORT = parseInt(process.env.NEXT_PUBLIC_API_PORT || '3080', 10
 // M27: single-sweep mutex — 0.6.75 restores the actual flag (the check
 // existed but the flag was never assigned, so the mutex never engaged).
 let isScanning = false;
+// FIELD-AUDIT 2026-11-26 — the mutex used to return null INSTANTLY when a
+// sweep was already in flight. Callers (requestViaLan → discoverLanServerOnce,
+// kiosk auto-connect) interpreted that null as "no desktop on this network"
+// and the api-client failover then threw status-0 → markBothUnreachable() →
+// every mutation was REFUSED for 30s ("Kiosk join failed: This operation
+// cannot be queued") even though the branch desktop was up the whole time.
+// The in-flight promise lets a second caller JOIN the running sweep and
+// receive its winner instead of a false negative.
+let scanInFlight: Promise<DiscoveredServer | null> | null = null;
 
 // ─── Cache Management ───────────────────────────────────────────────────────
 
@@ -331,15 +340,41 @@ async function deriveCandidateSubnets(candidateIps: string[] = []): Promise<stri
  */
 async function probeTopologyServers(opts?: { deviceToken?: string | null }): Promise<DiscoveredServer | null> {
   try {
-    const { apiFetch } = await import('./api-fetch');
+    // FIELD-AUDIT 2026-11-26 — this probe used apiFetch, whose failover
+    // machinery (10s cloud timeouts + LAN failover + markBothUnreachable)
+    // ran INSIDE the discovery pass: on a device with no internet the probe
+    // itself marked "both unreachable for 30s" (log 03:56:31) and refused
+    // every subsequent mutation. A best-effort hint probe must be a bare
+    // fetch against the CLOUD base with a short timeout — no flags, no
+    // retries, no recursion.
+    const { buildCloudUrl } = await import('./api-client');
+    const url = buildCloudUrl('/api/lan-topology');
     // 0.6.103 — kiosks/TVs authenticate with their DEVICE token (no staff
     // session): the header flips the cloud route into device-scope so the
     // kiosk gets the desktop's reported LAN IP instead of a 401 → sweep.
+    // Signed-in callers (phone manager / follower PC) ride the persisted
+    // session token as Bearer — the bare fetch has no cookie jar guarantees
+    // in the native shells, and apiFetch must NOT be used here (it would
+    // re-enter the failover machinery this probe exists to avoid).
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (opts?.deviceToken) headers['X-Device-Token'] = opts.deviceToken;
-    const res = await apiFetch('/api/lan-topology', { headers });
-    if (!res.ok) return null;
-    const data = await res.json().catch(() => null);
+    try {
+      const storeRaw = localStorage.getItem('blasti-app');
+      const sessionToken = storeRaw
+        ? (() => { try { return JSON.parse(storeRaw)?.state?.sessionToken as string | undefined; } catch { return undefined; } })()
+        : undefined;
+      if (!opts?.deviceToken && sessionToken) headers['Authorization'] = `Bearer ${sessionToken}`;
+    } catch { /* no session — the probe stays best-effort */ }
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2500);
+    let data: { nodes?: Array<{ ipAddress?: string | null; lanPort?: number | null; online?: boolean; role?: string | null; name?: string | null }> } | null = null;
+    try {
+      const res = await fetch(url, { headers, signal: ctl.signal, mode: 'cors', credentials: 'include' });
+      if (!res.ok) return null;
+      data = await res.json().catch(() => null);
+    } finally {
+      clearTimeout(timer);
+    }
     const nodes: Array<{ ipAddress?: string | null; lanPort?: number | null; online?: boolean; role?: string | null; name?: string | null }> =
       data?.nodes && Array.isArray(data.nodes) ? data.nodes : [];
     const candidates = nodes
@@ -383,16 +418,27 @@ function isLoopbackServer(s: DiscoveredServer | null): boolean {
 export async function quickDiscover(opts?: { preferRemote?: boolean; selfIps?: string[]; deviceToken?: string | null }): Promise<DiscoveredServer | null> {
   const preferRemote = opts?.preferRemote === true;
   const selfIps = new Set((opts?.selfIps || []).filter(Boolean));
-  // M27: Check isScanning mutex
-  if (isScanning) return null;
+  // M27: single-sweep mutex — FIELD-AUDIT 2026-11-26: instead of the instant
+  // null (which callers read as "no desktop exists" → failover poison), a
+  // caller now JOINS the sweep that is already running and shares its answer.
+  if (isScanning) {
+    try { return await scanInFlight; } catch { return null; }
+  }
   if (typeof window === 'undefined') return null;
   isScanning = true;
+  // FIELD-AUDIT 2026-11-26 — publish the sweep so concurrent callers join it
+  // (see the mutex comment above). The published promise resolves with the
+  // same value this call returns.
+  let settleScan!: (v: DiscoveredServer | null) => void;
+  const publish = new Promise<DiscoveredServer | null>((resolve) => { settleScan = resolve; });
+  scanInFlight = publish;
   // 0.6.91 — device event stream: LAN discovery is now visible in the Logs
   // Manager "Devices" tab (previously this sweep was COMPLETELY silent — the
   // user could not tell whether the phone ever looked for the desktop box).
   const scanStartedAt = Date.now();
   try { logDevice('scan_started', 'LAN discovery started (cached → localhost → gateways → subnet sweep)'); } catch { /* never block */ }
   try {
+    const result = await (async (): Promise<DiscoveredServer | null> => {
     // 0.6.115 — the device's own LAN IP(s) now seed the subnet derivation
     // (previously only the WebRTC/hostname paths did — a kiosk on
     // 192.168.100.x never swept its own subnet and never found the desktop).
@@ -523,13 +569,20 @@ export async function quickDiscover(opts?: { preferRemote?: boolean; selfIps?: s
       );
     } catch { /* never block */ }
     return winner;
+    })();
+    // FIELD-AUDIT 2026-11-26 — publish the answer to concurrent callers that
+    // joined this sweep through the mutex.
+    settleScan(result);
+    return result;
   } catch (err) {
     // 0.6.91 — device event stream: discovery crashed (was invisible before).
     try {
       logDevice('scan_failed', `LAN discovery failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`, undefined, 'error');
     } catch { /* never block */ }
+    settleScan(null);
     throw err;
   } finally {
     isScanning = false;
+    scanInFlight = null;
   }
 }

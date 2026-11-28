@@ -13,7 +13,10 @@ import { calculateETA, getEffectiveServiceTime, filterImmediateServiceWindow, fi
 // GETs that expose reservation-derived numbers (/api/stats, /api/agencies).
 import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { cancelPendingCustomerAlerts } from '../lib/cancel-pending-alerts'
-import { sendViaPushNotification } from '../lib/notification-router'
+// 0.6.126 — data-only FCM (call-style lock-screen alert) replaces the
+// notification-message push: system-rendered tray entries cannot carry the
+// full-screen intent / CallStyle layout / Stop action the audit requires.
+import { sendTurnCallPush } from '../lib/notification-router'
 import { z } from 'zod'
 import { recordSyncChange } from '../lib/sync-helpers'
 // UNIFIED QUEUE — both call-next surfaces share ONE atomic implementation
@@ -160,24 +163,24 @@ app.post('/call-next', async (c) => {
       emitNotificationEvent('notification:your-turn', mergedCallData.userId, { ticketNumber: mergedCallData.displayNumber, agencyName: mergedCallData.agency.name, serviceName: mergedCallData.service.name, userId: mergedCallData.userId, reservationId: mergedCallData.id, counterId: legacyCounterPayload?.id ?? null, counterName: legacyCounterPayload?.name ?? null, counter: legacyCounterPayload })
 
       // ── Lock-screen delivery when the app is CLOSED/backgrounded ──
-      // The socket event only reaches a LIVE webview; with the app dead the
-      // "It's your turn" alert previously NEVER reached the lock screen
-      // (no FCM push existed — routeNotification is dead code). FCM
-      // notification message → OS tray on the blasti-turn-alert channel
-      // (high-importance, PUBLIC → lock-screen content, native swipe
-      // dismiss). Requires Firebase credentials + the app's FCM token.
+      // 0.6.126 — data-only FCM (see sendTurnCallPush): the message reaches
+      // BlastiFirebaseMessagingService even with the app process dead, which
+      // renders the INCOMING-CALL notification (CallStyle shade layout,
+      // full-screen intent over the keyguard, repeating alarm, Stop button
+      // + swipe-to-stop). The socket event above only reaches a LIVE webview.
       const fcmToken = mergedCallData.user?.fcmToken
       if (fcmToken) {
-        void sendViaPushNotification(fcmToken, {
+        void sendTurnCallPush(fcmToken, {
           userId: mergedCallData.userId,
           reservationId: mergedCallData.id,
           agencyId,
-          type: 'TURN_CALL',
-          message: `Your turn now! Ticket ${mergedCallData.displayNumber} at ${mergedCallData.agency.name} — ${mergedCallData.service.name}.`,
-          messageAr: mergedCallData.user?.language === 'ar'
-            ? `دورك الآن! التذكرة ${mergedCallData.displayNumber} في ${mergedCallData.agency.nameAr || mergedCallData.agency.name}.`
-            : `دورك الآن! التذكرة ${mergedCallData.displayNumber} في ${mergedCallData.agency.nameAr || mergedCallData.agency.name}.`,
-        }).catch(() => { /* push is best-effort — the in-app row already exists */ })
+          ticketNumber: mergedCallData.displayNumber,
+          agencyName: mergedCallData.agency?.name || '',
+          agencyNameAr: mergedCallData.agency?.nameAr ?? null,
+          agencyNameFr: mergedCallData.agency?.nameFr ?? null,
+          counterName: legacyCallCounter?.name ?? null,
+          language: mergedCallData.user?.language,
+        }).catch(() => { /* push is best-effort — the in-app alert already exists */ })
       }
     }
     emitKioskEvent(agencyId, { action: 'call-next', displayNumber: mergedCallData.displayNumber, counterId })

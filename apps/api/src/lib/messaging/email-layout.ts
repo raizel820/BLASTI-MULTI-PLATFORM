@@ -19,8 +19,20 @@
  *   - no external fonts, no JS, max width 600px
  *   - RTL (dir="rtl") when the template language is Arabic
  *   - bodies that are already full documents (<html …>) pass through unwrapped
+ *
+ * App logo delivery (0.6.126) — the REAL app logo image, never a placeholder:
+ *   The logo is attached INLINE to every email (MIME Content-ID
+ *   'blasti-app-logo' — see getAppLogoAttachment(); the send adapter in
+ *   email-service.ts merges it into the provider payload) and the header
+ *   references it via <img src="cid:blasti-app-logo">. Inline cid images are
+ *   the only mechanism that renders reliably across Gmail, Outlook and Apple
+ *   Mail — remote URL loading is commonly blocked, and a missing
+ *   PUBLIC_BASE_URL previously degraded the header to a text wordmark
+ *   placeholder. When the asset file is absent the layout falls back to the
+ *   absolute URL (if a public base is configured) or the text wordmark.
  */
 
+import { existsSync, readFileSync } from 'fs'
 import { db } from '@blasti/db'
 
 const APP_NAME = 'BLASTI'
@@ -50,6 +62,48 @@ export function absoluteAssetUrl(pathOrUrl: string | null | undefined): string |
 /** Absolute URL of the bundled BLASTI app logo (served by /api/branding/logo). */
 export function appLogoAbsoluteUrl(): string | null {
   return absoluteAssetUrl('/api/branding/logo')
+}
+
+// ─── Inline app-logo attachment (cid: image) ───────────────────────────────────
+
+/** MIME Content-ID of the inline BLASTI app logo — referenced as cid:<CID>. */
+export const APP_LOGO_CID = 'blasti-app-logo'
+
+export interface EmailAttachment {
+  filename: string
+  /** base64-encoded file content */
+  content: string
+  /** MIME Content-ID — when set the attachment is inline (referenced via cid:) */
+  content_id?: string
+}
+
+let cachedAppLogoAttachment: EmailAttachment | null | undefined
+
+/**
+ * The bundled BLASTI app logo (apps/api/assets/branding/logo.png) as an
+ * inline email attachment — base64 + Content-ID. Cached per process; returns
+ * null when the asset file is missing (layout degrades to the remote-URL
+ * logo, then the text wordmark). Same on-disk asset /api/branding/logo serves.
+ */
+export function getAppLogoAttachment(): EmailAttachment | null {
+  if (cachedAppLogoAttachment !== undefined) return cachedAppLogoAttachment
+  try {
+    // Resolved relative to this module (src/lib/messaging → api root/assets),
+    // same technique as routes/branding.ts.
+    const logoPath = new URL('../../../assets/branding/logo.png', import.meta.url).pathname
+    if (existsSync(logoPath)) {
+      cachedAppLogoAttachment = {
+        filename: 'blasti-logo.png',
+        content: readFileSync(logoPath).toString('base64'),
+        content_id: APP_LOGO_CID,
+      }
+      return cachedAppLogoAttachment
+    }
+  } catch {
+    // fall through — no inline attachment
+  }
+  cachedAppLogoAttachment = null
+  return null
 }
 
 export function isFullHtmlDocument(html: string): boolean {
@@ -127,15 +181,23 @@ export function wrapEmailHtml(opts: WrapEmailOptions): string {
   const dir = rtl ? 'rtl' : 'ltr'
   const align = rtl ? 'right' : 'left'
   const copy = COPY_FOOTER[(opts.language ?? 'en') as keyof typeof COPY_FOOTER] ?? COPY_FOOTER.en
-  const appLogo = appLogoAbsoluteUrl()
+  // Delivery order (most reliable first):
+  //   1. cid: inline attachment (blasti-app-logo) — renders even when remote
+  //      image loading is blocked (Gmail/Outlook defaults) and works offline
+  //      of PUBLIC_BASE_URL. The attachment itself is merged into EVERY
+  //      outgoing message by email-service.ts (getAppLogoAttachment()).
+  //   2. absolute URL of /api/branding/logo — when PUBLIC_BASE_URL is set.
+  //   3. white text wordmark — last resort (no asset, no public base).
+  // The white chip keeps colored logos readable on the green band.
+  const appLogoSrc = getAppLogoAttachment() ? `cid:${APP_LOGO_CID}` : appLogoAbsoluteUrl()
   const branding = opts.branding
   const year = new Date().getFullYear()
 
   // ── Header: emerald brand band — white chip holds the real app logo ──
   // The logo is served by /api/branding/logo (the live admin-uploaded asset);
   // the white chip keeps colored logos readable on the green band.
-  const appLogoHtml = appLogo
-    ? `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border-radius:10px;"><tr><td style="padding:8px 14px;background:#ffffff;border-radius:10px;"><img src="${appLogo}" alt="${APP_NAME}" height="30" style="height:30px;width:auto;display:block;border:0;outline:none;" /></td></tr></table>`
+  const appLogoHtml = appLogoSrc
+    ? `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border-radius:10px;"><tr><td style="padding:8px 14px;background:#ffffff;border-radius:10px;"><img src="${appLogoSrc}" alt="${APP_NAME}" height="34" style="height:34px;max-width:150px;width:auto;display:block;border:0;outline:none;" /></td></tr></table>`
     : `<span style="font-size:21px;font-weight:800;color:#ffffff;letter-spacing:0.08em;">${APP_NAME}</span>`
 
   const agencyLogoHtml = branding?.logoUrl

@@ -401,8 +401,16 @@ async function joinHandler(body, bearerToken) {
     if (state.role !== 'MASTER') {
       return { status: 409, body: { success: false, code: 'NOT_MASTER', error: 'This device is not the offline master', master: masterHint() } }
     }
-    if (!bearerToken || !body) {
-      return { status: 401, body: { success: false, code: 'AUTH_NO_TOKEN', error: 'Cloud session token required' } }
+    // SECURITY (0.6.126 audit T1-9): the client NO LONGER sends its cloud
+    // session JWT (it used to be POSTed verbatim to any host that answered
+    // the spoofable discovery beacon — a rogue fake-master harvested
+    // credentials). A tokenless join is validated against the LOCAL USER
+    // MIRROR (same identity check the offline JWT path always used: the user
+    // row must exist and belong to this workspace) + the operator's
+    // mandatory acceptance. A presented token (older field clients still on
+    // 0.6.125) keeps the original validation chain unchanged.
+    if (!bearerToken && !(body && body.userId)) {
+      return { status: 401, body: { success: false, code: 'AUTH_NO_TOKEN', error: 'Join identity required (cloud session token or userId)' } }
     }
     const session = state.getSession && state.getSession()
     if (!session || !session.token || !session.user) {
@@ -411,7 +419,32 @@ async function joinHandler(body, bearerToken) {
     // Validation chain (see the function doc above).
     const scope = workspaceScope()
     let validatedUser = null
-    const presented = String(bearerToken)
+    const presented = String(bearerToken || '')
+    if (!presented) {
+      // ── Tokenless (T1-9) — mirror identity check ──
+      const db = state.getDb && state.getDb()
+      if (!db) return { status: 503, body: { success: false, code: 'LAN_NO_WORKSPACE', error: 'Master has no local database yet' } }
+      const rows = await db.$queryRawUnsafe(
+        'SELECT id, username, role, agencyId FROM "User" WHERE id = ? LIMIT 1', String(body.userId)
+      ).catch(() => [])
+      const user = rows && rows[0]
+      if (!user) {
+        log('JOIN DENIED tokenless basis=user-not-in-mirror userId=' + String(body.userId).slice(0, 8) + '…')
+        return { status: 401, body: { success: false, code: 'AUTH_TOKEN_MISMATCH', error: 'Joining user is not known to this workspace (mirror check: user-not-in-mirror)' } }
+      }
+      if (scope.agencyId && String(user.agencyId || '') !== String(scope.agencyId)) {
+        const staff = await db.$queryRawUnsafe(
+          'SELECT 1 AS ok FROM "AgencyStaff" WHERE "userId" = ? AND "agencyId" = ? AND "isActive" = 1 LIMIT 1',
+          String(body.userId), scope.agencyId
+        ).catch(() => [])
+        if (!staff || !staff.length) {
+          log('JOIN DENIED tokenless basis=not-a-workspace-member userId=' + String(body.userId).slice(0, 8) + '…')
+          return { status: 403, body: { success: false, code: 'LAN_SCOPE_MISMATCH', error: 'Joining user does not belong to this workspace' } }
+        }
+      }
+      validatedUser = { id: user.id, username: user.username, role: user.role, agencyId: user.agencyId || scope.agencyId }
+      log('JOIN token basis=tokenless-mirror user=' + (validatedUser.username || validatedUser.id))
+    } else {
     const sameSession = [String(session.token), session.previousToken ? String(session.previousToken) : null]
       .filter(Boolean)
       .some((cand) => {
@@ -458,6 +491,7 @@ async function joinHandler(body, bearerToken) {
         log('JOIN token basis=offline-mirror user=' + (validatedUser.username || validatedUser.id))
       }
     }
+    } // end: token-presented (bearerToken) validation chain
     const scopeAtDevice = scope
     const callerAgencyId = body.agencyId || null
     const callerBranchId = body.branchId || null
@@ -665,6 +699,25 @@ function startListener() {
       // caught by the two-node E2E drill). Broadcasts dedupe by instanceId,
       // so coexisting with main.js's beacon is harmless.
       try {
+        // 0.6.127 perf — cache broadcast targets for 60s: os.networkInterfaces
+        // is a slow OS syscall (Windows especially) and this used to sweep it
+        // on EVERY 3s tick, forever.
+        let beaconTargetsCache = { targets: ['255.255.255.255'], at: 0 }
+        const getBeaconTargets = () => {
+          const now = Date.now()
+          if (now - beaconTargetsCache.at < 60_000) return beaconTargetsCache.targets
+          try {
+            const found = new Set(['255.255.255.255'])
+            for (const addrs of Object.values(os.networkInterfaces())) {
+              for (const iface of addrs || []) {
+                if (iface.family !== 'IPv4' || iface.internal) continue
+                if (iface.broadcast) found.add(iface.broadcast)
+              }
+            }
+            beaconTargetsCache = { targets: Array.from(found), at: now }
+          } catch { /* keep the previous target list */ }
+          return beaconTargetsCache.targets
+        }
         beaconTimer = setInterval(() => {
           try {
             const payload = Buffer.from(JSON.stringify({
@@ -675,15 +728,7 @@ function startListener() {
               httpPort: state.identity.httpPort || 3080,
               ...(publicBeaconExtras() || {}),
             }))
-            const targets = new Set(['255.255.255.255'])
-            try {
-              for (const addrs of Object.values(os.networkInterfaces())) {
-                for (const iface of addrs || []) {
-                  if (iface.family !== 'IPv4' || iface.internal) continue
-                  if (iface.broadcast) targets.add(iface.broadcast)
-                }
-              }
-            } catch { /* global broadcast alone */ }
+            const targets = getBeaconTargets()
             for (const target of targets) {
               try { listenSocket.send(payload, 0, payload.length, BEACON_PORT, target, () => {}) } catch { /* skip */ }
             }

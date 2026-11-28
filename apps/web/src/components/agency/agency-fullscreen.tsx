@@ -1403,9 +1403,38 @@ export function AgencyFullscreen() {
     setTicketOpen(true);
   };
 
+  /**
+   * SECURITY (0.6.126 audit T1-10): the live ticket DOM is serialized via
+   * innerHTML and re-parsed by document.write into a same-origin popup that
+   * ALSO carries an inline <script> — any future attribute-context
+   * interpolation of user data (walk-in name/phone are staff-typed) in that
+   * DOM becomes a same-origin XSS. The serialized markup is now sanitized
+   * through a DOMParser pass BEFORE it is written: script/style/link/meta/
+   * iframe/object/embed nodes and every on* attribute are stripped, so the
+   * print output keeps its layout but cannot carry executable content. The
+   * auto-print hook stays a separate, attacker-un writable literal.
+   */
   const executePrint = () => {
     if (ticketPrintRef.current) {
       const printContent = ticketPrintRef.current.innerHTML;
+      // Sanitize the serialized ticket markup (DOMParser round-trip).
+      let sanitized = printContent;
+      try {
+        const parsed = new DOMParser().parseFromString(`<div id="__t">${printContent}</div>`, 'text/html');
+        const root = parsed.getElementById('__t');
+        if (root) {
+          root.querySelectorAll('script, style, link, meta, iframe, object, embed, svg, base, form').forEach((el) => el.remove());
+          root.querySelectorAll('*').forEach((el) => {
+            for (const attr of Array.from(el.attributes)) {
+              const name = attr.name.toLowerCase();
+              if (name.startsWith('on') || (name === 'href' || name === 'src' || name === 'xlink:href' || name === 'srcset') && /^\s*javascript:/i.test(attr.value)) {
+                el.removeAttribute(attr.name);
+              }
+            }
+          });
+          sanitized = root.innerHTML;
+        }
+      } catch { /* sanitizer unavailable — keep raw (current content is React-escaped) */ }
       const win = window.open('', '_blank', 'width=400,height=600');
       if (win) {
         win.document.write(`
@@ -1422,7 +1451,7 @@ export function AgencyFullscreen() {
             .qr { text-align: center; margin: 8px 0; }
             .qr img { width: 180px; height: 180px; }
           </style></head><body>
-          ${printContent}
+          ${sanitized}
           <script>window.onload=function(){window.print();window.close();}</script>
           </body></html>
         `);

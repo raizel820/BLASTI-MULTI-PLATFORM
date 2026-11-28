@@ -433,6 +433,13 @@ export function useRealtime(options?: UseRealtimeOptions) {
         if (deviceTokenRef.current) {
           socket.emit('join:device', deviceTokenRef.current)
         }
+        // 0.6.127 — RESYNC ON RECONNECT: events emitted while the socket was
+        // down are gone forever; re-joining rooms alone left every screen
+        // showing stale queue state until its next poll tick. Hard-invalidate
+        // the live cache families so every mounted surface's very next fetch
+        // (poll tick, event handler, reconnect watcher) pulls REAL data.
+        handleRealtimeCacheEvent('queue:updated')
+        handleRealtimeCacheEvent('reservation:updated')
         // Disconnect LAN socket — cloud is back
         if (lanSocket) {
           lanSocket.disconnect()
@@ -1079,6 +1086,12 @@ export function useTurnAlert(userId: string | undefined) {
   // dismissal timestamp so a swipe/Stop on the OS notification also silences
   // the in-app banner (full swipe-to-stop parity, app-side half).
   const turnAlertFiredAtRef = useRef<number>(0)
+  // 0.6.126 — mirror for the pending-turn-call pickup effect (avoids stale
+  // closures in the visibility/resume listeners).
+  const turnAlertDataRef = useRef<{ reservationId?: string; ticketNumber: string; agencyName: string; counterName?: string } | null>(null)
+  const showTurnAlertRef = useRef(false)
+  useEffect(() => { turnAlertDataRef.current = turnAlertData }, [turnAlertData])
+  useEffect(() => { showTurnAlertRef.current = showTurnAlert }, [showTurnAlert])
   const { subscribe, joinRoom, leaveRoom } = useRealtime()
 
   // H17: Join customer room for turn alerts
@@ -1115,12 +1128,18 @@ export function useTurnAlert(userId: string | undefined) {
         setTurnAlertData({ reservationId, ticketNumber, agencyName, counterName })
         setShowTurnAlert(true)
 
-        // Also fire a local notification (wakes phone, drops banner)
+        // Also fire a local notification (wakes phone, drops banner).
+        // 0.6.126 — reservationId rides along so the notification posts under
+        // the SAME stable tag+id as the native FCM service (dedupe: one
+        // notification no matter which path fired first).
         import('@/lib/notification-channel').then(({ scheduleTurnNotification }) => {
           scheduleTurnNotification(
             'إنه دورك! / It\'s Your Turn!',
             `Ticket ${ticketNumber} at ${agencyName}`,
-            ticketNumber
+            ticketNumber,
+            undefined,
+            'called',
+            { reservationId }
           )
         }).catch(() => {})
       }
@@ -1150,7 +1169,10 @@ export function useTurnAlert(userId: string | undefined) {
           scheduleTurnNotification(
             'إنه دورك! / It\'s Your Turn!',
             `Ticket ${ticketNumber} at ${agencyName}`,
-            ticketNumber
+            ticketNumber,
+            undefined,
+            'called',
+            { reservationId }
           )
         }).catch(() => {})
       }
@@ -1194,8 +1216,77 @@ export function useTurnAlert(userId: string | undefined) {
       enterSleepMode(turnAlertData.reservationId)
     }
     closeTurnNotifications()
+    // 0.6.126 — consume the native pending-turn-call so the FSI/tap launch
+    // does not re-show an alert the user just dismissed.
+    try {
+      const status = (window as any)?.Capacitor?.Plugins?.BlastiNativeStatus;
+      void status?.clearPendingTurnCall?.().catch?.(() => {});
+    } catch { /* non-native shell */ }
     setShowTurnAlert(false)
   }, [turnAlertData])
+
+  // ── 0.6.126 — Native pending-turn-call pickup (full-screen-intent half) ──
+  // When the customer's app was DEAD/backgrounded, the call arrived as FCM:
+  // BlastiFirebaseMessagingService posted the call-style notification AND
+  // persisted the pending call. Tapping the notification (or the full-screen
+  // intent over the keyguard) cold-starts/resumes the app — the socket event
+  // can NEVER replay here. This effect reads the pending call on boot, on
+  // resume (blasti:app-resume) and on visibility, and renders the same
+  // full-screen call layout instantly. Stale (>5 min) or already-shown
+  // pickups are dropped; natively-dismissed alerts never replay.
+  useEffect(() => {
+    if (!userId) return
+    let cancelled = false
+    const pickup = () => {
+      try {
+        const status = (window as any)?.Capacitor?.Plugins?.BlastiNativeStatus;
+        if (!status?.getPendingTurnCall) return;
+        void Promise.resolve(status.getPendingTurnCall()).then((pending: any) => {
+          if (cancelled) return;
+          const reservationId = pending?.reservationId || null;
+          if (!reservationId) return;
+          // Already showing this exact call (socket beat the pickup) — done.
+          if (showTurnAlertRef.current && turnAlertDataRef.current?.reservationId === reservationId) return;
+          const at = typeof pending?.at === 'number' ? pending.at : 0;
+          // Stale (>5 min) → the call is long past; drop it + clear.
+          if (!at || Date.now() - at > 5 * 60 * 1000) {
+            void status.clearPendingTurnCall?.().catch?.(() => {});
+            return;
+          }
+          // Sleep-mode suppression parity with the socket paths.
+          if (!shouldShowAlert(reservationId)) return;
+          // If the user ALREADY stopped this alert from the lock screen,
+          // never replay it (swipe-to-stop parity).
+          void wasTurnAlertDismissedNatively(at).then((dismissed) => {
+            if (dismissed || cancelled) return;
+            turnAlertFiredAtRef.current = Date.now();
+            setTurnAlertData({
+              reservationId,
+              ticketNumber: pending?.ticketNumber || '---',
+              agencyName: pending?.agencyName || '',
+              counterName: pending?.counterName || undefined,
+            });
+            setShowTurnAlert(true);
+            // Consumed — do not re-show on the next resume.
+            void status.clearPendingTurnCall?.().catch?.(() => {});
+          }).catch(() => {});
+        }).catch(() => {});
+      } catch { /* non-native shell / older APK */ }
+    };
+    pickup();
+    const onVisible = () => {
+      // Only pick up when the app is actually visible (visibilitychange also
+      // fires when the app goes to the background).
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') pickup();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('blasti:app-resume', pickup);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('blasti:app-resume', pickup);
+    };
+  }, [userId])
 
   // ── Lock-screen swipe-to-stop reconciliation (app-side half) ──────────
   // The user can stop the turn alert from the LOCK SCREEN itself — swipe the

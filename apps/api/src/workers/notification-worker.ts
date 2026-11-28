@@ -10,7 +10,7 @@
 
 import { db } from '@blasti/db'
 import { sendSms, type SendSmsResult } from '../lib/sms-service'
-import { sendViaPushNotification, type NotificationPayload } from '../lib/notification-router'
+import { sendDataPush } from '../lib/notification-router'
 
 const POLL_INTERVAL_MS = 30_000 // 30 seconds
 let workerInterval: ReturnType<typeof setInterval> | null = null
@@ -128,13 +128,17 @@ async function processPendingJobs(): Promise<number> {
       // the carrier flow below, unchanged.
       if (job.user.fcmToken) {
         try {
-          const pushSent = await sendViaPushNotification(job.user.fcmToken, {
-            userId,
+          // 0.6.126 — data-only FCM: the message reaches
+          // BlastiFirebaseMessagingService even when the app process is dead,
+          // which renders a MINIMAL lock-screen notification with a Stop
+          // action (the old notification-message push could not carry the
+          // Stop button or guarantee background delivery).
+          const pushSent = await sendDataPush(job.user.fcmToken, {
+            type: payload.type || 'ADVANCE_WARNING',
+            title: payload.type === 'TURN_CALL' ? "It's your turn!" : 'BLASTI',
+            body: message,
             reservationId: payload.reservationId ?? '',
             agencyId,
-            type: (payload.type as NotificationPayload['type']) || 'ADVANCE_WARNING',
-            message,
-            messageAr: message,
           })
           if (pushSent) {
             await db.delayedJob.update({

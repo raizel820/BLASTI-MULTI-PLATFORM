@@ -28,6 +28,7 @@ import {
   fetchLogoDataUrl,
   type InvoiceRecord,
 } from '@/lib/billing-client';
+import { BLASTI_LOGO_DATA_URL } from '@/lib/branding-logo';
 import {
   buildInvoiceHtml,
   printOrDownloadInvoice,
@@ -63,7 +64,9 @@ export function InvoicePreviewDialog({ invoice, open, onOpenChange }: InvoicePre
         });
       })
       .catch(() => {
-        if (alive) setAssets({ logoDataUrl: '/logo.png' });
+        // Real bundled logo — never a relative path (does not resolve in
+        // srcDoc/print contexts) and never a placeholder wordmark.
+        if (alive) setAssets({ logoDataUrl: BLASTI_LOGO_DATA_URL });
       })
       .finally(() => {
         if (alive) setLoading(false);

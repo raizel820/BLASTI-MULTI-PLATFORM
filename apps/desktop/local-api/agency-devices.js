@@ -81,7 +81,41 @@ function parseJSON(str) {
 }
 
 function generatePairingCode() {
-  return crypto.randomBytes(2).toString('hex').toUpperCase()
+  // SECURITY (0.6.126 audit T1-8): was randomBytes(2) → 4 hex chars = 65,536
+  // combinations — trivially brute-forceable via /public/kiosk-auth, which
+  // RETURNS the full 256-bit deviceToken on success. 4 random bytes → 8 hex
+  // chars (4.3 billion) makes online guessing impractical; the per-code
+  // attempt lockout on kiosk-auth closes the remaining grind.
+  return crypto.randomBytes(4).toString('hex').toUpperCase()
+}
+
+// SECURITY (T1-8): per-code failed-attempt lockout for /public/kiosk-auth.
+// In-memory (resets on desktop restart — acceptable for a pairing code that
+// regenerates on each pairing session); keyed by the PRESENTED code so a
+// attacker cannot sidestep it by rotating spoofed X-Forwarded-For values.
+const KIOSK_AUTH_MAX_ATTEMPTS = 5
+const KIOSK_AUTH_LOCKOUT_MS = 10 * 60 * 1000
+const kioskAuthAttempts = new Map() // code -> { fails, lockedUntil }
+function kioskAuthAttemptFailed(code) {
+  const entry = kioskAuthAttempts.get(code) || { fails: 0, lockedUntil: 0 }
+  entry.fails += 1
+  if (entry.fails >= KIOSK_AUTH_MAX_ATTEMPTS) {
+    entry.lockedUntil = Date.now() + KIOSK_AUTH_LOCKOUT_MS
+    entry.fails = 0
+  }
+  kioskAuthAttempts.set(code, entry)
+}
+function kioskAuthAttemptSucceeded(code) {
+  kioskAuthAttempts.delete(code)
+}
+function kioskAuthIsLocked(code) {
+  const entry = kioskAuthAttempts.get(code)
+  if (!entry) return false
+  if (entry.lockedUntil && entry.lockedUntil > Date.now()) return true
+  if (entry.lockedUntil && entry.lockedUntil <= Date.now()) {
+    kioskAuthAttempts.delete(code) // lockout expired
+  }
+  return false
 }
 
 
@@ -4678,8 +4712,15 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       const body = await c.req.json().catch(() => ({}))
       const pairingCode = typeof body.pairingCode === 'string' ? body.pairingCode.trim().toUpperCase() : ''
       if (!pairingCode) return c.json({ success: false, error: 'Pairing code is required' }, 400)
+      // SECURITY (T1-8): per-code lockout — 5 failed attempts lock the code
+      // for 10 minutes. Keyed on the presented code itself so rotating a
+      // spoofed X-Forwarded-For cannot reset the counter.
+      if (kioskAuthIsLocked(pairingCode)) {
+        return c.json({ success: false, error: 'Too many failed attempts — this pairing code is locked, ask your agency admin to re-issue it' }, 429)
+      }
       const foundDevice = await db.agencyDevice.findUnique({ where: { pairingCode } }).catch(() => null)
       if (!foundDevice) {
+        kioskAuthAttemptFailed(pairingCode)
         return c.json({ success: false, error: 'Invalid pairing code' }, 404)
       }
       if (foundDevice.status === 'DISABLED') {
@@ -4702,6 +4743,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       let deviceToken = foundDevice.deviceToken
       const presented = typeof body.deviceToken === 'string' && body.deviceToken ? body.deviceToken : ''
       if (presented && deviceToken && presented !== deviceToken) {
+        kioskAuthAttemptFailed(pairingCode)
         return c.json({ success: false, error: 'Invalid device token. Contact your agency admin.' }, 401)
       }
       const now = new Date()
@@ -4716,6 +4758,7 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         updateData.deviceToken = deviceToken
       }
       await db.agencyDevice.update({ where: { id: foundDevice.id }, data: updateData })
+      kioskAuthAttemptSucceeded(pairingCode)
       const services = await db.service.findMany({
         where: { agencyId: foundDevice.agencyId, isActive: true },
         select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },

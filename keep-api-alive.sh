@@ -18,7 +18,10 @@ BACKOFF_BASE=3
 BACKOFF_CAP=30
 
 export DATABASE_URL="${DATABASE_URL:-postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public}"
-export NEXTAUTH_SECRET="${NEXTAUTH_SECRET:-blast1-dev-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly}"
+# SECURITY (0.6.126 audit): no dev-secret default here anymore — dev uses the
+# in-code dev fallback; production MUST set a real generated secret
+# (fail-closed boot check in apps/api/src/index.ts).
+export NEXTAUTH_SECRET="${NEXTAUTH_SECRET:-}"
 export CORS_ORIGIN="${CORS_ORIGIN:-*}"
 export INTERNAL_SECRET="${INTERNAL_SECRET:-blast1-internal-secret-dev}"
 

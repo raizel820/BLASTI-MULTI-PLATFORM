@@ -148,9 +148,12 @@ export const registerSchema = z.object({
   // 05 55 12 34 56 and stores 0555123456.
   email: z.string().email('A valid email address is required'),
   phoneNumber: dzPhoneNumberSchema,
-  // Task 31: SUPER_ADMIN accepted so programmatic/admin-console registrations can
-  // create platform admins; they skip email/phone verification entirely (auth.ts).
-  role: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'SUPER_ADMIN']).optional().default('CUSTOMER'),
+  // SECURITY (0.6.126 audit T1-1): SUPER_ADMIN was REMOVED from the public
+  // register enum — it let any unauthenticated caller mint a platform admin
+  // (immediate creation + full session). SUPER_ADMINs are created ONLY via
+  // the DB seed (packages/db/prisma/seed.ts). The register route rejects the
+  // role again server-side (defense in depth — see routes/auth.ts).
+  role: z.enum(['CUSTOMER', 'AGENCY_OWNER']).optional().default('CUSTOMER'),
   agencyCode: z.string().optional(),
   // 0.6.54 — staged-registration continuation token: when the user goes BACK
   // from the OTP step to fix a typo (e.g. the email) and re-submits, the form

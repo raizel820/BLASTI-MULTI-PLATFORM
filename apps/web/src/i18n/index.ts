@@ -1,12 +1,31 @@
 import ar from './ar';
-import fr from './fr';
-import en from './en';
 import type { TranslationKeys } from './ar';
 
 export type { TranslationKeys };
 export type Language = 'ar' | 'fr' | 'en';
 
-export const translations: Record<Language, Record<TranslationKeys, string>> = { ar, fr, en };
+// 0.6.127 perf — BUNDLE: all three dictionaries (~880KB of TS source) used
+// to ship statically in the ENTRY CHUNK while only one language is ever
+// active at runtime. Arabic (the app default + primary audience) stays
+// static so first paint is instant with zero key flashes; French/English
+// load as on-demand chunks (kicked at boot from use-language for the stored
+// preference) and are cached here. `translations` keeps its old shape via a
+// Proxy that falls back to Arabic until the active dictionary lands.
+const dictionaries: Partial<Record<Language, Record<TranslationKeys, string>>> = { ar };
+
+export const translations: Record<Language, Record<TranslationKeys, string>> = new Proxy(
+  dictionaries as Record<Language, Record<TranslationKeys, string>>,
+  {
+    get(target, prop: string) {
+      return target[prop as Language] ?? target.ar;
+    },
+  }
+) as Record<Language, Record<TranslationKeys, string>>;
+
+/** Register a lazily-loaded dictionary (called from use-language). */
+export function setDictionary(lang: Language, dict: Record<TranslationKeys, string>): void {
+  dictionaries[lang] = dict;
+}
 
 export const languageNames: Record<Language, string> = {
   ar: 'العربية',

@@ -47,10 +47,20 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
         setDatabase(db);
         setIsReady(true);
 
-        // Start periodic sync (every 5 minutes)
-        // Also syncs on initial load and when coming back online
-        const cleanup = syncEngine.startPeriodicSync(db);
-        return cleanup;
+        // 0.6.127 — PERF: plain web (no Electron/Capacitor shell) never
+        // renders from WatermelonDB — every view paints from the ApiClient
+        // GET-cache + realtime events. The old unconditional 2-minute pull
+        // loop burned CPU/battery/bandwidth on every browser session for
+        // data nothing reads. Electron and Capacitor keep it (offline-first
+        // surfaces that actually consume the local DB).
+        const isElectron = typeof window !== 'undefined' && !!(window as any).electronAPI;
+        const isCapacitorNative = typeof window !== 'undefined' && !!(window as any).Capacitor?.isNativePlatform?.();
+        if (isElectron || isCapacitorNative) {
+          // Start periodic sync (every 5 minutes)
+          // Also syncs on initial load and when coming back online
+          const cleanup = syncEngine.startPeriodicSync(db);
+          return cleanup;
+        }
       }).catch((err) => {
         console.error('[DatabaseProvider] Failed to initialize WatermelonDB:', err);
       });

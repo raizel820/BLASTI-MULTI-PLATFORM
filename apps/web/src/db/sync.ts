@@ -25,6 +25,10 @@ import { buildCloudUrl } from '@/lib/api-client';
 import { isRevoked, setRevoked, clearRevoked } from '@/lib/authz-state';
 import { diag } from '@/lib/diag-log';
 import { onResume } from '@/lib/resume-refresh';
+// 0.6.127 — release phone builds bake NEXT_PUBLIC_SERVER_DISCOVERY=0: no LAN
+// sweep, no manual override. The sync engine previously never consulted the
+// flag (only the request pipeline did) and kept probing.
+import { SERVER_DISCOVERY_LOCKED } from '@/lib/native-cloud-resolver';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -329,6 +333,13 @@ class SyncEngine {
    */
   private async probeLanServer(): Promise<string | null> {
     if (!isBrowser) return null;
+    // 0.6.127 — PRODUCTION LOCK: locked builds (release phone APKs) talk ONLY
+    // to the baked cloud URL. The engine used to ignore the flag, so every
+    // customer phone swept the LAN (/24 × 4 fallback subnets ≈ up to 1,000
+    // plain-HTTP probes at 48-way concurrency + a WebRTC IP-gathering pass)
+    // EVERY 30 SECONDS for the whole session — the single biggest source of
+    // navigation jank and battery drain on mobile.
+    if (SERVER_DISCOVERY_LOCKED) return null;
     if (!navigator.onLine) {
       // When offline, we MUST use LAN sync if available
       // Don't skip the probe just because the internet is down
@@ -964,9 +975,12 @@ class SyncEngine {
     this.periodicRunning = true;
     this.armNextCycle(3000);
     this.armResumeReaction(this.lastDatabase);
-    this.lanProbeIntervalId = setInterval(() => {
-      this.probeLanServer().catch(() => {});
-    }, LAN_PROBE_INTERVAL_MS);
+    // 0.6.127 — no LAN probe loop on locked builds (see probeLanServer).
+    if (!SERVER_DISCOVERY_LOCKED) {
+      this.lanProbeIntervalId = setInterval(() => {
+        this.probeLanServer().catch(() => {});
+      }, LAN_PROBE_INTERVAL_MS);
+    }
   }
 
   /**
@@ -1051,9 +1065,12 @@ class SyncEngine {
 
     // LAN probe loop — re-probe every 30s even if not syncing
     // This ensures we switch to LAN quickly when a desktop comes online
-    this.lanProbeIntervalId = setInterval(() => {
-      this.probeLanServer().catch(() => {});
-    }, LAN_PROBE_INTERVAL_MS);
+    // 0.6.127 — skipped entirely on locked builds (release phones).
+    if (!SERVER_DISCOVERY_LOCKED) {
+      this.lanProbeIntervalId = setInterval(() => {
+        this.probeLanServer().catch(() => {});
+      }, LAN_PROBE_INTERVAL_MS);
+    }
 
     // 0.6.49 — resume reaction: foregrounding the app pulls the increment
     // IMMEDIATELY (the WDB copy catches up before the next 2-min tick),
@@ -1223,7 +1240,16 @@ function syncHttpErrorFromResponse(status: number, errorData: unknown, fallbackM
   const err = (errorData && typeof errorData === 'object' ? (errorData as Record<string, unknown>) : {});
   const raw = typeof err.error === 'string' ? err.error : '';
   const httpError = new SyncHttpError(status, raw || fallbackMessage);
-  httpError.code = /^[A-Z][A-Z0-9_]{5,}$/.test(raw) ? raw : null;
+  // FIELD-AUDIT 2026-11-26 — the desktop local API sends the machine code in
+  // a DEDICATED body field ({ error: 'Invalid session token',
+  // code: 'AUTH_TOKEN_MISMATCH' }), not inside the message. The old
+  // message-only extraction always yielded null for those responses, so the
+  // LAN AUTH_TOKEN_MISMATCH cooldown (5 min) never armed and the engine
+  // retried the same dead-token pull at the 15-min backoff ceiling for hours
+  // ("[SyncEngine] Sync failed: Invalid session token", 285 occurrences).
+  // Prefer the body's code field; fall back to the message-shape heuristic.
+  const bodyCode = typeof err.code === 'string' && /^[A-Z][A-Z0-9_]{5,}$/.test(err.code) ? err.code : null;
+  httpError.code = bodyCode ?? (/^[A-Z][A-Z0-9_]{5,}$/.test(raw) ? raw : null);
   return httpError;
 }
 

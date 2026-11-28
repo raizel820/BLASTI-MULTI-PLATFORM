@@ -113,19 +113,33 @@ async function synthesizeNow({ text, lang, speed }) {
   const rate = SPEED_MAP[speed] || SPEED_MAP.normal
 
   if (kind === 'cli') {
-    const { spawnSync } = require('child_process')
+    // 0.6.127 perf — spawnSync ran INSIDE the Electron MAIN process: every
+    // "calling ticket" announcement froze the window event loop, IPC and the
+    // :3080 UI server for up to the 8s synthesis timeout — the exact recipe
+    // for navigation lag and the "black screen for 30s" chunk-fetch hang.
+    // execFile runs on libuv's thread pool; the main process stays live.
+    const { execFile } = require('child_process')
     const { tmp } = require('os')
     const { join } = require('path')
-    const { readFileSync, unlinkSync } = require('fs')
+    const { readFile: readFileCb, unlink: unlinkCb } = require('fs')
     const outPath = join(tmp(), `blasti-voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`)
-    const res = spawnSync('espeak-ng', [
-      '-v', voice, '-s', String(rate), '-a', '200', '-w', outPath, text,
-    ], { timeout: 8000 })
-    if (res.status !== 0) throw new Error(`espeak-ng CLI failed (${res.status})`)
+    const execFileP = (cmd, args, opts) => new Promise((resolve, reject) => {
+      execFile(cmd, args, opts, (err) => { if (err) reject(err); else resolve() })
+    })
+    const readFileP = (p) => new Promise((resolve, reject) => readFileCb(p, (err, data) => (err ? reject(err) : resolve(data))))
+    const unlinkP = (p) => new Promise((resolve) => unlinkCb(p, () => resolve()))
     try {
-      return readFileSync(outPath)
+      await execFileP('espeak-ng', [
+        '-v', voice, '-s', String(rate), '-a', '200', '-w', outPath, text,
+      ], { timeout: 8000 })
+    } catch (err) {
+      await unlinkP(outPath).catch(() => {})
+      throw new Error(`espeak-ng CLI failed: ${err && err.message ? err.message : err}`)
+    }
+    try {
+      return await readFileP(outPath)
     } finally {
-      try { unlinkSync(outPath) } catch { /* best-effort */ }
+      await unlinkP(outPath).catch(() => {})
     }
   }
 
@@ -183,6 +197,10 @@ function startVoiceService(opts) {
     ? opts.log
     : (m) => console.log('[VOICE] ' + m)
   const port = (opts && Number(opts.port) > 0) ? Number(opts.port) : BLASTI_LAN_PORTS.VOICE_TTS
+  // SECURITY (T1-8): optional caller verifier (device/session token check)
+  // wired from index.js — /speak gates non-loopback callers on it.
+  const verifyCaller = opts && typeof opts.verifyCaller === 'function' ? opts.verifyCaller : null
+  const hostname = opts && opts.hostname ? String(opts.hostname) : '0.0.0.0'
 
   const Hono = require('hono').Hono
   const { serve } = require('@hono/node-server')
@@ -196,25 +214,53 @@ function startVoiceService(opts) {
     await next()
     c.header('Access-Control-Allow-Origin', '*')
     c.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    c.header('Access-Control-Allow-Headers', 'Content-Type')
+    c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Token')
     c.header('Access-Control-Max-Age', '86400')
   })
   app.options('*', (c) => c.body(null, 204))
 
-  // Per-IP limiter (mirrors the print-relay convention).
+  // Per-IP limiter — SECURITY (0.6.126 audit T1-8): keyed on the TCP remote
+  // address (c.env.incoming), NOT client-supplied X-Forwarded-For headers
+  // which any LAN caller can rotate per request to defeat the bucket.
   const hits = new Map()
   const LIMIT = 40
   const WINDOW_MS = 60_000
 
+  function remoteAddrOf(c) {
+    try {
+      const incoming = c.env && c.env.incoming
+      const addr = incoming && incoming.socket && incoming.socket.remoteAddress
+      if (addr) return String(addr)
+    } catch { /* fall through */ }
+    return 'lan'
+  }
+
   function limited(c) {
-    const ip = (c.req.header('x-forwarded-for') || '').split(',')[0].trim()
-      || c.req.header('x-real-ip') || 'lan'
+    const ip = remoteAddrOf(c)
     const now = Date.now()
     const entry = hits.get(ip) || { count: 0, windowStart: now }
     if (now - entry.windowStart > WINDOW_MS) { entry.count = 0; entry.windowStart = now }
     entry.count += 1
     hits.set(ip, entry)
     return entry.count > LIMIT
+  }
+
+  // SECURITY (T1-8): /speak was UNGATED on 0.0.0.0 — any LAN device could
+  // synthesize arbitrary audio on the branch PC. Non-loopback callers must
+  // now present a device token or session token (verifyCaller, wired from
+  // index.js). Loopback (the local UI / master itself) stays open.
+  function isLoopbackCaller(c) {
+    const addr = remoteAddrOf(c)
+    return /^(127\.0\.0\.1$|::1$|::ffff:127\.0\.0\.1$)/.test(addr)
+  }
+
+  async function authorizedCaller(c) {
+    if (isLoopbackCaller(c)) return true
+    if (!verifyCaller) return true // no verifier wired → keep legacy behavior
+    const token = (c.req.header('Authorization') || '').replace(/^Bearer\s+/i, '')
+      || c.req.header('X-Device-Token') || ''
+    if (!token) return false
+    try { return Boolean(await verifyCaller(token)) } catch { return false }
   }
 
   function parseSpec(obj) {
@@ -229,6 +275,9 @@ function startVoiceService(opts) {
   async function handleSpeak(c, spec) {
     if (!spec.text) {
       return c.json({ success: false, error: 'text query param required' }, 400)
+    }
+    if (!(await authorizedCaller(c))) {
+      return c.json({ success: false, error: 'Device or session token required' }, 401)
     }
     if (limited(c)) {
       return c.json({ success: false, error: 'Too many requests — slow down' }, 429)
@@ -281,8 +330,10 @@ function startVoiceService(opts) {
 
   let server = null
   try {
-    server = serve({ fetch: app.fetch, port }, () => {
-      log(`dedicated voice service running on http://0.0.0.0:${port} (offline TTS: ar/fr/en)`)
+    // SECURITY (T1-8): honor the deployment bind address (BLASTI_LAN_BIND —
+    // loopback-only desktops no longer expose :3084 to the whole LAN).
+    server = serve({ fetch: app.fetch, port, hostname }, () => {
+      log(`dedicated voice service running on http://${hostname}:${port} (offline TTS: ar/fr/en)`)
       resolveEngine().then((kind) => log(`voice engine ready: ${kind}`)).catch(() => undefined)
     })
     server.on('error', (err) => {

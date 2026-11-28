@@ -220,10 +220,10 @@ app.patch('/change-password', async (c) => {
 
     // passwordHash is nullable (Task 14): a NULL hash means no password is
     // set cloud-side — the current-password check can never succeed.
-    const isCorrect = !!dbUser.passwordHash && verifyPassword(currentPassword, dbUser.passwordHash)
+    const isCorrect = !!dbUser.passwordHash && (await verifyPassword(currentPassword, dbUser.passwordHash))
     if (!isCorrect) return c.json({ error: 'Current password is incorrect' }, 401)
 
-    const newHash = hashPassword(newPassword)
+    const newHash = await hashPassword(newPassword)
     await db.user.update({ where: { id: user.id }, data: { passwordHash: newHash } })
 
     // 0.6.51 — audit trail on every self-service password rotation (the

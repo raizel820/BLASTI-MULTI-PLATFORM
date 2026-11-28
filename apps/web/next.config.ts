@@ -124,6 +124,28 @@ const nextConfig: NextConfig = {
     unoptimized: true,
   },
 
+  // SECURITY (0.6.126 audit T1-4): baseline hardening headers. The web app
+  // shipped NO security headers at all before this — clickjackable (no
+  // frame-ancestors), MIME-sniffable, no referrer discipline. CSP is
+  // deliberately NOT set here: the app's runtime (Google Maps loader, Radix
+  // inline styles, Next dev runtime) breaks under a naive policy and a broken
+  // CSP bricks the UI; introducing CSP needs its own measured rollout
+  // (nonce-based script-src + style-src audit).
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "Permissions-Policy", value: "camera=(self), microphone=(), geolocation=(self)" },
+          { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
+        ],
+      },
+    ];
+  },
+
   // Allow cross-origin dev resources from the preview panel, local loopback,
   // and this machine's private LAN IPs (phones/tablets on the same Wi-Fi).
   // NOTE: `*` only matches ONE full DNS label — `preview-chat-*.space-z.ai`

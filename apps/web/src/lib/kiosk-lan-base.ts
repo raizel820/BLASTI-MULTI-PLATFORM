@@ -147,8 +147,14 @@ async function probeBeacon(ip: string, port: number, timeoutMs = 1500): Promise<
  * Resolve a branch/agency code to a LIVE desktop LAN host:
  * 1. Ask the CLOUD `/api/lan-topology/resolve?code=…` for candidate hosts the
  *    agency's desktops reported in the last 5 minutes.
- * 2. Probe each candidate's `/api/discover` beacon on the LAN.
- * 3. Return the agency + the first live host (callers then pin the base via
+ * 2. Probe each candidate's `/api/discover` beacon on the LAN — 0.6.126 ALL
+ *    candidates probe IN PARALLEL (the old sequential for-of paid up to
+ *    1.5s × dead hosts before reaching the live one — a named cause of the
+ *    "kiosk takes up to 30s to enter waiting-for-discovery" report).
+ * 3. Prefer the MASTER-role host when several answer (device-to-device
+ *    priority: the elected master owns every write; pinning a follower
+ *    would put writes behind the 409 NOT_MASTER gate).
+ * 4. Return the agency + the chosen live host (callers then pin the base via
  *    setKioskLanBase and continue the normal register/pair flow against it).
  *
  * Never throws — failures come back as `{ agency: null, hosts: [], server: null }`.
@@ -174,15 +180,29 @@ export async function resolveBranchLanServer(code: string, timeoutMs = 6000): Pr
     const hosts = (Array.isArray(body.hosts) ? body.hosts : []).filter(
       (h) => h && isPrivateIpv4(String(h.ip)) && Number.isFinite(Number(h.port)) && Number(h.port) > 0,
     );
-    for (const host of hosts) {
-      const live = await probeBeacon(host.ip, Number(host.port));
-      if (live) {
-        return {
-          agency: body.agency ?? null,
-          hosts,
-          server: { ip: host.ip, port: Number(host.port), name: host.name },
-        };
-      }
+    if (hosts.length === 0) return { agency: body.agency ?? null, hosts, server: null };
+    // 0.6.126 — probe every candidate AT ONCE, then rank: MASTER first.
+    const probed = await Promise.all(
+      hosts.map(async (host) => ({
+        host,
+        live: await probeBeacon(host.ip, Number(host.port)),
+      })),
+    );
+    const liveHosts = probed
+      .filter((p) => p.live)
+      .map((p) => p.host)
+      .sort((a, b) => {
+        const aMaster = String(a.role || '').toUpperCase() === 'MASTER' ? 1 : 0;
+        const bMaster = String(b.role || '').toUpperCase() === 'MASTER' ? 1 : 0;
+        return bMaster - aMaster;
+      });
+    const chosen = liveHosts[0];
+    if (chosen) {
+      return {
+        agency: body.agency ?? null,
+        hosts,
+        server: { ip: chosen.ip, port: Number(chosen.port), name: chosen.name },
+      };
     }
     return { agency: body.agency ?? null, hosts, server: null };
   } catch {
@@ -205,4 +225,32 @@ export async function pinKioskLanBaseFromIp(ipInput: string): Promise<boolean> {
   if (!live) return false;
   setKioskLanBase(`http://${ip}:${port}`);
   return true;
+}
+
+// ─── 0.6.126 — SIMULTANEOUS CLOUD REACHABILITY PROBE ────────────────────────
+// USER REQUIREMENT: "launch discovery on both local and cloud on the same
+// time giving connection priority to device to device first". The kiosk
+// mount effect now races the LAN sweep against THIS probe: whichever path
+// answers first decides the connection channel, and a live LAN desktop
+// always WINS the tie (device-to-device priority). Any HTTP answer — even a
+// 401/503 — proves the cloud path is alive; only a network error means it
+// is not.
+export async function probeCloudReachable(timeoutMs = 4000): Promise<boolean> {
+  try {
+    const { buildCloudUrl } = await import('./api-client');
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const res = await fetch(buildCloudUrl('/api/health'), {
+        headers: { Accept: 'application/json' },
+        signal: ctl.signal,
+      });
+      // Any resolved HTTP status proves the cloud answered.
+      return res.status > 0;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return false;
+  }
 }

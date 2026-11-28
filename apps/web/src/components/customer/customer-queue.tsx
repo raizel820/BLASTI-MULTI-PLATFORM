@@ -33,10 +33,11 @@ import { apiFetch } from '@/lib/api-fetch';
 import { useResumeRefresh } from '@/lib/resume-refresh';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 import { logQueue } from '@/lib/remote-logger';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useRealtime } from '@/hooks/use-realtime';
+import { debounceTrailing } from '@/lib/debounce';
 // Hotfix 0.6.12 — per-category terminology scope (see original note below):
 // this import was missing once and the hook call threw a runtime
 // ReferenceError that crashed the whole queue page. Every consumer imports
@@ -172,6 +173,16 @@ export function CustomerQueue() {
   const [calledCounterHints, setCalledCounterHints] = useState<Record<string, string>>({});
 
   const realtime = useRealtime();
+
+  // 0.6.127 — mirror of `reservations` for event handlers. The subscription
+  // and room-join effects used to depend on the `reservations` ARRAY ITSELF:
+  // every fetch produced a new array → all ~12 socket subscriptions were
+  // torn down and re-registered and every agency room was left/re-joined on
+  // EVERY fetch (and events landing inside the teardown window were
+  // silently dropped). Handlers now read the ref; the effects depend on a
+  // stable derived key instead.
+  const reservationsRef = useRef<Reservation[]>([]);
+  useEffect(() => { reservationsRef.current = reservations; }, [reservations]);
 
   // ─── Fetch Reservations (unchanged logic) ─────────────────────────────
   const fetchReservations = useCallback(async () => {
@@ -374,7 +385,12 @@ export function CustomerQueue() {
       if (isBothUnreachable()) return 300_000;
       if (failures >= 3) return 120_000;
       if (failures >= 1) return 60_000;
-      return isFastPolling ? 3_000 : refreshInterval;
+      // 0.6.127 — fast-poll ONLY while realtime is down: the 3s per-customer
+      // poll used to run even with the socket connected, amplifying load
+      // (venue NAT shares one rate-limit bucket) for data events already
+      // deliver instantly. Socket up → events + the 10s reconciliation tick;
+      // socket down → fast-poll resumes.
+      return (isFastPolling && !realtime.isConnected) ? 3_000 : refreshInterval;
     };
 
     const tick = async () => {
@@ -408,10 +424,13 @@ export function CustomerQueue() {
   }, [user?.id, realtime]);
 
   useEffect(() => {
-    const agencyIds = new Set(reservations.map(r => r.agencyId).filter(Boolean) as string[]);
-    agencyIds.forEach(id => realtime.joinAgency(id));
+    // 0.6.127 — stable join key: the room set only changes when the customer
+    // actually books with a DIFFERENT agency — not on every fetch tick.
+    const agencyIdsKey = Array.from(new Set(reservations.map(r => r.agencyId).filter(Boolean) as string[])).sort().join(',');
+    const ids = agencyIdsKey ? agencyIdsKey.split(',').filter(Boolean) : [];
+    ids.forEach(id => realtime.joinAgency(id));
     return () => {
-      agencyIds.forEach(id => realtime.leaveAgency(id));
+      ids.forEach(id => realtime.leaveAgency(id));
     };
   }, [reservations, realtime]);
 
@@ -419,13 +438,18 @@ export function CustomerQueue() {
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
 
+    // 0.6.127 — trailing-debounced event fetch: a staff call-next emits 2-3
+    // queue events; without the debounce each one was an immediate full
+    // refetch (phones behind venue NAT share one rate-limit bucket).
+    const fetchOnEvent = debounceTrailing(() => { void fetchReservations(); }, 300);
+
     const handleQueueEvent = () => {
-      fetchReservations();
+      fetchOnEvent();
     };
 
     const handleTerminalQueueEvent = () => {
       clearSleep();
-      fetchReservations();
+      fetchOnEvent();
     };
 
     // r21-8 — learn the counter pointer from the event payloads (the ticket
@@ -443,7 +467,7 @@ export function CustomerQueue() {
 
     unsubscribers.push(realtime.onQueueCalled((event: unknown) => {
       learnCounterHint(event);
-      fetchReservations();
+      fetchOnEvent();
     }));
     unsubscribers.push(realtime.onQueueCompleted(handleTerminalQueueEvent));
     unsubscribers.push(realtime.onQueueNoShow(handleTerminalQueueEvent));
@@ -455,7 +479,7 @@ export function CustomerQueue() {
     unsubscribers.push(realtime.onQueuePositionChanged(handleQueueEvent));
 
     unsubscribers.push(realtime.onTurnApproaching((event: unknown) => {
-      fetchReservations();
+      fetchOnEvent();
       toast.info(t('turnApproachingNotif'), {
         description: t('turnApproachingNotifDesc'),
         duration: 6000,
@@ -489,8 +513,8 @@ export function CustomerQueue() {
 
     unsubscribers.push(realtime.onYourTurn((event: unknown) => {
       learnCounterHint(event);
-      fetchReservations();
-      const calledRes = reservations.find(r => r.status === 'CALLED');
+      fetchOnEvent();
+      const calledRes = reservationsRef.current.find(r => r.status === 'CALLED');
       if (calledRes && !shouldShowAlert(calledRes.id)) return;
       if (!soundStartedRef.current) {
         soundStartedRef.current = true;
@@ -516,9 +540,10 @@ export function CustomerQueue() {
     }));
 
     return () => {
+      fetchOnEvent.cancel();
       unsubscribers.forEach(unsub => unsub());
     };
-  }, [realtime, fetchReservations, soundMuted, t, reservations]);
+  }, [realtime, fetchReservations, soundMuted, t]);
 
   // Reactivation: re-show alert ONCE when 10-min sleep expires
   useEffect(() => {

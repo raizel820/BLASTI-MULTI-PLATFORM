@@ -82,12 +82,30 @@ function pushMainLog(level, line) {
     if (_mainLogRing.length > 300) _mainLogRing.splice(0, _mainLogRing.length - 300);
   } catch { /* never let logging break the app */ }
 }
-(function mirrorConsoleToFile() {
+  (function mirrorConsoleToFile() {
   const fmt = (a) => {
     if (typeof a === 'string') return a;
     if (a instanceof Error) return a.stack || a.message;
     try { return JSON.stringify(a); } catch { return String(a); }
   };
+  // 0.6.127 perf — the old mirror did fs.appendFileSync PER LOG LINE on the
+  // main process; a busy sync round (per-row logs × ~700 call sites) stalled
+  // the UI thread on every line. A single append-only write stream batches
+  // the writes asynchronously; rotation is handled by the same 2MB guard.
+  let logStream = null;
+  let logStreamPath = null;
+  function getLogStream() {
+    const file = logFilePath || initFileLogger();
+    if (!file) return null;
+    if (logStream && logStreamPath === file) return logStream;
+    try {
+      if (logStream) { try { logStream.end(); } catch { /* ignore */ } }
+      logStream = fs.createWriteStream(file, { flags: 'a' });
+      logStreamPath = file;
+      logStream.on('error', () => { logStream = null; logStreamPath = null; });
+      return logStream;
+    } catch { return null; }
+  }
   for (const level of ['log', 'warn', 'error']) {
     const original = console[level].bind(console);
     console[level] = (...args) => {
@@ -95,8 +113,8 @@ function pushMainLog(level, line) {
       try {
         const line = args.map(fmt).join(' ');
         pushMainLog(level, line);
-        const file = logFilePath || initFileLogger();
-        if (file) fs.appendFileSync(file, `[${new Date().toISOString()}] [${level}] ${line}\n`);
+        const stream = getLogStream();
+        if (stream) stream.write(`[${new Date().toISOString()}] [${level}] ${line}\n`);
       } catch { /* never let logging break the app */ }
     };
   }
@@ -703,18 +721,35 @@ process.on('exit', () => clearInterval(_keepAlive));
  * Get the first non-internal IPv4 address of this machine.
  * Used by the UDP beacon and the /api/discover endpoint.
  */
-function getLocalIP() {
+// 0.6.127 perf — os.networkInterfaces() is a slow OS syscall (Windows
+// GetAdaptersAddresses especially). The beacon used to call getLocalIP() 2×
+// + getBeaconBroadcastAddresses() 1× per 3s tick (≈6 sweeps/3s forever).
+// Cache the answers for 60s — adapters do not churn faster than that in
+// normal operation, and a stale IP for ≤60s after a network change is
+// invisible to discovery (beacons refresh immediately after).
+let _lanInterfacesCache = { ip: null, targets: null, at: 0 };
+function getLanInterfacesCached() {
+  const now = Date.now();
+  if (_lanInterfacesCache.targets && (now - _lanInterfacesCache.at) < 60_000) {
+    return _lanInterfacesCache;
+  }
   const os = require('os');
   const interfaces = os.networkInterfaces();
+  let ip = '0.0.0.0';
+  const targets = new Set(['255.255.255.255']);
   for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]) {
-      // Skip internal and non-IPv4 addresses
-      if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address;
-      }
+    for (const iface of interfaces[name] || []) {
+      if (iface.family !== 'IPv4' || iface.internal) continue;
+      if (ip === '0.0.0.0') ip = iface.address;
+      if (iface.broadcast) targets.add(iface.broadcast);
     }
   }
-  return '0.0.0.0';
+  _lanInterfacesCache = { ip, targets: Array.from(targets), at: now };
+  return _lanInterfacesCache;
+}
+
+function getLocalIP() {
+  return getLanInterfacesCached().ip;
 }
 
 /**
@@ -967,18 +1002,7 @@ function buildBeaconPayload() {
 
 /** All broadcast addresses worth announcing on (subnets + global broadcast). */
 function getBeaconBroadcastAddresses() {
-  const targets = new Set(['255.255.255.255']);
-  try {
-    const os = require('os');
-    const interfaces = os.networkInterfaces();
-    for (const addrs of Object.values(interfaces)) {
-      for (const iface of addrs || []) {
-        if (iface.family !== 'IPv4' || iface.internal) continue;
-        if (iface.broadcast) targets.add(iface.broadcast);
-      }
-    }
-  } catch { /* global broadcast alone is fine */ }
-  return Array.from(targets);
+  return getLanInterfacesCached().targets;
 }
 
 function startLanBeacon() {
@@ -1055,8 +1079,14 @@ async function captureBoardSnapshot(url) {
       if (!snapshotWindow || snapshotWindow.isDestroyed()) {
         snapshotWindow = new BrowserWindow({
           show: false,
-          width: 1920,
-          height: 1080,
+          // 0.6.127 perf — was 1920×1080: the snapshot loop re-renders the
+          // ENTIRE TV board every 45s during cast sessions, and a full-HD
+          // offscreen render in the SAME process as the visible window stole
+          // compositing time → navigation jank. 1280×720 is far more than a
+          // compressed JPEG pushed to a TV needs (renderers downscale it to
+          // their panel anyway).
+          width: 1280,
+          height: 720,
           x: -32000,
           y: -32000,
           webPreferences: {
@@ -1598,7 +1628,7 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     title: 'BLASTI - بلاصتي',
-    backgroundColor: '#0a0f1a',
+    backgroundColor: '#ffffff',
     // Always show immediately for loading screen
     show: true,
     webPreferences: {
@@ -5326,7 +5356,16 @@ ipcMain.handle('local-db:query', async (_event, { table, options }) => {
     const { localDb } = require('./local-api/lib/db');
     const model = localDb[table];
     if (!model) return { success: false, error: `Unknown model: ${table}`, data: [] };
-    const data = await model.findMany(options || {});
+    // 0.6.127 perf — this IPC fallback becomes the hot path for list pages
+    // when the cloud is unreachable: an unpaginated findMany serialized a
+    // WHOLE table over IPC on the main process (multi-second stalls exactly
+    // when the app is offline/stressed). Cap every query and forbid
+    // unbounded selects.
+    const safeOptions = { ...(options || {}) };
+    const take = Number(safeOptions.take);
+    safeOptions.take = Number.isFinite(take) && take > 0 ? Math.min(Math.floor(take), 500) : 500;
+    if (safeOptions.include) delete safeOptions.include; // relation fan-out not allowed over this bridge
+    const data = await model.findMany(safeOptions);
     return { success: true, data };
   } catch (err) {
     return { success: false, error: err.message, data: [] };

@@ -431,6 +431,10 @@ model Agency {
   @@index([isActive, isSponsored, createdAt])
   // Category filter (public listing + branch search agency filter).
   @@index([category])
+  // 0.6.127 perf — ownerId is the hot auth path: verifyAgencyOwnership /
+  // getUserAgencyId / login run findFirst({ ownerId }) on EVERY agency-
+  // authenticated request (previously a full-table scan).
+  @@index([ownerId])
 }
 
 // Phase 2: Dynamic SubscriptionPlan model — replaces hardcoded subscriptionTier enum
@@ -1675,6 +1679,9 @@ model AgencyDevice {
   @@index([deviceToken])
   @@index([lastHeartbeatAt])
   @@index([deviceFingerprint])
+  // 0.6.127 perf — the device heartbeat watchdog looks devices up by IP on
+  // every 30s tick (and every printer touch); previously a full-table scan.
+  @@index([ipAddress])
 }
 
 // ─── Saved TVs (discovered TVs the agency wants to keep for later) ─────────
@@ -2091,6 +2098,9 @@ model SyncChange {
   @@index([agencyId, sequence])
   @@index([agencyId, model, recordId])
   @@index([mutationId])
+  // 0.6.127 perf — the 6-hourly prune deletes by changedAt cutoff; without
+  // this index every prune seq-scanned the append-only feed.
+  @@index([changedAt])
 }
 
 /// Durable idempotency ledger for mutations arriving from desktop/mobile.

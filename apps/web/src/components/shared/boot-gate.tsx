@@ -49,6 +49,15 @@ export function BootGate({ onDone }: { onDone: () => void }) {
   const [phase, setPhase] = useState<BootPhase>('preparing');
   const [showSlowNote, setShowSlowNote] = useState(false);
 
+  // 0.6.127 — PLAIN-WEB DETECTION: the web UI paints from the ApiClient
+  // GET-cache (persisted snapshot + ETag revalidation), never from
+  // WatermelonDB. Waiting up to 25s for the first sync cycle added pure
+  // blank-splash time to every reload on plain web. Electron and Capacitor
+  // shells keep the full offline-first gate (they render offline).
+  const isPlainWeb = typeof window !== 'undefined'
+    && !(window as any).electronAPI
+    && !(window as any).Capacitor?.isNativePlatform?.();
+
   const doneRef = useRef(false);
   const onDoneRef = useRef(onDone);
   useEffect(() => {
@@ -99,6 +108,15 @@ export function BootGate({ onDone }: { onDone: () => void }) {
         console.warn('[BootGate] Offline DB not ready in time — proceeding without initial sync');
         finish('db-not-ready');
       }, DB_WAIT_CAP_MS));
+    } else if (isPlainWeb) {
+      // 0.6.127 — plain-web fast boot: kick the first sync cycle in the
+      // BACKGROUND and release the gate after the minimum splash time. The
+      // dashboard mounts with cached/API data immediately; nothing on plain
+      // web reads WatermelonDB for rendering, so blocking on the pull only
+      // delayed first paint (up to MAX_WAIT_MS on slow links).
+      setPhase('syncing');
+      void syncEngine.runSyncAndWait(database).catch(() => {});
+      finish('plain-web-fast-boot');
     } else {
       setPhase('syncing');
       let syncErrorMessage: string | null = null;
@@ -118,7 +136,9 @@ export function BootGate({ onDone }: { onDone: () => void }) {
       cancelled = true;
       timers.forEach(clearTimeout);
     };
-  }, [dbReady, database]);
+    // isPlainWeb is stable per mount (window doesn't change type) — the lint
+    // exhaustive-deps rule would demand it; include for correctness.
+  }, [dbReady, database, isPlainWeb]);
 
   const phaseLabel =
     phase === 'syncing'

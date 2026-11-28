@@ -4769,6 +4769,47 @@ function createApp() {
         return c.json({ success: false, error: 'Token and user required' }, 400)
       }
 
+      // ── SECURITY (0.6.126 audit T1-7): import-session takeover fix ──────
+      // This route used to accept ANY body { token, user } from ANY LAN host
+      // with no auth: a non-JWT token skipped cloud validation entirely and
+      // a JWT-shaped token was accepted offline — the caller then held a
+      // local session with attacker-chosen role/agencyId. Now:
+      //   • non-loopback callers MUST present a real cloud session JWT;
+      //   • when the cloud is unreachable, the JWT signature is verified
+      //     LOCALLY (HS256 + NEXTAUTH_SECRET, timing-safe) before any
+      //     offline import;
+      //   • user claims for non-loopback callers are derived from the
+      //     verified JWT payload, never from the request body.
+      // Loopback callers (the Electron renderer itself) keep today's
+      // offline-first behavior.
+      const incomingReq = (c.env && c.env.incoming) || null
+      const remoteAddr = incomingReq && incomingReq.socket ? String(incomingReq.socket.remoteAddress || '') : ''
+      const isLoopbackRequest = /^(127\.0\.0\.1$|::1$|::ffff:127\.0\.0\.1$)/.test(remoteAddr)
+      const looksLikeCloudJwtT1 = typeof token === 'string' &&
+        token.split('.').length === 3 && token.indexOf('eyJ') === 0
+
+      const verifyHs256JwtLocally = (jwt) => {
+        try {
+          const secret = process.env.NEXTAUTH_SECRET
+          if (!secret) return null
+          const parts = String(jwt).split('.')
+          if (parts.length !== 3) return null
+          const b64 = (s) => Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64')
+          const expected = createHmac('sha256', secret).update(parts[0] + '.' + parts[1]).digest()
+          const sig = b64(parts[2])
+          if (sig.length !== expected.length || !timingSafeEqual(sig, expected)) return null
+          const payload = JSON.parse(b64(parts[1]).toString('utf8'))
+          if (!payload || typeof payload !== 'object' || !payload.id) return null
+          if (typeof payload.exp === 'number' && payload.exp * 1000 < Date.now()) return null
+          return payload
+        } catch { return null }
+      }
+
+      if (!isLoopbackRequest && !looksLikeCloudJwtT1) {
+        console.warn(`[LocalAPI] import-session REFUSED — non-loopback caller (${remoteAddr}) presented a non-JWT token`)
+        return c.json({ success: false, error: 'import-session refused — non-loopback callers must present a cloud session token' }, 403)
+      }
+
       // ── Task 33-C: workspace-LOCK gate (closes the re-import hole) ──────
       // A locked workspace must never be resurrected by re-importing the
       // stale token (the loading-screen fallback and a renderer rehydration
@@ -4793,6 +4834,7 @@ function createApp() {
       // first — never block on unavailability). Validation is capped at ~5s
       // per hop so reloads stay snappy.
       let adopted = null
+      let offlineVerifiedPayload = null
       try {
         // Task 67: a LOCAL-ONLY token (offline device unlock / legacy unlock)
         // is raw hex — the cloud can NEVER recognize it. Validating it used to
@@ -4814,7 +4856,21 @@ function createApp() {
         }
 
         if (!cloudReachable) {
-          console.log('[LocalAPI] Cloud unreachable — importing session offline (offline-first)')
+          if (isLoopbackRequest) {
+            console.log('[LocalAPI] Cloud unreachable — importing session offline (loopback renderer, offline-first)')
+          } else {
+            // SECURITY (T1-7): a non-loopback offline import MUST present a
+            // cryptographically verifiable cloud JWT — signature + expiry
+            // checked against NEXTAUTH_SECRET right here. Previously any
+            // LAN host could inject an arbitrary session while the cloud
+            // was unreachable ("offline-first") with attacker-chosen claims.
+            offlineVerifiedPayload = verifyHs256JwtLocally(token)
+            if (!offlineVerifiedPayload) {
+              console.warn(`[LocalAPI] import-session REFUSED — cloud unreachable and the token could not be verified locally (caller ${remoteAddr})`)
+              return c.json({ success: false, error: 'Cloud unreachable — session token could not be verified' }, 403)
+            }
+            console.log('[LocalAPI] Cloud unreachable — importing session offline from a LOCALLY-VERIFIED cloud JWT (non-loopback caller)')
+          }
         } else {
           let vStatus = 0
           let vData = null
@@ -4864,7 +4920,21 @@ function createApp() {
       }
 
       const finalToken = adopted ? adopted.token : token
-      const finalUser = adopted ? adopted.user : user
+      // SECURITY (T1-7): for a non-loopback offline import the user identity
+      // is derived from the VERIFIED JWT payload — body claims are ignored.
+      const finalUser = adopted
+        ? adopted.user
+        : (offlineVerifiedPayload
+          ? {
+              id: offlineVerifiedPayload.id,
+              username: offlineVerifiedPayload.username || offlineVerifiedPayload.fullName || 'imported',
+              fullName: offlineVerifiedPayload.fullName || '',
+              role: offlineVerifiedPayload.role || 'CUSTOMER',
+              language: offlineVerifiedPayload.language || 'ar',
+              avatarUrl: offlineVerifiedPayload.avatarUrl || null,
+              agencyId: offlineVerifiedPayload.agencyId || null,
+            }
+          : user)
 
       // Set session with the CLOUD token (so LAN failover works with the same token)
       // Task 41 — assignSession records the rotation (stale renderer token
@@ -13619,6 +13689,10 @@ function createApp() {
     const pathMod = require('path')
     const fsMod = require('fs')
     const STATIC_UI_ROOT = pathMod.resolve(__dirname, '..', 'out')
+    // 0.6.127 — LRU for immutable /_next/static chunks (content-hashed →
+    // never change). Caps at 24 entries × ≤2MB each.
+    const STATIC_UI_CACHE_MAX = 24
+    const staticUiCache = new Map()
     const STATIC_MIME = {
       html: 'text/html; charset=utf-8',
       js: 'text/javascript; charset=utf-8',
@@ -13671,7 +13745,7 @@ function createApp() {
       }
       return null
     }
-    app.get('*', (c) => {
+    app.get('*', async (c) => {
       const file = resolveStaticUiFile(c.req.url)
       if (!file) {
         return c.json({ success: false, error: 'Not found', path: c.req.path }, 404)
@@ -13679,16 +13753,36 @@ function createApp() {
       const ext = pathMod.extname(file).slice(1).toLowerCase()
       const mime = STATIC_MIME[ext] || 'application/octet-stream'
       const isHtml = mime.startsWith('text/html')
+      const isImmutableStatic = file.includes(pathMod.join('_next', 'static'))
       const cacheControl = isHtml
         ? 'no-cache'
-        : file.includes(pathMod.join('_next', 'static'))
+        : isImmutableStatic
           ? 'public, max-age=31536000, immutable'
           : 'no-cache'
+      // 0.6.127 perf — this handler serves EVERY lazy view chunk / HTML /
+      // RSC payload the SPA fetches during page navigation, and it used to
+      // do a SYNCHRONOUS fs.readFileSync inside the Electron main process —
+      // blocking the very thread the renderer needs for IPC at exactly the
+      // moment of a navigation (multiplied by the handful of chunk requests
+      // a view switch fires). Async read + a small LRU for immutable
+      // content-hashed chunks keeps navigations smooth.
+      const cached = staticUiCache.get(file)
+      if (cached) {
+        staticUiCache.delete(file)
+        staticUiCache.set(file, cached)
+        return c.body(cached, 200, { 'Content-Type': mime, 'Cache-Control': cacheControl })
+      }
       try {
-        return c.body(fsMod.readFileSync(file), 200, {
-          'Content-Type': mime,
-          'Cache-Control': cacheControl,
-        })
+        const buf = await fsMod.promises.readFile(file)
+        if (isImmutableStatic && buf.length > 0 && buf.length <= 2 * 1024 * 1024) {
+          staticUiCache.set(file, buf)
+          while (staticUiCache.size > STATIC_UI_CACHE_MAX) {
+            const oldest = staticUiCache.keys().next().value
+            if (oldest === undefined) break
+            staticUiCache.delete(oldest)
+          }
+        }
+        return c.body(buf, 200, { 'Content-Type': mime, 'Cache-Control': cacheControl })
       } catch (err) {
         return c.json({ success: false, error: 'Static read failed', detail: err.message }, 500)
       }
@@ -14161,6 +14255,9 @@ async function startLocalApi(dbPath, port, options) {
     }
     printRelayListener = printRelayHandler.startPrintRelayListener({
       port: BLASTI_LAN_PORTS.PRINT_RELAY,
+      // SECURITY (T1-8): bind like the main API (BLASTI_LAN_BIND) — a
+      // loopback-only desktop no longer exposes the print relay to the LAN.
+      hostname: BIND_ADDRESS,
       verifyCaller: verifyPrintRelayCaller,
       getDb: () => db,
       log: (m) => console.log('[LocalAPI] [PRINT-RELAY] ' + m),
@@ -14181,6 +14278,10 @@ async function startLocalApi(dbPath, port, options) {
     const { BLASTI_LAN_PORTS: voicePorts } = require('./lib/lan-ports')
     voiceListener = startVoiceService({
       port: voicePorts.VOICE_TTS,
+      // SECURITY (T1-8): bind like the main API + token-gate /speak for
+      // non-loopback callers (device token or session token).
+      hostname: BIND_ADDRESS,
+      verifyCaller: verifyPrintRelayCaller,
       log: (m) => console.log('[LocalAPI] [VOICE] ' + m),
     })
   } catch (err) {

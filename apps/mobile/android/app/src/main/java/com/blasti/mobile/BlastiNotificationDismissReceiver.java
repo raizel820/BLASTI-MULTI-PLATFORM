@@ -39,6 +39,11 @@ public class BlastiNotificationDismissReceiver extends BroadcastReceiver {
     /** Notification id extra so the receiver can cancel the right one. */
     static final String EXTRA_NOTIFICATION_ID = "notificationId";
 
+    /** Notification tag extra (0.6.126) — notifications posted under a stable
+     *  tag ("blasti-turn-<reservationId>") must be cancelled by TAG+id, not id
+     *  alone (the same id exists under other tags). */
+    static final String EXTRA_NOTIFICATION_TAG = "notificationTag";
+
     /** Shared prefs file — the same one BlastiNativeStatus.setLockscreenTakeover uses. */
     static final String PREFS_FILE = "blasti-native-prefs";
     static final String KEY_TURN_DISMISSED_AT = "turnDismissedAt";
@@ -52,7 +57,17 @@ public class BlastiNotificationDismissReceiver extends BroadcastReceiver {
         // 1) Cancel the notification. On swipe (deleteIntent) the system has
         //    already removed it — cancelling a stale id is a harmless no-op.
         //    On the explicit Stop ACTION button this is the actual removal.
-        if (id >= 0) {
+        //    0.6.126 — tag-aware: tagged notifications cancel by tag+id
+        //    (also stops FLAG_INSISTENT ringing immediately).
+        String tag = intent.getStringExtra(EXTRA_NOTIFICATION_TAG);
+        if (tag != null && !tag.isEmpty() && id >= 0) {
+            try {
+                Object nm = context.getSystemService(Context.NOTIFICATION_SERVICE);
+                if (nm instanceof android.app.NotificationManager) {
+                    ((android.app.NotificationManager) nm).cancel(tag, id);
+                }
+            } catch (Throwable ignored) { }
+        } else if (id >= 0) {
             try {
                 Object nm = context.getSystemService(Context.NOTIFICATION_SERVICE);
                 if (nm instanceof android.app.NotificationManager) {

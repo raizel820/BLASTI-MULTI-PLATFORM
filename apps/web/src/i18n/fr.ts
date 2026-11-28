@@ -2383,6 +2383,7 @@ const fr: Record<TranslationKeys, string> = {
   itIsYourTurn: "C'est votre tour !",
   imHere: "Je suis là",
   turnAlertSubtitle: 'Votre tour a été appelé',
+  turnAlertStop: 'Arrêter',
 
   // ─── Agency Dashboard Enhancement ─────────────
   nowServingHero: 'En cours de service',

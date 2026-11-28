@@ -7,6 +7,9 @@ import { getClientIp } from '../lib/rate-limit'
 import { validateBody, createAnnouncementSchema, createBranchSchema, updateBranchSchema, createCounterSchema, updateCounterSchema, updateAgencyProfileSchema, updateAgencySettingsSchema, createServiceSchema, updateServiceSchema, updateStaffSchema, createStaffSchema, createReviewSchema, subscriptionPaySchema, subscriptionUnsubscribeSchema, updateWorkingHoursSchema, createHardwareOrderSchema, createEnterpriseRequestSchema } from '../lib/validations'
 import { servicePolicyPriceViolation, getServicePolicyForCategory } from './admin-service-policies'
 import { emitQueueEvent, emitNotificationEvent, emitKioskEvent, emitReservationEvent, emitAgencyEvent, emitStaffEvent, emitCounterEvent } from '../lib/realtime-emit'
+// 0.6.126 — data-only FCM turn-call push (call-style lock-screen alert
+// rendered by BlastiFirebaseMessagingService when the app is closed/locked).
+import { sendTurnCallPush } from '../lib/notification-router'
 // Task 2-a — shared waiting/callable criteria: the queue list, the stats count
 // and call-next MUST evaluate the SAME predicate or the staff UI reports
 // "customer waiting" while call-next reports "No customers waiting". These
@@ -3760,7 +3763,15 @@ app.get('/queue', async (c) => {
   try {
     const agencyId = c.req.query('agencyId')
     const statusParam = c.req.query('status') || 'WAITING,CALLED'
-    const statuses = statusParam.split(',').filter(Boolean)
+    // 0.6.127 perf/hardening — the client-supplied status list used to go
+    // straight into the WHERE clause: `status=COMPLETED` would load the
+    // agency's ENTIRE ticket history over and over (this endpoint is polled
+    // every 10s AND on every realtime event). Whitelist the live statuses;
+    // history surfaces use the dedicated completed/history endpoints.
+    const ALLOWED_QUEUE_STATUSES = ['WAITING', 'CALLED', 'SERVING'] as const
+    const requested = statusParam.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+    const statuses = requested.filter(s => (ALLOWED_QUEUE_STATUSES as readonly string[]).includes(s))
+    const effectiveStatuses = statuses.length > 0 ? statuses : ['WAITING', 'CALLED']
 
     if (!agencyId) {
       return c.json({ error: 'agencyId required' }, 400)
@@ -3773,8 +3784,12 @@ app.get('/queue', async (c) => {
     const reservations = await db.reservation.findMany({
       where: {
         agencyId,
-        status: { in: statuses },
+        status: { in: effectiveStatuses },
       },
+      // 0.6.127 — hard cap: the live board never legitimately shows 500
+      // concurrent tickets; unbounded findMany let a pathological queue
+      // (or a status=COMPLETED probe) drag the whole table every poll.
+      take: 500,
       include: {
         user: { select: { id: true, fullName: true, username: true, phoneNumber: true, avatarUrl: true } },
         service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true, priority: true } },
@@ -3794,6 +3809,9 @@ app.get('/queue', async (c) => {
     // callableNow so staff surfaces can stop counting scheduled tickets as
     // "waiting now" — the exact divergence that produced the VPS phantom.
     const waitingReservations = reservations.filter(r => r.status === 'WAITING')
+    // 0.6.127 perf — position lookup via Map (the old waitingReservations.
+    // indexOf(res) was O(n²) on every poll of the busiest endpoint).
+    const waitingPositionById = new Map(waitingReservations.map((r, i) => [r.id, i + 1]))
     const { callable: callableWaiting, scheduled: scheduledWaiting } = partitionWaiting(waitingReservations)
     const callableById = new Set(callableWaiting.map(r => r.id))
     const entries = reservations.map((res) => ({
@@ -3807,7 +3825,7 @@ app.get('/queue', async (c) => {
       serviceNameFr: res.service.nameFr,
       joinedAt: res.joinedAt.toISOString(),
       status: res.status,
-      position: res.status === 'WAITING' ? waitingReservations.indexOf(res) + 1 : 0,
+      position: res.status === 'WAITING' ? (waitingPositionById.get(res.id) ?? 0) : 0,
       isWalkIn: res.isWalkIn,
       walkInCustomerName: res.walkInCustomerName,
       importToken: res.isWalkIn ? (res.importToken || null) : null,
@@ -4012,16 +4030,48 @@ app.post('/queue/call-next', async (c) => {
       counter: counterPayload,
     })
     if (nextReservation.userId) {
+      // 0.6.126 — payload parity with the legacy route: agencyName rides on
+      // the event so the in-app call layout always shows WHERE the customer
+      // is called (previously only ticket + counter made it through here).
       emitNotificationEvent('notification:your-turn', nextReservation.userId, {
         ticketNumber: nextReservation.displayNumber,
         agencyId,
         userId: nextReservation.userId,
         reservationId: nextReservation.id,
+        agencyName: agencyCheck.name,
         serviceName: (nextReservation as any).service?.name || null,
         counterId: claimCounter?.id ?? null,
         counterName: claimCounter?.name ?? null,
         counter: counterPayload,
       })
+
+      // ── Lock-screen call delivery when the app is CLOSED/backgrounded ──
+      // 0.6.126 audit fix: the CANONICAL calling route (every web dashboard
+      // uses it) previously emitted socket events only — with the app dead
+      // the customer got NO notification at all. Data-only FCM →
+      // BlastiFirebaseMessagingService renders the call-style alert
+      // (full-screen intent over the keyguard + repeating alarm + Stop).
+      try {
+        const callRecipient = await db.user.findUnique({
+          where: { id: nextReservation.userId },
+          select: { fcmToken: true, language: true },
+        })
+        if (callRecipient?.fcmToken) {
+          void sendTurnCallPush(callRecipient.fcmToken, {
+            userId: nextReservation.userId,
+            reservationId: nextReservation.id,
+            agencyId,
+            ticketNumber: nextReservation.displayNumber,
+            agencyName: agencyCheck.name,
+            agencyNameAr: (agencyCheck as any).nameAr ?? null,
+            agencyNameFr: (agencyCheck as any).nameFr ?? null,
+            counterName: claimCounter?.name ?? null,
+            language: callRecipient.language,
+          }).catch(() => { /* push is best-effort — the in-app alert already fired */ })
+        }
+      } catch (pushErr) {
+        console.warn('[agency/queue/call-next] turn-call push failed:', pushErr instanceof Error ? pushErr.message : pushErr)
+      }
     }
     emitKioskEvent(agencyId, {
       nowServing: nextReservation.displayNumber,
@@ -5727,7 +5777,7 @@ app.post('/staff/create', async (c) => {
     }
 
     // Hash the password
-    const passwordHash = hashPassword(password)
+    const passwordHash = await hashPassword(password)
 
     // Create User with appropriate role
     const newUser = await db.user.create({
@@ -6233,14 +6283,18 @@ app.get('/stats', async (c) => {
     const avgHourlyWait = hourlyWaitTime.map((total, i) => hourlyCount[i] > 0 ? Math.round(total / hourlyCount[i]) : 0)
 
     // Rating distribution
-    const ratingDist = [0, 0, 0, 0, 0] // 1-5 stars
-    const allRated = await db.reservation.findMany({
+    // 0.6.127 perf — one indexed GROUP BY instead of loading EVERY rated
+    // reservation ever (the old findMany grew with the agency's full history
+    // and ran on every stats poll; stats is polled ~10s by every dashboard).
+    const ratingGroups = await db.reservation.groupBy({
+      by: ['rating'],
       where: { agencyId, rating: { not: null } },
-      select: { rating: true },
+      _count: { _all: true },
     })
-    allRated.forEach((r) => {
-      if (r.rating && r.rating >= 1 && r.rating <= 5) ratingDist[r.rating - 1]++
-    })
+    const ratingDist = [0, 0, 0, 0, 0] // 1-5 stars
+    for (const g of ratingGroups) {
+      if (g.rating && g.rating >= 1 && g.rating <= 5) ratingDist[g.rating - 1] += g._count._all
+    }
 
     // Calculate ETA range for overall queue
     const isPaused = queueSettings?.isPaused || false

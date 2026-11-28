@@ -267,13 +267,17 @@ const DEVICE_INCLUDE = {
 
 // ─── Device Auth Middleware ─────────────────────────────────────────────────
 // Authenticates via `Authorization: Bearer <deviceToken>` (NOT JWT).
+// SECURITY (0.6.126 audit T1-5): DISABLED (revoked) devices no longer
+// authenticate to ANY device route — the token resolves to null, so every
+// call site's existing `if (!device) → 401` becomes a revocation enforcement
+// point (previously a revoked device kept full device API access forever).
 
 async function requireDeviceAuth(c: Context) {
   const authHeader = c.req.header('Authorization')
   if (!authHeader?.startsWith('Bearer ')) return null
   const token = authHeader.slice(7)
-  const device = await db.agencyDevice.findUnique({
-    where: { deviceToken: token },
+  const device = await db.agencyDevice.findFirst({
+    where: { deviceToken: token, status: { not: 'DISABLED' } },
     include: DEVICE_INCLUDE,
   })
   return device
@@ -2785,6 +2789,28 @@ app.post('/test-printer', async (c) => {
   }
 })
 
+// ─── GET /tombstones — cloud blocklist → branch desktop pull (0.6.126) ────
+// The realtime 'agency-device:revoked' push only reaches a CONNECTED desktop.
+// When the branch was offline at delete time, its mirror row survived and
+// the deleted kiosk kept working device-to-device. The desktop now PULLS
+// this list on every (re)connect of its sync socket and applies it locally —
+// the offline-delete hole closes with the same data the push used.
+app.get('/tombstones', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const all = await listDeviceTombstones()
+    // Agency scoping mirrors /tombstones/sync: unscoped entries are global
+    // (an agency-less device row), agency-scoped entries only go home.
+    const visible = all.filter((t) => !t.agencyId || !user.agencyId || t.agencyId === user.agencyId)
+    return c.json({ success: true, tombstones: visible })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+// REGISTERED BEFORE GET /:id — Hono matches in registration order and the
+// /:id handler would otherwise capture "tombstones" as a device id.
+
 // ─── GET /:id — Get a single device ────────────────────────────────────────
 
 app.get('/:id', async (c) => {
@@ -3020,26 +3046,6 @@ app.post('/tombstones/clear', async (c) => {
     }
     const cleared = await clearDeviceTombstone(fingerprint)
     return c.json({ success: true, cleared })
-  } catch (error: unknown) {
-    const err = authErrorResponse(error)
-    return c.json({ success: err.success, error: err.error }, err.status as any)
-  }
-})
-
-// ─── GET /tombstones — cloud blocklist → branch desktop pull (0.6.126) ────
-// The realtime 'agency-device:revoked' push only reaches a CONNECTED desktop.
-// When the branch was offline at delete time, its mirror row survived and
-// the deleted kiosk kept working device-to-device. The desktop now PULLS
-// this list on every (re)connect of its sync socket and applies it locally —
-// the offline-delete hole closes with the same data the push used.
-app.get('/tombstones', async (c) => {
-  try {
-    const user = await requireAuth(c)
-    const all = await listDeviceTombstones()
-    // Agency scoping mirrors /tombstones/sync: unscoped entries are global
-    // (an agency-less device row), agency-scoped entries only go home.
-    const visible = all.filter((t) => !t.agencyId || !user.agencyId || t.agencyId === user.agencyId)
-    return c.json({ success: true, tombstones: visible })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

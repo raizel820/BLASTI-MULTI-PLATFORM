@@ -4,10 +4,21 @@
  * Sends transactional email through the Resend REST API
  * (POST {apiUrl}/emails, Bearer auth). Templates are app-side
  * (NotificationTemplate) — see template-service.ts.
+ *
+ * Inline branding (0.6.126): EVERY html message automatically carries the
+ * bundled BLASTI app logo as an inline attachment (Content-ID
+ * 'blasti-app-logo') so the layout's <img src="cid:blasti-app-logo"> renders
+ * the REAL logo in Gmail/Outlook/Apple Mail regardless of remote-image
+ * blocking or PUBLIC_BASE_URL configuration — never a placeholder.
  */
 
 import { getResolvedConfig, recordTestResult } from './provider-config'
-import { wrapEmailHtml } from './email-layout'
+import {
+  getAppLogoAttachment,
+  APP_LOGO_CID,
+  wrapEmailHtml,
+  type EmailAttachment,
+} from './email-layout'
 
 export interface SendEmailResult {
   success: boolean
@@ -22,6 +33,8 @@ interface EmailPayload {
   text?: string
   html?: string
   replyTo?: string
+  /** Extra attachments (inline cid: images or regular files) */
+  attachments?: EmailAttachment[]
 }
 
 function isDevMode(): boolean {
@@ -44,6 +57,15 @@ export async function sendEmail(payload: EmailPayload): Promise<SendEmailResult>
   }
 
   try {
+    // ── Inline brand logo — merge into every html message ──
+    // The layout header references cid:blasti-app-logo; without this merge
+    // the cid reference would render broken in real mail clients.
+    const attachments: EmailAttachment[] = [...(payload.attachments ?? [])]
+    if (payload.html && !attachments.some((a) => a.content_id === APP_LOGO_CID)) {
+      const logo = getAppLogoAttachment()
+      if (logo) attachments.push(logo)
+    }
+
     const res = await fetch(`${config.apiUrl}/emails`, {
       method: 'POST',
       headers: {
@@ -57,6 +79,7 @@ export async function sendEmail(payload: EmailPayload): Promise<SendEmailResult>
         text: payload.text || undefined,
         html: payload.html || undefined,
         reply_to: payload.replyTo || config.extra.replyTo || undefined,
+        attachments: attachments.length ? attachments : undefined,
       }),
       signal: AbortSignal.timeout(15000),
     })

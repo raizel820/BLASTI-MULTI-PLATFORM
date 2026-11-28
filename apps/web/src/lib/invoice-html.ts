@@ -9,9 +9,15 @@
  * A4 (210mm × 297mm), supports ar (RTL) / fr / en, and embeds the BLASTI
  * logo + verification QR as base64 data URLs so the document is fully
  * self-contained (works from srcDoc, data: URLs and print contexts).
+ *
+ * The REAL app logo (bundled brand asset) is embedded by default — no network
+ * fetch is required for the header brand image, so the printed/PDF invoice
+ * always carries the actual logo. A caller-supplied assets.logoDataUrl (live
+ * admin-uploaded branding) still takes precedence.
  */
 
 import type { InvoiceRecord } from './billing-client'
+import { BLASTI_LOGO_DATA_URL } from './branding-logo'
 import { isRTL, type Language } from '@/i18n'
 
 export interface InvoiceDocumentAssets {
@@ -182,6 +188,18 @@ function esc(value: unknown): string {
     .replace(/'/g, '&#39;')
 }
 
+// SECURITY (0.6.126 audit T1-10): qrDataUrl / logoDataUrl are interpolated
+// into img src="" attributes UNESCAPED (escaping a data URL would corrupt it).
+// A crafted value containing `"` could break out of the attribute and inject
+// markup into a document the print flow renders. Every data URL that reaches
+// this module must match the strict image-data-URL shape — anything else is
+// dropped (the img simply disappears; the document stays valid).
+const SAFE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/
+function safeDataUrl(value: string | null | undefined): string | null {
+  const s = String(value ?? '').trim()
+  return s && SAFE_DATA_URL_RE.test(s) ? s : null
+}
+
 function nvl(value: unknown, fallback = '—'): string {
   const s = String(value ?? '').trim()
   return s ? s : fallback
@@ -220,7 +238,13 @@ export function buildInvoiceHtml(invoice: InvoiceRecord, options: InvoiceHtmlOpt
     return str
   }
 
-  const { logoDataUrl, qrDataUrl, verifyUrl } = options.assets || {}
+  const { verifyUrl } = options.assets || {}
+  // SECURITY (T1-10): every data URL passes the strict image-data-URL
+  // validator before it touches an img src attribute.
+  const qrDataUrl = safeDataUrl(options.assets?.qrDataUrl)
+  // Real app logo by default — the document must never degrade to a text
+  // wordmark placeholder (bundled asset works offline / from srcDoc / in print).
+  const logoDataUrl = safeDataUrl(options.assets?.logoDataUrl) || safeDataUrl(BLASTI_LOGO_DATA_URL)
   const issuer = invoice.issuer || {}
   const recipient = (invoice.recipient || {}) as Record<string, unknown>
   const details = invoice.details || {}
@@ -531,6 +555,11 @@ export async function printOrDownloadInvoice(
 
   const iframe = document.createElement('iframe')
   iframe.id = uniqueHtmlWindowId()
+  // SECURITY (0.6.126 audit T1-10): the print document is written from an
+  // in-app HTML string — sandbox it so no injected markup can ever execute
+  // (no allow-scripts) while keep parent write access (allow-same-origin)
+  // and the print dialog (allow-modals).
+  iframe.setAttribute('sandbox', 'allow-same-origin allow-modals')
   iframe.style.position = 'fixed'
   iframe.style.right = '0'
   iframe.style.bottom = '0'

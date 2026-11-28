@@ -12,7 +12,12 @@
     <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">
         <item name="windowActionBar">false</item>
         <item name="windowNoTitle">true</item>
-        <item name="android:background">@null</item>
+        <!-- 0.6.127 — the activity theme had NO windowBackground: whatever gap
+             appears before the WebView paints (hydration, webview reload,
+             renderer recovery) showed the raw window color — BLACK on phones
+             in system dark mode (DayNight parent), white otherwise. The
+             brand splash drawable makes every such gap read as intentional. -->
+        <item name="android:windowBackground">@drawable/splash</item>
     </style>
 
     <style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">

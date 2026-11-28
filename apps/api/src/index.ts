@@ -139,7 +139,7 @@ import { initialSyncRoutes } from './routes/initial-sync'
 import { idempotencyGuard } from './lib/idempotency-middleware'
 import { setSyncNotifyIo, startSyncNotifyTimer } from './lib/sync-notify'
 import { installSyncTracking, pruneSyncChanges } from './lib/sync-helpers'
-import { cancelPendingCustomerAlerts } from './lib/cancel-pending-alerts'
+import { cancelAllPendingAlertsForUser } from './lib/cancel-pending-alerts'
 import { startNotificationWorker, stopNotificationWorker } from './workers/notification-worker'
 // r21-7 — counter control sweeper: frees stale counter control (heartbeat TTL)
 // and expires/auto-approves takeover requests past their 60s window.
@@ -191,6 +191,35 @@ if (!POSTGRES_URL_RE.test(DATABASE_URL)) {
   process.exit(1)
 }
 
+// ─── SECURITY (0.6.126 audit T1-2): fail-closed production secrets ──────────
+// The auth/encryption/QR libs keep DEVELOPMENT fallback secrets so a fresh
+// clone boots in dev, but in PRODUCTION a missing or known dev secret means
+// anyone who read the public repo can forge session JWTs offline. Boot is
+// refused instead of running with a forgeable trust root.
+const KNOWN_DEV_SECRETS = new Set([
+  'blast1-d3v-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly',
+  'blast1-dev-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly',
+  'blast1-qr-dev-key',
+  'blast1-qr-hm4c-s3cr3t-f0r-t1ck3t5',
+  'fallback-dev-key-not-secure',
+])
+function assertProductionSecret(name: string, value: string | undefined): void {
+  if (!value || KNOWN_DEV_SECRETS.has(value.trim())) {
+    console.error(`\n❌ FATAL: ${name} is missing or equals a known development secret.`)
+    console.error('   In production every deployment MUST generate unique secrets, e.g.:')
+    console.error('     export ' + name + '="$(openssl rand -hex 32)"')
+    console.error('   The deploy script writes them into /etc/blasti/blasti.env — never reuse')
+    console.error('   a value from the repository or another environment.')
+    process.exit(1)
+  }
+}
+if (process.env.NODE_ENV === 'production') {
+  assertProductionSecret('NEXTAUTH_SECRET', process.env.NEXTAUTH_SECRET)
+  assertProductionSecret('ENCRYPTION_KEY', process.env.ENCRYPTION_KEY || process.env.NEXTAUTH_SECRET)
+  assertProductionSecret('QR_HMAC_SECRET', process.env.QR_HMAC_SECRET || process.env.NEXTAUTH_SECRET)
+  console.log('[boot] production secret check: NEXTAUTH_SECRET / ENCRYPTION_KEY / QR_HMAC_SECRET ok')
+}
+
 // Phase 1c: Allowed origins for CSWSH protection
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(o => o.trim())
 
@@ -199,44 +228,54 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')
 const app = new Hono()
 
 // Global middleware
-// Phase 4: Explicitly allow capacitor://localhost and file:// origins for native CORS
-// IMPORTANT: When CORS_ORIGIN is '*', Hono sends Access-Control-Allow-Origin: * which
-// is incompatible with credentials: true per the CORS spec. For Electron (page at
-// localhost:3000, API at localhost:3003), we must echo the request Origin header
-// instead of sending '*'. We use a function to dynamically set the origin.
+// SECURITY (0.6.126 audit T1-4): the default CORS_ORIGIN='*' mode used to
+// REFLECT ANY Origin header together with credentials:true — a textbook
+// misconfiguration that blessed every origin on the internet. Now '*' and an
+// unset env BOTH resolve to the built-in allowlist below (production domains,
+// native shells, loopback desktop origins). A comma-separated CORS_ORIGIN
+// EXTENDS the allowlist; reflecting arbitrary origins is no longer possible.
+const BUILTIN_CORS_ORIGINS = [
+  // Phase 4: Native app origins
+  'capacitor://localhost',
+  'http://localhost',
+  'file://',
+  // Task 70: Android Capacitor PRODUCTION shells run under androidScheme
+  // 'https' (capacitor.config.ts) so the WebView origin is https://localhost —
+  // NOT capacitor://localhost (iOS) and NOT http://localhost (old http scheme).
+  // Missing it meant every REST call from a real Android phone against the VPS
+  // died at CORS preflight while the same app worked in a desktop browser.
+  'https://localhost',
+  // Task 75: the PACKAGED desktop app serves its renderer from the embedded
+  // local API, so its page origin is http://127.0.0.1:3080 (or localhost:3080)
+  // — the machine's own loopback. The renderer's cloud health probe and any
+  // direct renderer→cloud fetch are CROSS-ORIGIN from that origin; without
+  // these entries an explicit CORS_ORIGIN allowlist silently rejected every
+  // probe and the desktop banner showed "local mode / offline" while login
+  // (same-origin to :3080, proxied server-side) worked fine. These origins
+  // are fixed and local to the user's machine — always safe to allow.
+  'http://127.0.0.1:3080',
+  'http://localhost:3080',
+  // 0.6.36 — PRODUCTION DOMAIN, hardcoded so the API keeps accepting the
+  // production origins even when the VPS env (CORS_ORIGIN/ALLOWED_ORIGINS)
+  // is missing or stale. https://blastidz.online is the canonical origin
+  // (www included; it 308-redirects to the apex).
+  // 0.6.41 — STRICT-HTTPS: the http:// origin entry was removed. Caddy
+  // 308-redirects every cleartext request before a page can even load,
+  // so no client can ever send a preflight from that origin anyway.
+  'https://blastidz.online',
+  'https://www.blastidz.online',
+]
+const CORS_ALLOWLIST = [
+  ...BUILTIN_CORS_ORIGINS,
+  ...(CORS_ORIGIN && CORS_ORIGIN !== '*'
+    ? CORS_ORIGIN.split(',').map(o => o.trim()).filter(Boolean)
+    : []),
+]
+if (CORS_ORIGIN === '*' && process.env.NODE_ENV === 'production') {
+  console.warn('[security] CORS_ORIGIN="*" is no longer supported — the built-in origin allowlist applies. Add extra origins via CORS_ORIGIN="https://a.example,https://b.example".')
+}
 app.use('*', cors({
-  origin: CORS_ORIGIN === '*' ? ((origin) => origin || '*') : [
-    ...CORS_ORIGIN.split(',').map(o => o.trim()),
-    // Phase 4: Native app origins
-    'capacitor://localhost',
-    'http://localhost',
-    'file://',
-    // Task 70: Android Capacitor PRODUCTION shells run under androidScheme
-    // 'https' (capacitor.config.ts) so the WebView origin is https://localhost —
-    // NOT capacitor://localhost (iOS) and NOT http://localhost (old http scheme).
-    // Missing it meant every REST call from a real Android phone against the VPS
-    // died at CORS preflight while the same app worked in a desktop browser.
-    'https://localhost',
-    // Task 75: the PACKAGED desktop app serves its renderer from the embedded
-    // local API, so its page origin is http://127.0.0.1:3080 (or localhost:3080)
-    // — the machine's own loopback. The renderer's cloud health probe and any
-    // direct renderer→cloud fetch are CROSS-ORIGIN from that origin; without
-    // these entries an explicit CORS_ORIGIN allowlist silently rejected every
-    // probe and the desktop banner showed "local mode / offline" while login
-    // (same-origin to :3080, proxied server-side) worked fine. These origins
-    // are fixed and local to the user's machine — always safe to allow.
-    'http://127.0.0.1:3080',
-    'http://localhost:3080',
-    // 0.6.36 — PRODUCTION DOMAIN, hardcoded so the API keeps accepting the
-    // production origins even when the VPS env (CORS_ORIGIN/ALLOWED_ORIGINS)
-    // is missing or stale. https://blastidz.online is the canonical origin
-    // (www included; it 308-redirects to the apex).
-    // 0.6.41 — STRICT-HTTPS: the http:// origin entry was removed. Caddy
-    // 308-redirects every cleartext request before a page can even load,
-    // so no client can ever send a preflight from that origin anyway.
-    'https://blastidz.online',
-    'https://www.blastidz.online',
-  ],
+  origin: (origin) => (origin && CORS_ALLOWLIST.includes(origin) ? origin : undefined),
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   // Task 55: x-blasti-network (web network-type attribution) + x-blasti-device
   // (device attribution) MUST be allowed or every browser request carrying
@@ -253,6 +292,21 @@ app.use('*', cors({
   credentials: true,
   maxAge: 86400,
 }))
+
+// SECURITY (0.6.126 audit T1-4): baseline hardening headers on every API
+// response. nosniff stops content-type-sniffing of user uploads (e.g. an
+// attacker-renamed .html served as text/plain still won't execute), DENY
+// blocks clickjacking of API-served pages, and HSTS matters when the API is
+// reached directly over HTTPS (Caddy terminates TLS in front of the web app).
+app.use('*', async (c, next) => {
+  await next()
+  c.header('X-Content-Type-Options', 'nosniff')
+  c.header('X-Frame-Options', 'DENY')
+  c.header('Referrer-Policy', 'strict-origin-when-cross-origin')
+  if (process.env.NODE_ENV === 'production') {
+    c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  }
+})
 // Request logging is pure I/O overhead on the production VPS (every request
 // wrote a line to journald on a 2-core box). Enabled by default ONLY in
 // development; set BLASTI_HTTP_LOG=1 to force it back on in production.
@@ -969,9 +1023,21 @@ function broadcastEvent(event: Record<string, unknown>): number {
     if (agencyId) {
       const room = `agency:${agencyId}`
       io.to(room).emit(type, { ...event, timestamp })
+      // 0.6.127 — CUSTOMER DELIVERY: customers are NEVER in agency rooms
+      // (join:agency is staff/owner/device-only), so customer-affecting
+      // queue events (queue:called, queue:position-changed, …) never reached
+      // the customer's phone — their "people ahead" counter only moved on
+      // the poll tick. The queue emitters carry the affected user inside
+      // data.userId; fan out to that customer's own room so the customer UI
+      // updates INSTANTLY with everyone else.
+      const data = (event.data && typeof event.data === 'object' ? event.data : {}) as Record<string, unknown>
+      const userId = typeof data.userId === 'string' ? data.userId : (event.userId as string | undefined)
+      if (userId) {
+        io.to(`customer:${userId}`).emit(type, { ...event, timestamp })
+      }
       const sockets = io.sockets.adapter.rooms.get(room)
       const count = sockets ? sockets.size : 0
-      console.log(`[${type}] → ${room} (${count} recipients)`)
+      console.log(`[${type}] → ${room} (${count} recipients)${userId ? ` + customer:${userId}` : ''}`)
       return count
     }
   }
@@ -1350,38 +1416,28 @@ setSyncNotifyIo(io)
 startSyncNotifyTimer()
 setInterval(() => {
   pruneSyncChanges(14).catch(() => {})
+  // 0.6.127 — bounded retention for DataUsageEvent: one row per API request
+  // (+ per realtime emit) with NO prune existed — the table grew unboundedly
+  // on busy deployments and the admin analytics scans got slower every week.
+  // 90-day retention, indexed by createdAt.
+  db.dataUsageEvent
+    .deleteMany({ where: { createdAt: { lt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } } })
+    .catch((err: unknown) => console.warn('[prune] DataUsageEvent prune failed:', err))
 }, 6 * 60 * 60 * 1000).unref()
 
-// Phase 3: Agency Presence Tracking — Heartbeat system
-const AGENCY_HEARTBEAT_INTERVAL = 30000 // 30 seconds
-const AGENCY_HEARTBEAT_TIMEOUT = 90000  // 90 seconds (3 missed heartbeats)
-
+// Phase 3: Agency Presence Tracking
+// 0.6.127 — the 30s offline-watcher interval was REMOVED: no client ever
+// emitted 'heartbeat:agency' (grep-verified across web/desktop/mobile), so
+// the timer did nothing but emit a spurious `queue:agency-offline` to every
+// agency room ~90s after each join (no client listens for it either) — pure
+// wire noise and timer work. The join/leave bookkeeping below stays so the
+// heartbeat can be revived with real senders later.
 interface AgencyHeartbeat {
   lastBeat: number
   socketIds: Set<string>
 }
 
 const agencyHeartbeats = new Map<string, AgencyHeartbeat>()
-
-// Periodically check for offline agencies
-setInterval(() => {
-  if (!io) return
-  const now = Date.now()
-  for (const [agencyId, hb] of agencyHeartbeats.entries()) {
-    if (now - hb.lastBeat > AGENCY_HEARTBEAT_TIMEOUT && hb.socketIds.size > 0) {
-      console.log(`[PRESENCE] Agency ${agencyId} appears offline (last heartbeat ${Math.round((now - hb.lastBeat) / 1000)}s ago)`)
-      // Emit offline event to all customers waiting for this agency
-      io.to(`agency:${agencyId}`).emit('queue:agency-offline', {
-        type: 'queue:agency-offline',
-        agencyId,
-        timestamp: now,
-        data: { message: 'Agency is temporarily offline' },
-      })
-      // Clear the heartbeat since we've notified
-      hb.socketIds.clear()
-    }
-  }
-}, AGENCY_HEARTBEAT_INTERVAL)
 
 // Socket.IO connection handling
 io.on('connection', async (socket) => {
@@ -1412,14 +1468,11 @@ io.on('connection', async (socket) => {
       // connect; updateMany silently matches zero rows instead.
       await db.user.updateMany({ where: { id: authUser.id }, data: { isAppOnline: true } })
 
-      // Cancel any pending delayed alerts for this user's active reservations
-      const activeReservations = await db.reservation.findMany({
-        where: { userId: authUser.id, status: { in: ['WAITING', 'CALLED'] } },
-        select: { id: true },
-      })
-      for (const res of activeReservations) {
-        await cancelPendingCustomerAlerts(authUser.id, res.id)
-      }
+      // 0.6.127 — one bulk cancel instead of findMany + N sequential
+      // updateManys. Reconnect storms (flaky mobile networks, API restart
+      // with hundreds of devices) used to serialize DB writes on the
+      // connect path against the queue-critical API.
+      await cancelAllPendingAlertsForUser(authUser.id)
     } catch (error) {
       console.error('[socket] Error cancelling pending alerts on connect:', error)
     }
@@ -1462,14 +1515,61 @@ io.on('connection', async (socket) => {
   }
 
 
+  // ─── 0.6.127 — MID-SESSION AUTH UPGRADE ──────────────────────────────
+  // Clients connect PRE-LOGIN (the landing/auth views mount useRealtime with
+  // no session yet) and then log in via a SPA view switch — no page reload.
+  // The client emits 'auth' so the pre-login socket can become authenticated;
+  // the desktop local server has had this exact upgrade path since day one
+  // (local-realtime.js). The cloud never implemented it — the emit was
+  // silently dropped and every subsequent join:agency / join:customer was
+  // evaluated against _authUser = null and REJECTED, leaving web/mobile
+  // realtime dead for the entire session until a manual reload.
+  socket.on('auth', async (payload: unknown, ack?: (result: { ok: boolean; error?: string }) => void) => {
+    const token = payload && typeof payload === 'object'
+      ? String((payload as { token?: unknown }).token ?? '')
+      : ''
+    if (!token) {
+      ack?.({ ok: false, error: 'missing token' })
+      return
+    }
+    try {
+      const session = await verifySessionToken(token)
+      ;(socket as any)._authUser = session
+      ;(socket as any)._isAuthenticated = true
+      ack?.({ ok: true })
+      console.log(`[AUTH] Socket ${socket.id} authenticated via 'auth' upgrade (user: ${session.username}, role: ${session.role})`)
+    } catch {
+      ack?.({ ok: false, error: 'invalid or expired token' })
+    }
+  })
+
   // ─── Phase 1b: Secure Room Joining ────────────────────────────────────
 
   socket.on('join:room', async (room: string) => {
     if (room && typeof room === 'string') {
-      // Phase 1b: Validate access to sensitive rooms
-      if (room.startsWith('admin:global') && !isAuthenticated) {
-        console.warn(`[AUTH] Unauthenticated socket ${socket.id} tried to join admin:global — rejected`)
-        return
+      // SECURITY (0.6.126 audit T1-5): join:room used to let ANY authenticated
+      // user join ANY customer:<userId> room (other users' notifications /
+      // payment events) and admin:global with nothing but a valid session.
+      // The dedicated join:customer / join:admin handlers always enforced
+      // ownership — join:room now enforces the SAME rules instead of a bare
+      // isAuthenticated check.
+      if (room.startsWith('admin:')) {
+        // 0.6.127 — live auth state (see join:customer note above)
+        const liveAuth = (socket as any)._authUser as SessionToken | null
+        if (!liveAuth || liveAuth.role !== 'SUPER_ADMIN') {
+          console.warn(`[AUTH] Socket ${socket.id} (${liveAuth?.username || 'anon'}) tried join:room ${room} without SUPER_ADMIN — rejected`)
+          return
+        }
+      }
+      if (room.startsWith('customer:')) {
+        const roomUserId = room.substring('customer:'.length)
+        // 0.6.127 — live auth state (see join:customer note above)
+        const liveAuth = (socket as any)._authUser as SessionToken | null
+        const owns = !!(socket as any)._isAuthenticated && !!liveAuth && (liveAuth.id === roomUserId || liveAuth.role === 'SUPER_ADMIN')
+        if (!owns) {
+          console.warn(`[AUTH] Socket ${socket.id} (user: ${liveAuth?.username || 'anon'}) tried join:room customer:${roomUserId} without ownership — rejected`)
+          return
+        }
       }
       if (room.startsWith('agency:')) {
         const roomAgencyId = room.substring('agency:'.length)
@@ -1479,8 +1579,10 @@ io.on('connection', async (socket) => {
           return
         }
       }
-      if (room.startsWith('customer:') && !isAuthenticated) {
-        console.warn(`[AUTH] Unauthenticated socket ${socket.id} tried to join customer room via join:room — rejected`)
+      if (room.startsWith('pairing-wait:')) {
+        // Pre-pairing rooms have their own handler (join:pairing-wait) that
+        // sanitizes the room key — craftable keys must not enter through here.
+        console.warn(`[AUTH] Socket ${socket.id} tried join:room on a pairing-wait room — use join:pairing-wait`)
         return
       }
       socket.join(room)
@@ -1526,16 +1628,23 @@ io.on('connection', async (socket) => {
   })
 
   socket.on('join:customer', (id: string) => {
+    // 0.6.127 — read the LIVE auth state from the socket, not the
+    // connection-time closure: a socket that authenticated via the 'auth'
+    // upgrade (pre-login connect → SPA login) still had null closure values
+    // here, so its customer-room join was REJECTED after a successful auth
+    // ack. Same for join:room's customer/admin branches below.
+    const liveAuth = (socket as any)._authUser as SessionToken | null
+    const liveAuthed = !!(socket as any)._isAuthenticated
     // Phase 1b: Customers can only join their own room unless admin
     if (id) {
-      if (isAuthenticated && authUser && (authUser.id === id || authUser.role === 'SUPER_ADMIN')) {
+      if (liveAuthed && liveAuth && (liveAuth.id === id || liveAuth.role === 'SUPER_ADMIN')) {
         socket.join(`customer:${id}`)
-      } else if (!isAuthenticated) {
+      } else if (!liveAuthed) {
         // Reject unauthenticated customer room joins
         console.warn(`[AUTH] Unauthenticated socket ${socket.id} tried to join customer:${id} — rejected`)
         return
       } else {
-        console.warn(`[AUTH] Socket ${socket.id} (user: ${authUser?.username}) tried to join customer:${id} — not authorized`)
+        console.warn(`[AUTH] Socket ${socket.id} (user: ${liveAuth?.username}) tried to join customer:${id} — not authorized`)
         return
       }
     }
@@ -1606,26 +1715,53 @@ io.on('connection', async (socket) => {
       return // REJECTED
     }
 
-    // Join device-specific room
+    // SECURITY (0.6.126 audit T1-5): room membership now follows device
+    // status. A DISABLED (revoked) device is denied the realtime gate
+    // completely; a PAIRING device (created by the unauthenticated public
+    // register route, before manager approval) must NOT hear the agency's
+    // live queue/staff/counter stream — it only gets its own device room.
+    // Only PAIRED devices enter agency:<id> and kiosk:<id>.
+    if (device.status === 'DISABLED') {
+      console.warn(`[AUTH] Socket ${socket.id} tried join:device for DISABLED device ${device.id} — rejected`)
+      appendDeviceEvent({
+        event: 'socket_auth_failed',
+        message: 'join:device rejected — device is DISABLED (revoked)',
+        level: 'warn',
+        deviceId: device.id,
+        deviceType: device.type,
+        agencyId: device.agencyId,
+      })
+      return // REJECTED
+    }
+
+    // Join device-specific room (own identity — always allowed)
     socket.join(`device:${device.id}`)
-    // Also join agency room for queue updates
-    socket.join(`agency:${device.agencyId}`)
-    // Also join kiosk room for backwards compatibility
-    socket.join(`kiosk:${device.agencyId}`)
+    if (device.status === 'PAIRED' || device.status === 'ONLINE') {
+      // Also join agency room for queue updates
+      socket.join(`agency:${device.agencyId}`)
+      // Also join kiosk room for backwards compatibility
+      socket.join(`kiosk:${device.agencyId}`)
+    } else {
+      console.log(`[AUTH] Device ${device.id} joined with status ${device.status} — own room only (no agency stream)`)
+    }
 
     // Store device info on socket
     ;(socket as any)._deviceId = device.id
     ;(socket as any)._deviceAgencyId = device.agencyId
     ;(socket as any)._isDevice = true
 
-    // Update device status to ONLINE (H7: only if not DISABLED)
-    if (device.status !== 'DISABLED') {
+    // Update device status to ONLINE (H7: DISABLED already rejected above).
+    // SECURITY (T1-5): only a PAIRED device may transition to ONLINE — the
+    // old `status !== 'DISABLED'` check silently PROMOTED a PAIRING device
+    // to ONLINE on first socket connect, which would have re-opened the
+    // agency-room eavesdrop via the PAIRED/ONLINE check above.
+    if (device.status === 'PAIRED' || device.status === 'ONLINE') {
       await db.agencyDevice.update({
         where: { id: device.id },
         data: { status: 'ONLINE', lastHeartbeatAt: new Date(), statusChangedAt: new Date() }
       })
     } else {
-      // Still update heartbeat but don't change status
+      // PAIRING / other statuses: record the heartbeat only, keep status
       await db.agencyDevice.update({
         where: { id: device.id },
         data: { lastHeartbeatAt: new Date() }
@@ -1642,7 +1778,7 @@ io.on('connection', async (socket) => {
       agencyId: device.agencyId,
       status: device.status,
     })
-    if (device.status !== 'DISABLED') {
+    if (device.status === 'PAIRED' || device.status === 'ONLINE') {
       appendDeviceEvent({
         event: 'device_online',
         message: `Device marked ONLINE via socket join`,
@@ -1692,12 +1828,11 @@ io.on('connection', async (socket) => {
     // Mark user as offline when they disconnect
     const disconnectUser = (socket as any)._authUser as SessionToken | null
     if (disconnectUser) {
-      try {
-        // updateMany — same ghost-token tolerance as the connect handler.
-        await db.user.updateMany({ where: { id: disconnectUser.id }, data: { isAppOnline: false } })
-      } catch (error) {
-        console.error('[socket] Error marking user offline on disconnect:', error)
-      }
+      // updateMany — same ghost-token tolerance as the connect handler.
+      // 0.6.127 — fire-and-forget: a slow DB must not stall socket teardown
+      // during disconnect storms.
+      db.user.updateMany({ where: { id: disconnectUser.id }, data: { isAppOnline: false } })
+        .catch((error: unknown) => console.error('[socket] Error marking user offline on disconnect:', error))
     }
 
     // Phase 3: Clean up presence tracking

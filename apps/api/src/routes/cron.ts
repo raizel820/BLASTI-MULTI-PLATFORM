@@ -4,7 +4,7 @@ import { db } from '@blasti/db'
 import { normalizeDzPhone, getSmsTemplate, sendSms } from '../lib/sms-service'
 import { recordSyncChange } from '../lib/sync-helpers'
 import { emitNotificationEvent } from '../lib/realtime-emit'
-import { sendViaPushNotification } from '../lib/notification-router'
+import { sendTurnApproachingPush } from '../lib/notification-router'
 import { getCheckoutStatus, expireCheckout } from '../lib/chargily-service'
 import {
   fulfillCheckoutPaid,
@@ -214,21 +214,23 @@ app.get('/check-reminders', async (c) => {
           }).catch(() => {})
 
           // ── Lock-screen delivery when the app is CLOSED/backgrounded ──
-          // The socket event above only reaches a LIVE webview; the field
-          // report ("cooling turn notification is no longer showing in lock
-          // screen") is exactly the app-dead case. FCM notification message
-          // → OS tray on the blasti-turn-alert channel (high-importance,
-          // PUBLIC → lock-screen content, native swipe dismiss).
+          // 0.6.126 — data-only FCM (sendTurnApproachingPush): minimal
+          // heads-up notification with a Stop action, rendered by
+          // BlastiFirebaseMessagingService even when the app process is dead
+          // (the field report "cooling turn notification is no longer showing
+          // in lock screen" was exactly the app-dead case).
           const fcmToken = (reservation.user as { fcmToken?: string | null }).fcmToken
           if (fcmToken) {
-            void sendViaPushNotification(fcmToken, {
+            void sendTurnApproachingPush(fcmToken, {
               userId: reservation.userId!,
               reservationId: reservation.id,
               agencyId: reservation.agencyId,
-              type: 'ADVANCE_WARNING',
-              message: `Your ticket ${reservation.displayNumber} at ${agencyName} is coming up soon. ${ev.peopleAhead === 0 ? 'You are next!' : `Approximately ${ev.peopleAhead} ahead of you.`}`,
-              messageAr: `تذكرتك ${reservation.displayNumber} في ${agencyName} يقترب دورك قريبًا.`,
-              remainingMinutes: estimatedMinutesUntilTurn,
+              ticketNumber: reservation.displayNumber,
+              agencyName: reservation.agency.name,
+              agencyNameAr: reservation.agency.nameAr,
+              agencyNameFr: reservation.agency.nameFr,
+              language: reservation.user.language,
+              peopleAhead: ev.peopleAhead,
             }).catch(() => { /* push is best-effort — the in-app row already exists */ })
           }
         }

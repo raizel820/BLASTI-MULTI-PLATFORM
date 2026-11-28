@@ -1858,21 +1858,25 @@ app.post('/import-walk-in', async (c) => {
     } catch { /* capture must never fail the business write */ }
 
     // Emit realtime events
-    try {
-      await emitReservationEvent('reservation:updated', reservation.agencyId, user.id, {
+    // 0.6.127 — fire-and-forget: each emit is a loopback HTTP POST with its
+    // own 3s timeout; the ticket is already committed, so a stalled realtime
+    // service must not hold the HTTP response hostage (up to 9s waits were
+    // possible when two emits were awaited).
+    void Promise.all([
+      emitReservationEvent('reservation:updated', reservation.agencyId, user.id, {
         reservationId: reservation.id,
         status: reservation.status,
         importedByUser: true,
-      })
-      await emitQueueEvent('queue:updated', reservation.agencyId, {
+      }),
+      emitQueueEvent('queue:updated', reservation.agencyId, {
         action: 'walk_in_imported',
         reservationId: reservation.id,
         userId: user.id,
         displayNumber: reservation.displayNumber,
-      })
-    } catch (emitErr) {
+      }),
+    ]).catch((emitErr) => {
       console.warn('[Import-WalkIn] Failed to emit realtime event:', emitErr)
-    }
+    })
 
     // Task 4-a — QR walk-in import → queue event stream.
     appendQueueEvent({

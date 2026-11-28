@@ -107,6 +107,19 @@ app.post('/push', async (c) => {
 
     const existing = await db.fileAsset.findUnique({ where: { deviceFileId: meta.deviceFileId } })
 
+    // SECURITY (0.6.126 audit T1-6): the upsert used to overwrite ANY row by
+    // deviceFileId with no ownership check — a caller who learned another
+    // user's deviceFileId could rewrite their asset (blob, owner, agency).
+    // An existing row may only be updated by its owner (or an agency member
+    // when the row belongs to that agency).
+    if (existing) {
+      const sameOwner = existing.ownerId === user.id
+      const sameAgency = !!user.agencyId && existing.agencyId === user.agencyId
+      if (!sameOwner && !sameAgency) {
+        return c.json({ success: false, error: 'Forbidden — file id belongs to another owner' }, 403)
+      }
+    }
+
     const data = {
       bucket: meta.bucket,
       storagePath: saved.storagePath,
@@ -201,11 +214,22 @@ app.get('/pull', async (c) => {
 
 app.get('/blob/:fileId', async (c) => {
   try {
-    await requireAuth(c)
+    const user = await requireAuth(c)
     const fileId = c.req.param('fileId')
 
     const asset = await db.fileAsset.findUnique({ where: { id: fileId } })
     if (!asset || asset.deletedAt) {
+      return c.json({ success: false, error: 'File not found' }, 404)
+    }
+
+    // SECURITY (0.6.126 audit T1-6): was an unscoped read — ANY authenticated
+    // user could fetch ANY FileAsset blob by id (receipts, documents).
+    // Scoping mirrors /pull: agency members read their agency's files,
+    // everything else stays private to its owner.
+    const allowed =
+      (user.agencyId && asset.agencyId === user.agencyId) ||
+      asset.ownerId === user.id
+    if (!allowed) {
       return c.json({ success: false, error: 'File not found' }, 404)
     }
 

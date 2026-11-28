@@ -8,13 +8,14 @@
 	},
 	"plugins": {
 		"SplashScreen": {
-			"launchShowDuration": 400,
+			"launchShowDuration": 2500,
 			"launchAutoHide": true,
 			"backgroundColor": "#10b981",
 			"showSpinner": true,
 			"spinnerColor": "#ffffff",
 			"splashFullScreen": true,
-			"splashImmersive": true
+			"splashImmersive": true,
+			"launchFadeOutDuration": 300
 		},
 		"StatusBar": {
 			"style": "LIGHT",
@@ -41,7 +42,7 @@
 	},
 	"android": {
 		"allowMixedContent": true,
-		"backgroundColor": "#FFFFFF"
+		"backgroundColor": "#10b981"
 	},
 	"ios": {
 		"contentInset": "automatic",

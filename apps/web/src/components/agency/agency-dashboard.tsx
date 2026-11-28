@@ -72,6 +72,7 @@ import { CreateAgencyForm } from '@/components/agency/create-agency-form';
 import { apiFetch } from '@/lib/api-fetch';
 import { apiClient } from '@/lib/api-client';
 import { isBothUnreachable } from '@/lib/api-client';
+import { debounceTrailing } from '@/lib/debounce';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
 import { logQueue } from '@/lib/remote-logger';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -324,7 +325,10 @@ export function AgencyDashboard() {
       .catch(() => { /* silent */ });
   }, [agencyCode]);
 
-  const fetchData = useCallback(async (allowAutoRetry = true) => {
+  // 0.6.127 — NOTE: `fetchDataNow` (the direct fetch) is declared below; the
+  // debounced `fetchData` alias is created right after it (all realtime
+  // handlers, the poll loop and the recovery paths call the debounced one).
+  const fetchDataNow = useCallback(async (allowAutoRetry = true) => {
     if (!agencyId) {
       // No agency assigned — show setup prompt instead of error
       setLoading(false);
@@ -490,6 +494,34 @@ export function AgencyDashboard() {
       if (!willAutoRetry) setLoading(false);
     }
   }, [agencyId]);
+
+  // 0.6.127 — DEBOUNCED realtime/poll refetch. The 14 realtime event
+  // handlers used to call the fetch DIRECTLY: one staff call-next emits
+  // 2-3 queue events → 6-9 full network round-trips per action on every
+  // open surface, and a bulk operation × N screens tripped the venue-wide
+  // shared-IP rate limit exactly at peak. Trailing 300ms collapses each
+  // burst into ONE fetch while staying instantly responsive (the poll loop,
+  // payment-settled and rate-limit handlers all go through the same path).
+  // Indirection via refs (updated in effects — react-hooks/refs forbids
+  // touching refs during render) keeps `fetchData` fully stable so consumer
+  // effects don't re-arm on every fetch identity change.
+  const fetchDataNowRef = useRef(fetchDataNow);
+  useEffect(() => {
+    fetchDataNowRef.current = fetchDataNow;
+  }, [fetchDataNow]);
+  const debouncedFetchRef = useRef<((allowAutoRetry?: boolean) => void) | null>(null);
+  useEffect(() => {
+    debouncedFetchRef.current = debounceTrailing((allowAutoRetry?: boolean) => {
+      void fetchDataNowRef.current(allowAutoRetry ?? true);
+    }, 300);
+    return () => {
+      debouncedFetchRef.current?.cancel();
+      debouncedFetchRef.current = null;
+    };
+  }, []);
+  const fetchData = useCallback((allowAutoRetry = true) => {
+    debouncedFetchRef.current?.(allowAutoRetry);
+  }, []);
 
   const handleCallNext = async () => {
     if (guardSubscription()) return;

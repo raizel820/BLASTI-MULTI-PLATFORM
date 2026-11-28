@@ -90,11 +90,12 @@ export interface LanAuthorityState {
 
 /** Session material for the join call (cloud token + caller scope). */
 export interface JoinSessionInfo {
+  /** SECURITY (T1-9): kept for the login gate — NEVER transmitted to the LAN. */
   token: string;
+  userId?: string | null;
   agencyId?: string | null;
   branchId?: string | null;
   role?: string | null;
-  userId?: string | null;
 }
 
 export interface JoinOutcome {
@@ -360,12 +361,28 @@ export function clearLanAuthority(reason: string): void {
  * Activate the override from a 409 { code:'NOT_MASTER', master:{...} } hint
  * (contract rule 4): point every subsequent API call at the REAL master and
  * log the repoint. Invalid hints are logged and ignored.
+ *
+ * SECURITY (0.6.126 audit T1-9): the hint inside ANY 409 body was an
+ * attacker-controlled redirect primitive — a rogue LAN host answering any
+ * request with a crafted 409 repointed every API call to itself. Two gates
+ * now apply: (a) only an ALREADY-JOINEd follower follows a hint (an
+ * unjoined client has no legitimate reason to trust a body hint), and
+ * (b) the hinted target must be an RFC1918 private address (a "master"
+ * on a public IP is never a Blasti LAN master).
  */
 export function handleNotMasterResponse(master: LanMasterHint): void {
   ensureRestored();
   if (typeof window === 'undefined') return;
   if (!master || typeof master.ip !== 'string' || !master.ip || typeof master.port !== 'number' || !Number.isFinite(master.port)) {
     safeLog('lan-repoint', '409 NOT_MASTER carried no usable master hint — ignored', { master: master ?? null });
+    return;
+  }
+  if (!state?.active) {
+    safeLog('lan-repoint', `409 NOT_MASTER hint for ${master.ip}:${master.port} IGNORED — not joined to any LAN master (attacker-repoint guard)`, { hint: { ip: master.ip, port: master.port } });
+    return;
+  }
+  if (!/^10\./.test(master.ip) && !/^192\.168\./.test(master.ip) && !/^172\.(1[6-9]|2\d|3[01])\./.test(master.ip)) {
+    safeLog('lan-repoint', `409 NOT_MASTER hint for ${master.ip}:${master.port} IGNORED — not an RFC1918 private address (attacker-repoint guard)`, { hint: { ip: master.ip, port: master.port } });
     return;
   }
   const sameNode = !!state?.active && (
@@ -456,14 +473,19 @@ export async function joinMaster(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), JOIN_TIMEOUT_MS);
     try {
+      // SECURITY (0.6.126 audit T1-9): NO credentials on this request — the
+      // cloud session JWT used to ride both the Authorization header and the
+      // body, handing the primary credential to any LAN host that answered
+      // the (spoofable) discovery beacon. The join carries identity + scope
+      // only; the master validates the user against its local mirror and the
+      // operator's mandatory acceptance remains the trust anchor.
       return await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(session.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({
-          sessionToken: session.token,
+          userId: session.userId ?? null,
           agencyId: session.agencyId ?? null,
           branchId: session.branchId ?? null,
           role: session.role ?? null,

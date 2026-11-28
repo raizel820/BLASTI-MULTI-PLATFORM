@@ -1118,6 +1118,27 @@ export class ApiClient {
   /** Paths that must NEVER be served from cache (auth/session/sync semantics). */
   private static isUncacheablePath(path: string): boolean {
     const p = path.split('?')[0];
+    // FIELD-AUDIT 2026-11-26 — freshness-critical realtime reads must NEVER
+    // be answered from the 30s GET cache:
+    //   • GET /api/agency/queue — the fullscreen/TV display polled every 5s
+    //     but every poll inside the 30s TTL returned the CACHED body, so a
+    //     called/waiting customer appeared up to ~35s late ("customer takes
+    //     time to appear in full screen mode") even with realtime events
+    //     firing (the refetch also read the cache).
+    //   • GET /api/agency-devices (+ /unpaired, /discovery/*) — the Device
+    //     Manager refreshed on socket events, but each refresh read the
+    //     cached pre-ONLINE list; combined with the 30s heartbeat this is
+    //     the "connected devices take up to 60s to show up" field fault.
+    //   • /queue-status — the kiosk/TV live queue read (same staleness).
+    //   • GET /api/agency/stats — the fullscreen serving/waiting counters.
+    if (
+      p.startsWith('/api/agency/queue') ||
+      p.includes('/queue-status') ||
+      p.startsWith('/api/agency-devices') ||
+      p.startsWith('/api/agency/stats')
+    ) {
+      return true;
+    }
     return (
       p.startsWith('/api/auth') ||
       p.startsWith('/api/sync') ||
@@ -1546,12 +1567,73 @@ export class ApiClient {
     // reachable) fall through to the cloud URL.
     const isDeviceOpPath = /^\/api\/agency-devices(\/|$)/.test(path)
     const kioskLanBase = isDeviceOpPath ? getKioskLanBase() : null
-    const requestBaseUrl = getLanAuthorityOverride()?.baseUrl
+    let requestBaseUrl = getLanAuthorityOverride()?.baseUrl
       ?? (kioskLanBase
         ? kioskLanBase
         : (isCapacitorRuntime() && getNativeCloudUrl()
           ? getNativeCloudUrl() as string
           : this.config.baseUrl));
+    // FIELD-AUDIT 2026-11-26 — CLOUD-EXCLUSIVE ROUTING: paths that exist ONLY
+    // on the cloud API (no local implementation at all) used to be requested
+    // against the LOCAL-FIRST base inside Electron and 404'd locally on every
+    // poll cycle — the Device Manager's topology tree fired
+    // "GET /api/lan-topology → 404 Not Found" 51×/hour against
+    // http://127.0.0.1:3080 while the real route lives on the CLOUD API only.
+    // (Deliberately surgical: /api/admin/* has SOME local implementations
+    // (announcements, payment-settings), so only the proven-404 family is
+    // redirected. The LAN-authority override base always wins untouched.)
+    const CLOUD_EXCLUSIVE_PATH_RE = /^\/api\/lan-topology(\/|$)/;
+    const isCloudOnlyPath = CLOUD_EXCLUSIVE_PATH_RE.test(path) && !getLanAuthorityOverride();
+    if (isCloudOnlyPath && requestBaseUrl === ELECTRON_LOCAL_API_BASE) {
+      requestBaseUrl = getCloudApiBaseUrl() || requestBaseUrl;
+    }
+    // FIELD-AUDIT 2026-11-26 — DEVICE-OP LAN-FIRST (native, no pinned base):
+    // on a Wi-Fi-only branch network the kiosk/phone has NO internet, yet its
+    // device ops (heartbeat, device-status, join-queue) still paid the full
+    // cloud-retry cycle (12s DNS hang + 3 backoff retries ≈ 8-20s) before the
+    // LAN failover ran — the "20s delay before creating the reservation" and
+    // the per-mutation "cloud marked UNREACHABLE" flapping in the field log.
+    // When a desktop was recently discovered (fresh sweep cache), device ops
+    // go THERE first (3s budget) and fall through to the cloud loop only when
+    // the LAN attempt fails — the 0.6.107 device-to-device mandate, applied
+    // to the not-yet-pinned case. The Electron base already IS the local API,
+    // so this only changes Capacitor/webview shells.
+    const _deviceOpLanCached = isDeviceOpPath
+      && !kioskLanBase
+      && !getLanAuthorityOverride()
+      && isNativeRuntime()
+      && !isElectronRuntime();
+    if (_deviceOpLanCached) {
+      try {
+        const { getCachedServer } = await import('./lan-discovery');
+        const cachedBox = getCachedServer();
+        if (cachedBox?.ip) {
+          const lanUrl = `http://${cachedBox.ip}:${cachedBox.apiPort || cachedBox.port || 3080}${path}`;
+          const lanCtl = new AbortController();
+          const lanTimer = setTimeout(() => lanCtl.abort(), 3000);
+          try {
+            const lanRes = await fetch(lanUrl, {
+              method,
+              headers: { ...buildAuthHeaders(), ...(body !== undefined && !(typeof FormData !== 'undefined' && body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options?.headers },
+              body: body !== undefined ? JSON.stringify(body) : undefined,
+              signal: lanCtl.signal,
+            });
+            clearTimeout(lanTimer);
+            if (lanRes.ok || (lanRes.status >= 400 && lanRes.status < 500)) {
+              // LAN answered (2xx business answer or a 4xx the caller must
+              // see) — server IS up; do not fall through to the cloud.
+              if (DEBUG_HTTP_LOGS) console.log(`[ApiClient:DEVLAN] ${method} ${path} → LAN-first OK (${lanRes.status}) ${lanUrl}`);
+              return await this.parseResponse<T>(lanRes);
+            }
+            // 5xx from the LAN box — fall through to the cloud loop.
+          } catch {
+            clearTimeout(lanTimer);
+            // LAN dead — fall through to the normal cloud loop (no flag
+            // poisoning: the cache may simply be stale; cloud may still win).
+          }
+        }
+      } catch { /* cache unavailable — straight to the normal loop */ }
+    }
     const url = buildUrl(requestBaseUrl, path, options?.params);
 
     // ── Electron: pre-discover local API (inert under local-first) ──────────────────
@@ -1854,6 +1936,19 @@ export class ApiClient {
         // other routes that LAN DOES support should continue working.
         // (See Issue #16 in the offline analysis: "A 404 from local API is
         // not a network failure.")
+        //
+        // FIELD-AUDIT 2026-11-26 — "No LAN server available" is a DISCOVERY
+        // MISS, not a proven LAN outage: the branch desktop may be up while
+        // this client simply has no pinned/discovered address yet. The old
+        // code threw status-0 → markBothUnreachable() → for the next 30s
+        // EVERY mutation was routed to the offline queue and join-queue was
+        // REFUSED ("This operation cannot be queued") — the exact kiosk
+        // field fault at 03:56:40–03:57:05 (log 2026-11-26). A missing pin
+        // now fails the request WITHOUT poisoning the routing flags.
+        if (lanErr instanceof ApiClientError && lanErr.status === 0 && /no lan server/i.test(lanErr.message || '')) {
+          console.log(`[ApiClient:LAN] ${method} ${path} → no LAN server known (discovery miss, NOT marked offline)`);
+          throw lanErr;
+        }
         if (lanErr instanceof ApiClientError && (lanErr.status === 0 || lanErr.status >= 500)) {
           markBothUnreachable();
           console.log(`[ApiClient:LAN] ${method} ${path} → LAN also failed (status=${lanErr.status}), marking BOTH unreachable for 30s`);

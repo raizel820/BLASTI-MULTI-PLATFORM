@@ -41,6 +41,12 @@ export interface PairingBeaconIdentity {
   /** Why the phone is announcing — e.g. 'ready-for-pairing'. */
   status?: string;
   /**
+   * 0.6.126 — EXPLICIT device type on the wire (user requirement: "blasti
+   * app must also announce and send device type (pc, phone, kiosk) and
+   * device name"). When omitted the native side derives it from `mode`.
+   */
+  deviceType?: 'phone' | 'kiosk' | 'desktop';
+  /**
    * 0.6.102 — WHICH BLASTI surface is announcing. The manager's result
    * filters are strict (audit requirement): 'phone' → PHONE WITH BLASTI APP,
    * 'kiosk' → PHONE/TABLET WITH BLASTI APP IN KIOSK MODE. Without this field
@@ -96,6 +102,9 @@ export async function startPairingBeacon(identity: PairingBeaconIdentity = {}): 
       // 0.6.102 — the announcing surface travels with the signal so the
       // manager renders the STRICT result-filter category.
       mode: identity.mode || 'phone',
+      // 0.6.126 — explicit deviceType (derived from mode when not given).
+      deviceType: identity.deviceType
+        || (identity.mode === 'kiosk' ? 'kiosk' : identity.mode === 'desktop' ? 'desktop' : 'phone'),
       appVersion: APP_VERSION || '',
     });
     return true;

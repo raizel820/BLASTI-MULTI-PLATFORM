@@ -83,7 +83,7 @@ app.patch('/account/username', async (c) => {
     })
     if (!dbAdmin) return c.json({ error: 'User not found' }, 404)
 
-    const isCorrect = !!dbAdmin.passwordHash && verifyPassword(currentPassword, dbAdmin.passwordHash)
+    const isCorrect = !!dbAdmin.passwordHash && (await verifyPassword(currentPassword, dbAdmin.passwordHash))
     if (!isCorrect) return c.json({ success: false, error: 'Current password is incorrect' }, 401)
 
     // No-op rename — succeed without touching the row.
@@ -156,10 +156,10 @@ app.patch('/account/password', async (c) => {
     })
     if (!dbAdmin) return c.json({ error: 'User not found' }, 404)
 
-    const isCorrect = !!dbAdmin.passwordHash && verifyPassword(currentPassword, dbAdmin.passwordHash)
+    const isCorrect = !!dbAdmin.passwordHash && (await verifyPassword(currentPassword, dbAdmin.passwordHash))
     if (!isCorrect) return c.json({ success: false, error: 'Current password is incorrect' }, 401)
 
-    const newHash = hashPassword(newPassword)
+    const newHash = await hashPassword(newPassword)
     await db.user.update({ where: { id: admin.id }, data: { passwordHash: newHash } })
 
     // Audit trail — NEVER the password itself, not even a hash.
@@ -4411,7 +4411,11 @@ app.post('/users/:id/reset-password', async (c) => {
     const admin = await requireAdmin(c)
 
     const id = c.req.param('id')
-    const newPassword = 'password123'
+    // SECURITY (0.6.126 audit T1-3): was a hardcoded 'password123' hashed with
+    // a static repo-default salt in a hex format verifyPassword() can NEVER
+    // match (bricked the account). Now: CSPRNG one-time password + the shared
+    // scrypt hashPassword() so the user can actually log in with it.
+    const newPassword = require('crypto').randomBytes(12).toString('base64url') // 16 chars, ~72 bits
 
     // Verify user exists
     const user = await db.user.findUnique({
@@ -4422,9 +4426,8 @@ app.post('/users/:id/reset-password', async (c) => {
       return c.json({ error: 'User not found' }, 404)
     }
 
-    // Hash the new password (same method as register)
-    const salt = process.env.PASSWORD_SALT || 'blasti-salt-2024'
-    const passwordHash = scryptSync(newPassword, salt, 64).toString('hex')
+    // Hash the new password with the SAME hasher every login verifies against
+    const passwordHash = await hashPassword(newPassword)
 
     // Update password
     await db.user.update({

@@ -54,41 +54,51 @@ export function setGlobalLanMode(val: boolean) {
 
 /** Caller scope read from the persisted zustand store ('blasti-app'). */
 interface StoredSessionContext {
+  userId: string | null;
   agencyId: string | null;
   branchId: string | null;
   role: string | null;
 }
 
 /**
- * Read the logged-in user's agency/branch/role scope for the join call.
+ * Read the logged-in user's id + agency/branch/role scope for the join call.
  * Staff branch info may live on user.branchId or user.staff.branchId —
  * pass what exists, null otherwise (the master validates the scope itself).
  */
 function readStoredSessionUser(): StoredSessionContext {
   try {
     const raw = localStorage.getItem('blasti-app');
-    if (!raw) return { agencyId: null, branchId: null, role: null };
+    if (!raw) return { userId: null, agencyId: null, branchId: null, role: null };
     const parsed = JSON.parse(raw) as { state?: { user?: Record<string, unknown> | null } } | null;
     const user = parsed?.state?.user;
-    if (!user || typeof user !== 'object') return { agencyId: null, branchId: null, role: null };
+    if (!user || typeof user !== 'object') return { userId: null, agencyId: null, branchId: null, role: null };
     const staff = (user as { staff?: { branchId?: unknown } }).staff;
     const branchId = typeof user.branchId === 'string'
       ? user.branchId
       : staff && typeof staff.branchId === 'string' ? staff.branchId : null;
     return {
+      userId: typeof user.id === 'string' ? user.id : null,
       agencyId: typeof user.agencyId === 'string' ? user.agencyId : null,
       branchId,
       role: typeof user.role === 'string' ? user.role : null,
     };
   } catch {
-    return { agencyId: null, branchId: null, role: null };
+    return { userId: null, agencyId: null, branchId: null, role: null };
   }
 }
 
 /**
  * When a discovered beacon advertises `lanAuthority: true`, join that node
- * as a follower: cloud session token + stable device fingerprint → the
- * master mints a per-device lanToken and api-client repoints all traffic.
+ * as a follower: user identity + scope + stable device fingerprint → the
+ * master validates the identity against its local User mirror and mints a
+ * per-device lanToken after the operator ACCEPTS, then api-client repoints
+ * all traffic.
+ *
+ * SECURITY (0.6.126 audit T1-9): the CLOUD SESSION JWT IS NO LONGER SENT —
+ * it used to be POSTed verbatim to whatever LAN host answered the (spoofable)
+ * discovery beacon, so a rogue fake-master harvested staff/owner credentials.
+ * The join now carries only identity + scope; the master's operator approval
+ * (mandatory acceptance dialog) remains the trust anchor.
  *
  * Guard: only joins when NOT already joined to that master.instanceId.
  * NEVER throws — LAN failures must not break discovery.
@@ -110,7 +120,7 @@ async function attemptLanAuthorityJoin(server: LanServerInfo): Promise<void> {
       return;
     }
 
-    const { agencyId, branchId, role } = readStoredSessionUser();
+    const { userId, agencyId, branchId, role } = readStoredSessionUser();
     const fingerprint = await getDeviceId();
     const outcome = await joinMaster(
       {
@@ -120,7 +130,8 @@ async function attemptLanAuthorityJoin(server: LanServerInfo): Promise<void> {
         name: server.hostname ?? null,
         term: server.term ?? null,
       },
-      { token, agencyId, branchId, role },
+      // SECURITY (T1-9): identity + scope ONLY — never the session token.
+      { token: '', userId, agencyId, branchId, role },
       fingerprint,
     );
     if (outcome.joined) {

@@ -1,7 +1,7 @@
 'use client';
 
 import { useAppStore } from '@/store/use-app-store';
-import { t as translate, type TranslationKeys, type Language } from '@/i18n';
+import { t as translate, setDictionary, type TranslationKeys, type Language } from '@/i18n';
 import { useSyncExternalStore, useCallback } from 'react';
 
 // Simple external store for language changes outside of Zustand (pre-login)
@@ -33,13 +33,50 @@ export function setLanguage(lang: Language) {
   } catch {
     /* storage unavailable (private mode) — session-only choice */
   }
+  if (lang === 'fr' || lang === 'en') void ensureDictionary(lang);
   langListeners.forEach(l => l());
+}
+
+// ─── 0.6.127 — lazy dictionary loading ──────────────────────────────────
+// Arabic ships statically (see i18n/index.ts); fr/en are on-demand chunks.
+// The STORED preference starts loading at MODULE EVAL (below) so the chunk
+// lands while the shell hydrates/boot-gates — components using useLanguage
+// subscribe to `dictVersion` and re-render once their dictionary arrives.
+let dictVersion = 0;
+const dictListeners = new Set<() => void>();
+const loadedLangs = new Set<Language>(['ar']);
+
+function subscribeToDict(callback: () => void): () => void {
+  dictListeners.add(callback);
+  return () => { dictListeners.delete(callback); };
+}
+
+async function ensureDictionary(lang: Language): Promise<void> {
+  if (loadedLangs.has(lang)) return;
+  try {
+    const mod = lang === 'fr'
+      ? await import('@/i18n/fr')
+      : lang === 'en'
+        ? await import('@/i18n/en')
+        : null;
+    if (mod && mod.default) {
+      setDictionary(lang, mod.default);
+      loadedLangs.add(lang);
+      dictVersion++;
+      dictListeners.forEach(l => l());
+    }
+  } catch {
+    /* dictionary failed to load — Arabic fallback stays active */
+  }
 }
 
 // Initialize from localStorage
 if (typeof window !== 'undefined') {
   const stored = localStorage.getItem('blasti-lang') as Language | null;
   if (stored) currentLang = stored;
+  // Kick the on-demand dictionary chunk for a non-default stored language
+  // IMMEDIATELY — parallel with hydration, invisible inside the boot gate.
+  if (stored === 'fr' || stored === 'en') void ensureDictionary(stored);
 }
 
 /**
@@ -88,7 +125,7 @@ export function adoptLocalLanguagePreference<T extends { language?: string; id?:
 
 export function useLanguage() {
   const user = useAppStore((s) => s.user);
-  
+
   const getSnapshot = () => {
     if (user?.language) return user.language;
     return currentLang;
@@ -97,6 +134,16 @@ export function useLanguage() {
   const getServerSnapshot = () => 'ar' as Language;
 
   const effectiveLang = useSyncExternalStore(subscribeToLang, getSnapshot, getServerSnapshot);
+
+  // Subscribe to dictionary arrival: when the fr/en chunk lands the hook
+  // re-renders and every t() call resolves against the full dictionary.
+  useSyncExternalStore(subscribeToDict, () => dictVersion, () => dictVersion);
+
+  // Post-login language (user.language can differ from the stored one) —
+  // make sure that dictionary is on its way too.
+  if (typeof window !== 'undefined' && (effectiveLang === 'fr' || effectiveLang === 'en')) {
+    void ensureDictionary(effectiveLang);
+  }
 
   const t = useCallback((key: TranslationKeys, params?: Record<string, string>) => translate(key, effectiveLang, params), [effectiveLang]);
 

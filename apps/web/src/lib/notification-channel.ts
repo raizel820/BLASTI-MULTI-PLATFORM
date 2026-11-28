@@ -95,7 +95,11 @@ interface NotificationChannelConfig {
 }
 
 const BLASTI_TURN_CHANNEL: NotificationChannelConfig = {
-  id: 'blasti-turn-alert',
+  // 0.6.126 — v2: matches the NATIVE channel BlastiNativeStatus creates at
+  // boot (blasti-turn-alert-v2, custom blasti_alarm sound + call-like
+  // vibration). Android channels are immutable — the old 'blasti-turn-alert'
+  // id was created with the generic ding, so both sides moved to -v2.
+  id: 'blasti-turn-alert-v2',
   name: 'BLASTI Turn Alert',
   importance: 5, // Max importance — shows as heads-up notification
   sound: 'blasti_alarm.wav',
@@ -103,6 +107,14 @@ const BLASTI_TURN_CHANNEL: NotificationChannelConfig = {
   lights: true,
   lightColor: '#10b981',
 };
+
+/** 0.6.126 — stable dedupe identity shared with BlastiFirebaseMessagingService:
+ *  notifications posted under the SAME tag+id replace each other, so the
+ *  socket path (web) and the FCM path (native service) can never produce two
+ *  notifications for one call. */
+export const TURN_ALERT_NOTIFICATION_TAG_PREFIX = 'blasti-turn-';
+export const TURN_ALERT_NOTIFICATION_ID = 4242;
+export const TURN_APPROACHING_NOTIFICATION_ID = 4243;
 
 let channelCreated = false;
 
@@ -175,10 +187,22 @@ function getBlastiNativeStatusPlugin(): {
   openInstallPermissionSettings?: () => Promise<{ ok?: boolean; canInstall?: boolean }>;
   setLockscreenTakeover?: (opts: { enabled: boolean }) => Promise<{ ok?: boolean; enabled?: boolean }>;
   getTurnDismissState?: () => Promise<{ dismissedAt?: number; dismissedId?: number }>;
+  getPendingTurnCall?: () => Promise<{
+    reservationId?: string | null;
+    ticketNumber?: string;
+    agencyName?: string;
+    counterName?: string;
+    at?: number;
+  }>;
+  clearPendingTurnCall?: () => Promise<{ ok?: boolean }>;
   notifyLockscreen?: (opts: {
     title: string;
     body: string;
     notificationId?: number;
+    /** Stable dedupe tag — "blasti-turn-<reservationId>" for turn calls. */
+    tag?: string;
+    /** Incoming-call category treatment (CATEGORY_CALL). */
+    callStyle?: boolean;
     /** Opt-in full-screen app launch over the keyguard (default false). */
     fullScreen?: boolean;
     /** Label for the native "Stop" action button (default "إيقاف / Stop"). */
@@ -249,8 +273,11 @@ export async function wasTurnAlertDismissedNatively(at: number): Promise<boolean
 
 /**
  * Post a LOCK-SCREEN notification through the native plugin (high-importance
- * PUBLIC content on the lock screen, tap → app; the full-screen APP takeover
- * only when the user opted in via lockscreenTakeover).
+ * PUBLIC content on the lock screen, tap → app).
+ * 0.6.126 — call-style: turn calls post under the stable tag shared with the
+ * FCM service, CATEGORY_CALL, and the full-screen intent fires for turn
+ * CALLS (incoming-call UX) — tap/full-screen launch renders the call layout
+ * over the keyguard while every OTHER app launch stays behind it.
  * Returns true when the native path handled it.
  */
 export async function showLockscreenNotification(
@@ -258,22 +285,28 @@ export async function showLockscreenNotification(
   body: string,
   ticketNumber?: string,
   stopLabel?: string,
+  opts?: {
+    /** Stable dedupe tag — omit for generic notifications. */
+    tag?: string;
+    /** Stable notification id (shared with the FCM service). */
+    notificationId?: number;
+    /** Incoming-call treatment (CATEGORY_CALL). */
+    callStyle?: boolean;
+    /** Full-screen intent over the keyguard. */
+    fullScreen?: boolean;
+  },
 ): Promise<boolean> {
   if (!isCapacitorNative()) return false;
   try {
     const status = getBlastiNativeStatusPlugin();
     if (!status?.notifyLockscreen) return false;
-    // Apply the CURRENT takeover preference to the running activity BEFORE
-    // the notification posts — the runtime flags are what the full-screen
-    // intent launch obeys (singleTask reuses this very instance).
-    syncLockscreenTakeoverToNative();
     const res = await status.notifyLockscreen({
       title,
       body,
-      notificationId: Date.now() % 100000,
-      // Default OFF — the app must not show itself on the lock screen
-      // (field report: the whole app appeared over the keyguard).
-      fullScreen: lockscreenTakeoverEnabled(),
+      notificationId: opts?.notificationId ?? Date.now() % 100000,
+      tag: opts?.tag,
+      callStyle: opts?.callStyle,
+      fullScreen: opts?.fullScreen ?? lockscreenTakeoverEnabled(),
       // Lock-screen "Stop" action button — swipe/stop parity with the
       // in-app banner. Bilingual default matches the alert title style.
       stopLabel,
@@ -296,6 +329,7 @@ export async function scheduleTurnNotification(
   ticketNumber: string,
   stopLabel?: string,
   kind: TurnAlertKind = 'called',
+  opts?: { reservationId?: string },
 ): Promise<void> {
   // ── Preference gate (report: "no way to stop the lock screen notification
   // when agency calls") — queue_called=false silences EVERYTHING here:
@@ -306,13 +340,29 @@ export async function scheduleTurnNotification(
 
   // Channels MUST exist before anything posts. Idempotent — also covers
   // builds where the native boot hook could not run (the FCM background path
-  // targets blasti-turn-alert; without it, pushes land on the OS default
+  // targets blasti-turn-alert-v2; without it, pushes land on the OS default
   // low-importance channel: no heads-up, no lock-screen content).
   await setupTurnAlertChannel();
 
+  // 0.6.126 — stable dedupe identity: same tag+id as BlastiFirebaseMessaging-
+  // Service, so the socket-path post and the FCM-path post merge into ONE
+  // notification instead of stacking two.
+  const reservationId = opts?.reservationId;
+  const isCalled = kind === 'called';
+  const nativeOpts = reservationId
+    ? {
+        tag: `${TURN_ALERT_NOTIFICATION_TAG_PREFIX}${reservationId}`,
+        notificationId: isCalled ? TURN_ALERT_NOTIFICATION_ID : TURN_APPROACHING_NOTIFICATION_ID,
+        callStyle: isCalled,
+        // Turn CALLS get the incoming-call full-screen layout (renders over
+        // the keyguard when locked); approaching alerts stay heads-up only.
+        fullScreen: isCalled ? true : lockscreenTakeoverEnabled(),
+      }
+    : undefined;
+
   // 1. Native lock-screen path (public lock-screen visibility + optional
-  //    opt-in full-screen takeover) — exactly what the mobile app was missing.
-  if (await showLockscreenNotification(title, body, ticketNumber, stopLabel)) {
+  //    full-screen call takeover) — exactly what the mobile app was missing.
+  if (await showLockscreenNotification(title, body, ticketNumber, stopLabel, nativeOpts)) {
     // Still play the in-app alarm sound through the LocalNotifications path?
     // No — the lock-screen channel carries its own sound + vibration.
     return;
@@ -328,12 +378,12 @@ export async function scheduleTurnNotification(
           notifications: [{
             title,
             body,
-            id: Date.now() % 100000,
+            id: nativeOpts?.notificationId ?? Date.now() % 100000,
             channelId: BLASTI_TURN_CHANNEL.id,
             sound: 'blasti_alarm.wav',
             smallIcon: 'ic_launcher',
             iconColor: '#10b981',
-            extra: { ticketNumber, type: 'TURN_CALLED' },
+            extra: { ticketNumber, type: 'TURN_CALLED', reservationId },
           }],
         });
         void emitLockscreenEvent({ title, body, ticketNumber, at: Date.now() });

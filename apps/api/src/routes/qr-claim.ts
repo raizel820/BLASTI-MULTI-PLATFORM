@@ -205,28 +205,31 @@ app.post('/claim', async (c) => {
     }
 
     // Emit real-time events to agency room
-    try {
-      await emitQueueEvent('queue:updated', reservation.agencyId, {
+    // 0.6.127 — fire-and-forget (parallel): three awaited loopback emits with
+    // 3s timeouts each could block the claim response ~9s if the realtime
+    // service stalls. The claim is already committed — deliver in background.
+    void Promise.all([
+      emitQueueEvent('queue:updated', reservation.agencyId, {
         action: 'qr_claimed',
         reservationId: reservation.id,
         ticketNumber: reservation.displayNumber,
         deviceId,
-      })
-      await emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId || undefined, {
+      }),
+      emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId || undefined, {
         reservationId: reservation.id,
         status: reservation.status,
         qrClaimedAt: now.toISOString(),
-      })
+      }),
       // Task 24: fixed arity — the old call passed ('kiosk:update', agencyId, data)
       // to emitKioskEvent(agencyId, data), landing the event in room 'kiosk:kiosk:update'
-      await emitKioskEvent(reservation.agencyId, {
+      emitKioskEvent(reservation.agencyId, {
         action: 'qr_claimed',
         reservationId: reservation.id,
         ticketNumber: reservation.displayNumber,
-      })
-    } catch (emitErr) {
+      }),
+    ]).catch((emitErr) => {
       console.warn('[QR-Claim] Failed to emit realtime event:', emitErr)
-    }
+    })
 
     if (clientIp) recordSuccessfulRequest(clientIp)
 

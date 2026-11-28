@@ -44,6 +44,19 @@
         @binaryDownloads path /api/app-versions/*/download /api/app-versions/delta/*/download
 
         route {
+                # ── SECURITY (0.6.126 audit T1-4): gateway security headers ──
+                # Applied to every proxied response (web + API). The upstreams
+                # also set these now; `defer` lets upstream values win when
+                # they differ. HSTS is safe: Caddy auto-HTTPS guarantees TLS
+                # on every site block using a domain SITE_ADDRESS.
+                header {
+                        X-Content-Type-Options "nosniff"
+                        X-Frame-Options "DENY"
+                        Referrer-Policy "strict-origin-when-cross-origin"
+                        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+                        defer
+                }
+
                 # ── Binary downloads bypass compression (SPEED ROUND 2) ──
                 handle @binaryDownloads {
                         reverse_proxy api:3003 {

@@ -220,6 +220,40 @@ async function resolveAgencyName(db: any, agencyId: string): Promise<string> {
 }
 
 /**
+ * 0.6.126 — data-only FCM turn-call push for DEVICE-ORIGINATED calls
+ * (desktop workstations operating offline-first). Parity with the direct
+ * routes: with the customer's app dead/backgrounded the call must STILL
+ * reach the lock screen as an incoming-call-style notification
+ * (BlastiFirebaseMessagingService). Best-effort, never throws.
+ */
+async function sendDeviceTurnCallPush(db: any, agencyId: string, userId: string,
+                                      reservationId: string, displayNumber: string,
+                                      counterName: string | null): Promise<void> {
+  try {
+    if (!db) return
+    const [recipient, agency] = await Promise.all([
+      db.user.findUnique({ where: { id: userId }, select: { fcmToken: true, language: true } }),
+      db.agency.findUnique({ where: { id: agencyId }, select: { name: true, nameAr: true, nameFr: true } }),
+    ])
+    if (!recipient?.fcmToken) return
+    const { sendTurnCallPush } = require('./notification-router') as typeof import('./notification-router')
+    await sendTurnCallPush(recipient.fcmToken, {
+      userId,
+      reservationId,
+      agencyId,
+      ticketNumber: displayNumber,
+      agencyName: agency?.name || '',
+      agencyNameAr: agency?.nameAr ?? null,
+      agencyNameFr: agency?.nameFr ?? null,
+      counterName: counterName || null,
+      language: recipient.language,
+    })
+  } catch (err) {
+    console.warn('[sync-side-effects] turn-call push failed:', (err as Error)?.message)
+  }
+}
+
+/**
  * Notification row parity with the direct routes:
  *   CALLED    → QUEUE_CALLED  (agency.ts processCandidate)
  *   cancel    → CANCELLED     (agency.ts PATCH /queue/:id)
@@ -311,11 +345,14 @@ export async function emitPushSideEffects(params: EmitPushSideEffectsParams): Pr
     if (action === 'call') {
       // Payload parity: agency.ts POST /queue/call-next.
       const customerName = await resolveCustomerName(db, data, prev)
+      // 0.6.126 — agencyName parity (the in-app call layout needs WHERE).
+      const agencyName = await resolveAgencyName(db, agencyId)
       fire(() => emit.queue('queue:called', agencyId, {
         reservationId: recordId,
         displayNumber,
         userId: userId || null,
         customerName,
+        agencyName,
         isWalkIn,
         serviceId,
       }))
@@ -325,7 +362,10 @@ export async function emitPushSideEffects(params: EmitPushSideEffectsParams): Pr
           agencyId,
           userId,
           reservationId: recordId,
+          agencyName,
         }))
+        // 0.6.126 — call-style lock-screen push (app closed/backgrounded).
+        fire(() => sendDeviceTurnCallPush(db, agencyId, userId, recordId, displayNumber, null))
       }
       fire(() => emit.kiosk(agencyId, { nowServing: displayNumber, action: 'called' }))
     } else {

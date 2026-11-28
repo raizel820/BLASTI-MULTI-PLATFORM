@@ -120,7 +120,7 @@ export async function sendViaPushNotification(
         notification: {
           // Matches the notification channel the mobile shell creates
           // for turn alerts (high-importance, alarm sound).
-          channelId: 'blasti-turn-alert',
+          channelId: 'blasti-turn-alert-v2',
           sound: 'blasti_alarm.wav',
         },
       },
@@ -146,4 +146,169 @@ export async function sendViaPushNotification(
     )
     return false
   }
+}
+
+// ─── Data-only push (call-style notifications) — 0.6.126 ────────────────────
+
+/**
+ * 0.6.126 — DATA-ONLY FCM message.
+ *
+ * WHY DATA-ONLY (audit: "calling notification must behave like a phone
+ * call"): FCM notification messages are rendered by the system tray when the
+ * app is dead — the app cannot attach a full-screen intent, call-style shade
+ * layout, Stop action or repeating alarm to them. Data messages are ALWAYS
+ * delivered to the app's FirebaseMessagingService (BlastiFirebaseMessagingService),
+ * which renders them as a real incoming-call notification.
+ *
+ * All values MUST be strings (FCM data payload contract).
+ */
+export async function sendDataPush(
+  fcmToken: string,
+  data: Record<string, string>
+): Promise<boolean> {
+  try {
+    const messaging = getFirebaseMessaging()
+    if (!messaging) return false
+
+    const stringData: Record<string, string> = {}
+    for (const [key, value] of Object.entries(data)) {
+      stringData[key] = value == null ? '' : String(value)
+    }
+
+    const messageId = await messaging.send({
+      token: fcmToken,
+      data: stringData,
+      android: { priority: 'high' },
+    })
+
+    console.log(
+      `[NotificationRouter] FCM data push → token:${fcmToken.substring(0, 8)}… ` +
+        `(type: ${stringData.type ?? 'generic'}, messageId: ${messageId})`
+    )
+    return true
+  } catch (error) {
+    console.warn(
+      `[NotificationRouter] FCM data push failed for token ${fcmToken.substring(0, 8)}…:`,
+      error instanceof Error ? error.message : error
+    )
+    return false
+  }
+}
+
+export interface TurnCallPushParams {
+  userId: string
+  reservationId: string
+  agencyId: string
+  ticketNumber: string
+  /** Localized agency names (pick by recipient language). */
+  agencyName: string
+  agencyNameAr?: string | null
+  agencyNameFr?: string | null
+  /** Counter pointer, e.g. "الشباك 3" / "Counter 3" (already localized). */
+  counterName?: string | null
+  /** Recipient language: 'ar' | 'fr' | anything else → English. */
+  language?: string | null
+}
+
+/** Localized title/body for the turn-call alert (server-side, since the
+ *  data-only notification is rendered natively without webview i18n). */
+function localizedTurnCallStrings(params: TurnCallPushParams): { title: string; body: string } {
+  const lang = params.language
+  const agencyName =
+    lang === 'ar'
+      ? params.agencyNameAr || params.agencyName
+      : lang === 'fr'
+        ? params.agencyNameFr || params.agencyName
+        : params.agencyName
+  const counter = params.counterName ? ` — ${params.counterName}` : ''
+
+  if (lang === 'ar') {
+    return {
+      title: 'دورك الآن!',
+      body: `التذكرة ${params.ticketNumber} في ${agencyName}${counter}`,
+    }
+  }
+  if (lang === 'fr') {
+    return {
+      title: "C'est votre tour !",
+      body: `Ticket ${params.ticketNumber} à ${agencyName}${counter}`,
+    }
+  }
+  return {
+    title: "It's your turn!",
+    body: `Ticket ${params.ticketNumber} at ${agencyName}${counter}`,
+  }
+}
+
+/**
+ * TURN_CALL — the phone-call-style lock-screen alert. Data-only (see
+ * sendDataPush): BlastiFirebaseMessagingService renders it with CallStyle,
+ * full-screen intent, repeating alarm and a Stop action.
+ */
+export async function sendTurnCallPush(
+  fcmToken: string,
+  params: TurnCallPushParams
+): Promise<boolean> {
+  const { title, body } = localizedTurnCallStrings(params)
+  return sendDataPush(fcmToken, {
+    type: 'TURN_CALL',
+    title,
+    body,
+    ticketNumber: params.ticketNumber ?? '',
+    reservationId: params.reservationId ?? '',
+    agencyId: params.agencyId ?? '',
+    agencyName: params.agencyName ?? '',
+    agencyNameAr: params.agencyNameAr ?? '',
+    counterName: params.counterName ?? '',
+  })
+}
+
+/**
+ * TURN_APPROACHING — the MINIMAL notification (no full-screen takeover, no
+ * insistent ringing): heads-up on the same high-importance channel with a
+ * Stop action.
+ */
+export async function sendTurnApproachingPush(
+  fcmToken: string,
+  params: TurnCallPushParams & { peopleAhead?: number | null }
+): Promise<boolean> {
+  const lang = params.language
+  const agencyName =
+    lang === 'ar'
+      ? params.agencyNameAr || params.agencyName
+      : lang === 'fr'
+        ? params.agencyNameFr || params.agencyName
+        : params.agencyName
+
+  let title: string
+  let body: string
+  if (lang === 'ar') {
+    title = 'دورك يقترب'
+    body =
+      params.peopleAhead === 0
+        ? `التذكرة ${params.ticketNumber} في ${agencyName} — أنت التالي!`
+        : `التذكرة ${params.ticketNumber} في ${agencyName} — يقترب دورك`
+  } else if (lang === 'fr') {
+    title = 'Votre tour approche'
+    body =
+      params.peopleAhead === 0
+        ? `Ticket ${params.ticketNumber} à ${agencyName} — vous êtes le suivant !`
+        : `Ticket ${params.ticketNumber} à ${agencyName} — votre tour approche`
+  } else {
+    title = 'Your turn is approaching'
+    body =
+      params.peopleAhead === 0
+        ? `Ticket ${params.ticketNumber} at ${agencyName} — you are next!`
+        : `Ticket ${params.ticketNumber} at ${agencyName} — your turn is coming up`
+  }
+
+  return sendDataPush(fcmToken, {
+    type: 'TURN_APPROACHING',
+    title,
+    body,
+    ticketNumber: params.ticketNumber ?? '',
+    reservationId: params.reservationId ?? '',
+    agencyId: params.agencyId ?? '',
+    agencyName: params.agencyName ?? '',
+  })
 }

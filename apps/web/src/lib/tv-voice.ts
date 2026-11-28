@@ -169,6 +169,31 @@ function candidateEndpoints(): VoiceEndpoint[] {
   return out;
 }
 
+/**
+ * Auth headers for /speak calls (SECURITY 0.6.126 audit T1-8): the desktop
+ * voice service now token-gates non-loopback callers. Device surfaces (TV
+ * boards / kiosks) hold a device token in localStorage — attach it so the
+ * LAN endpoint accepts the request. A tokenless caller degrades to the
+ * browser-voice fallback (the probe/health endpoint stays open).
+ */
+function speakAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { Accept: 'audio/wav, application/json' };
+  try {
+    const deviceToken =
+      localStorage.getItem('blasti_kiosk_device_token') ||
+      localStorage.getItem('blasti_tv_device_token') ||
+      '';
+    if (deviceToken) headers['X-Device-Token'] = deviceToken;
+  } catch { /* storage unavailable */ }
+  try {
+    const raw = localStorage.getItem('blasti-app') || '';
+    const parsed = raw ? JSON.parse(raw) : null;
+    const sessionToken = parsed?.state?.sessionToken || parsed?.sessionToken || '';
+    if (sessionToken) headers['Authorization'] = `Bearer ${sessionToken}`;
+  } catch { /* storage unavailable */ }
+  return headers;
+}
+
 let resolvedEndpoint: (VoiceEndpoint & { at: number }) | null = null;
 let failedUntil = 0;
 
@@ -402,7 +427,7 @@ async function speakLine(line: AnnouncementLine, config: Required<VoiceCallingCo
       const url = `${service.base}/speak?${qs.toString()}${service.suffix ? `&${service.suffix}` : ''}`;
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), 8000);
-      const res = await fetch(url, { signal: ctl.signal });
+      const res = await fetch(url, { headers: speakAuthHeaders(), signal: ctl.signal });
       clearTimeout(timer);
       if (res.ok) {
         const bytes = await res.arrayBuffer();
@@ -466,7 +491,7 @@ export async function playTestAnnouncement(config: Required<VoiceCallingConfig>)
     try {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), 8000);
-      const res = await fetch(url, { signal: ctl.signal });
+      const res = await fetch(url, { headers: speakAuthHeaders(), signal: ctl.signal });
       clearTimeout(timer);
       if (!res.ok) return false;
       const bytes = await res.arrayBuffer();

@@ -279,6 +279,8 @@ function startPrintRelayListener(opts) {
   const verifyCaller = opts && typeof opts.verifyCaller === 'function' ? opts.verifyCaller : null
   const getDb = opts && typeof opts.getDb === 'function' ? opts.getDb : () => null
   const port = (opts && Number(opts.port) > 0) ? Number(opts.port) : BLASTI_LAN_PORTS.PRINT_RELAY
+  // SECURITY (T1-8): honor the deployment bind address (BLASTI_LAN_BIND).
+  const hostname = opts && opts.hostname ? String(opts.hostname) : '0.0.0.0'
 
   const Hono = require('hono').Hono
   const { serve } = require('@hono/node-server')
@@ -290,7 +292,13 @@ function startPrintRelayListener(opts) {
   const WINDOW_MS = 60_000
 
   app.post('/print-job', async (c) => {
-    const clientIp = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || c.req.header('x-real-ip') || 'lan'
+    // SECURITY (T1-8): keyed on the TCP remote address, NOT the spoofable
+    // X-Forwarded-For header any LAN caller can rotate per request.
+    let clientIp = 'lan'
+    try {
+      const incoming = c.env && c.env.incoming
+      if (incoming && incoming.socket && incoming.socket.remoteAddress) clientIp = String(incoming.socket.remoteAddress)
+    } catch { /* keep fallback */ }
     const now = Date.now()
     const entry = hits.get(clientIp) || { count: 0, windowStart: now }
     if (now - entry.windowStart > WINDOW_MS) { entry.count = 0; entry.windowStart = now }
@@ -323,8 +331,8 @@ function startPrintRelayListener(opts) {
 
   let server = null
   try {
-    server = serve({ fetch: app.fetch, port }, () => {
-      log(`dedicated print-relay listener running on http://0.0.0.0:${port} (kiosk/master print jobs)`)
+    server = serve({ fetch: app.fetch, port, hostname }, () => {
+      log(`dedicated print-relay listener running on http://${hostname}:${port} (kiosk/master print jobs)`)
     })
     server.on('error', (err) => {
       log(`print-relay listener error (compat :3080 route keeps working): ${err && err.message}`)

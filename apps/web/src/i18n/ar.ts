@@ -2383,6 +2383,7 @@ const ar = {
   itIsYourTurn: 'إنه دورك!',
   imHere: 'أنا هنا',
   turnAlertSubtitle: 'تم استدعاء دورك',
+  turnAlertStop: 'إيقاف',
 
   // ─── Agency Dashboard Enhancement ─────────────
   nowServingHero: 'يُخدم الآن',

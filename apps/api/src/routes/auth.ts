@@ -262,9 +262,11 @@ app.post('/login', async (c) => {
     // which usernames exist. On a miss we burn one scrypt verification
     // against a fixed dummy hash so both paths cost the same.
     let timingHash: string | null = null
-    const equalizeTiming = () => {
-      if (timingHash === null) timingHash = hashPassword('blasti-timing-equalizer-0.6.48')
-      verifyPassword('blasti-timing-probe', timingHash)
+    // 0.6.127 — async scrypt: burns the same wall-clock cost off the event
+    // loop (the sync version froze every concurrent request ~50-150ms).
+    const equalizeTiming = async () => {
+      if (timingHash === null) timingHash = await hashPassword('blasti-timing-equalizer-0.6.48')
+      await verifyPassword('blasti-timing-probe', timingHash)
     }
 
     // Find user by username
@@ -293,7 +295,7 @@ app.post('/login', async (c) => {
 
     if (!user) {
       // Same generic body/status as a wrong password — and now the same cost.
-      equalizeTiming()
+      await equalizeTiming()
       return c.json(
         { success: false, error: 'Invalid username or password' },
         401,
@@ -311,7 +313,7 @@ app.post('/login', async (c) => {
     // Verify password. passwordHash is nullable (Task 14 — synced desktop
     // profiles store NULL; cloud accounts always have one): treat a NULL
     // hash as "no password set" → cannot authenticate.
-    const isPasswordValid = !!user.passwordHash && verifyPassword(password, user.passwordHash)
+    const isPasswordValid = !!user.passwordHash && (await verifyPassword(password, user.passwordHash))
     if (!isPasswordValid) {
       return c.json(
         { success: false, error: 'Invalid username or password' },
@@ -555,6 +557,14 @@ app.post('/register', async (c) => {
     // the strict auth bucket before any DB write / OTP dispatch.
     checkRateLimit(ip, AUTH_RATE_LIMIT)
 
+    // SECURITY (0.6.126 audit T1-1) — defense in depth: the schema no longer
+    // accepts SUPER_ADMIN, but refuse it HERE too in case a future schema
+    // drift ever re-adds it. The only supported way to create a platform
+    // admin is the DB seed (packages/db/prisma/seed.ts).
+    if ((validation.data as { role?: string }).role === 'SUPER_ADMIN') {
+      return c.json({ success: false, error: 'Invalid role' }, 403)
+    }
+
     const { username, fullName, password, email, phoneNumber, role, agencyCode } = validation.data
     // Task 5 — optional Algeria address (register form location selectors).
     // wilaya arrives as the canonical two-digit code (schema regex enforced);
@@ -671,7 +681,7 @@ app.post('/register', async (c) => {
     }
 
     // Hash password
-    const passwordHash = hashPassword(password)
+    const passwordHash = await hashPassword(password)
 
     // Task 31-A: SUPER_ADMIN accounts are created pre-verified — they skip
     // the email/phone OTP flow entirely (see the early return below).
@@ -1935,7 +1945,7 @@ app.post('/reset-password', async (c) => {
     }
 
     // Hash the new password
-    const passwordHash = hashPassword(newPassword)
+    const passwordHash = await hashPassword(newPassword)
 
     // Update user's password in the database
     await db.user.update({

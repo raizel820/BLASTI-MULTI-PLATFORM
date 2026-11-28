@@ -1,5 +1,7 @@
 package com.blasti.mobile;
 
+import android.content.Intent;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
@@ -13,6 +15,66 @@ import com.getcapacitor.BridgeActivity;
 public class MainActivity extends BridgeActivity {
 
     private static final String TAG = "BLASTI";
+
+    /** Extra set by BlastiFirebaseMessagingService on the turn-call launch
+     *  intent (content intent + full-screen intent): marks this launch as a
+     *  CALL — MainActivity temporarily applies setShowWhenLocked(true) +
+     *  setTurnScreenOn(true) so the call layout renders over the keyguard
+     *  (the incoming-call experience), while every other launch keeps the
+     *  safe pref-driven defaults (never show over the keyguard). */
+    private static final String EXTRA_FROM_TURN_CALL = "blastiFromTurnCall";
+
+    /** True while the activity is resumed — BlastiFirebaseMessagingService
+     *  consults it, plus the notification dedupe, to avoid double alerts. */
+    private static volatile boolean appInForeground = false;
+
+    public static boolean isAppForeground() {
+        return appInForeground;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        appInForeground = true;
+    }
+
+    @Override
+    protected void onPause() {
+        appInForeground = false;
+        super.onPause();
+    }
+
+    /**
+     * 0.6.126 — per-launch flags: a turn-CALL launch (notification tap or
+     * full-screen intent carrying EXTRA_FROM_TURN_CALL) may render over the
+     * keyguard (incoming-call UX); every other launch keeps the safe
+     * pref-driven default (never show over the lock screen — the original
+     * "whole app on the lock screen" field bug stays fixed). Best-effort:
+     * setShowWhenLocked/setTurnScreenOn exist from API 27.
+     */
+    private void applyLaunchFlagsForIntent(Intent intent) {
+        boolean isTurnCallLaunch = intent != null
+            && intent.getBooleanExtra(EXTRA_FROM_TURN_CALL, false);
+        if (isTurnCallLaunch && Build.VERSION.SDK_INT >= 27) {
+            try {
+                setShowWhenLocked(true);
+                setTurnScreenOn(true);
+            } catch (Throwable t) {
+                Log.w(TAG, "applyTurnCallLaunchFlags failed", t);
+            }
+        } else {
+            BlastiNativeStatus.applyLaunchPreferences(this);
+        }
+    }
+
+    /** singleTask re-launch (app already running when the call notification
+     *  is tapped) — same per-launch flag application as onCreate. */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        applyLaunchFlagsForIntent(intent);
+    }
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -39,8 +101,8 @@ public class MainActivity extends BridgeActivity {
         BlastiNativeStatus.initializeFirebase(this);
 
         // 4) Boot-time native prep, web-independent:
-        //      - Create the notification channels (blasti-lockscreen,
-        //        blasti-turn-alert, blasti-general) so FCM background pushes
+        //      - Create the notification channels (blasti-lockscreen-v2,
+        //        blasti-turn-alert-v2, blasti-general) so FCM background pushes
         //        and the web layer's notifications land on high-importance
         //        PUBLIC channels even when the app was cold-started by a push.
         //      - Apply the persisted lockscreenTakeover preference
@@ -49,7 +111,12 @@ public class MainActivity extends BridgeActivity {
         //        only the notification shows on the lock screen; the static
         //        showWhenLocked/turnScreenOn manifest attributes were removed
         //        for exactly this reason).
-        BlastiNativeStatus.applyLaunchPreferences(this);
+        //      - EXCEPTION (0.6.126): a turn-CALL launch (notification tap /
+        //        full-screen intent carrying EXTRA_FROM_TURN_CALL) applies
+        //        show-when-locked so the call layout renders over the keyguard
+        //        — the incoming-call experience the user opted into by
+        //        triggering the call notification flow.
+        applyLaunchFlagsForIntent(getIntent());
 
         // 5) 0.6.104 — SYSTEM BAR INSETS (user fault: "the app behaves as if
         //    it is always in full-screen — it covers the system data in the

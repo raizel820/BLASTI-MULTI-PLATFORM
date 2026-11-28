@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <application
         android:allowBackup="true"
@@ -64,6 +65,16 @@
         <receiver
             android:name=".BlastiNotificationDismissReceiver"
             android:exported="false" />
+
+        <!-- 0.6.126 — CALL-STYLE turn notifications: the planned custom
+             BlastiFirebaseMessagingService (CallStyle shade + full-screen
+             intent) was NEVER committed — the 0.6.126 recovery shipped only
+             this manifest reference, leaving NO service bound to
+             MESSAGING_EVENT (push delivery broken + ClassNotFoundException
+             risk). SECURITY AUDIT 0.6.126: restored the stock Capacitor
+             MessagingService so pushes deliver again. The custom CallStyle
+             service must be implemented before it can replace the stock one
+             (class + rendering code, not a manifest entry alone). -->
     </application>
 
     <!-- Permissions -->

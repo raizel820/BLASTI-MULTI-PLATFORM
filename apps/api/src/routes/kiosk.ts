@@ -236,9 +236,22 @@ app.get('/status', async (c) => {
       orderBy: { calledAt: 'desc' },
     })
 
+    // 0.6.127 perf — ONE GROUP BY instead of one COUNT per service. Kiosk
+    // status is polled regularly by wall devices; the old loop issued a
+    // separate reservation.count per active service on every poll.
+    const waitingByService = new Map<string, number>(
+      (
+        await db.reservation.groupBy({
+          by: ['serviceId'],
+          where: { agencyId, status: 'WAITING' },
+          _count: { _all: true },
+        })
+      ).map((g) => [g.serviceId, g._count._all])
+    )
+
     const serviceStats = await Promise.all(
       agency.services.map(async (service) => {
-        const waiting = await db.reservation.count({ where: { agencyId, serviceId: service.id, status: 'WAITING' } })
+        const waiting = waitingByService.get(service.id) ?? 0
         // Unified ETA per service
         const svcCompleted = recentCompletedForAgency.filter(r => r.serviceId === service.id)
         const svcEffective = getEffectiveServiceTime(svcCompleted, agency.averageServiceTime)

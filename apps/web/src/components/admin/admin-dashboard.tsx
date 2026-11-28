@@ -2,7 +2,7 @@
 import { apiFetch } from '@/lib/api-fetch';;
 import { APP_VERSION } from '@/lib/version';
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useRealtime } from '@/hooks/use-realtime';
@@ -146,6 +146,41 @@ interface ActivityItem {
 // with the prevValue→value tween used by agency/dashboard/helpers.tsx: it
 // animates on EVERY change (first paint AND the 60s auto-refresh) and no
 // longer needs a one-shot latch.
+
+// 0.6.127 — ISOLATED auto-refresh countdown. The tick used to live in the
+// dashboard body with `setAutoRefreshCountdown` per second — re-rendering
+// this 2,000+ line dashboard EVERY second just to move one number. The
+// interval + display now live in this memoized leaf; the dashboard tree
+// only re-renders when real data changes.
+const AutoRefreshCountdown = memo(function AutoRefreshCountdown({
+  onFire,
+  label,
+}: {
+  onFire: () => void;
+  label: string;
+}) {
+  const [count, setCount] = useState(60);
+  const onFireRef = useRef(onFire);
+  // 0.6.127 — keep the latest callback in an effect (react-hooks/refs:
+  // never touch refs during render).
+  useEffect(() => {
+    onFireRef.current = onFire;
+  });
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCount(prev => {
+        if (prev <= 1) {
+          onFireRef.current();
+          return 60;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return <span>{label} {count}s</span>;
+});
+
 function AnimatedCounter({ value, duration = 1200, prefix = '', suffix = '', decimals = 0 }: {
   value: number;
   duration?: number;
@@ -487,7 +522,7 @@ export function AdminDashboard() {
   const [smsTestLoading, setSmsTestLoading] = useState(false);
   const [smsValidating, setSmsValidating] = useState(false);
   const [agencies, setAgencies] = useState<Array<{ id: string; name: string; nameAr?: string; nameFr?: string; customCode: string; subscriptionStatus: string }>>([]);
-  const [autoRefreshCountdown, setAutoRefreshCountdown] = useState(60);
+  // 0.6.127 — the 60s auto-refresh countdown moved into <AutoRefreshCountdown>.
 
   const realtime = useRealtime();
 
@@ -720,19 +755,9 @@ export function AdminDashboard() {
     }
   };
 
-  // ─── Auto-refresh countdown ───────────────────────────────────────────
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setAutoRefreshCountdown(prev => {
-        if (prev <= 1) {
-          fetchDashboard();
-          return 60;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
+  // ─── Auto-refresh countdown ───────────────────────────────────────
+  // 0.6.127 — moved into <AutoRefreshCountdown> (isolated 1Hz leaf); the
+  // dashboard no longer re-renders every second.
 
   // ─── Initial fetch ────────────────────────────────────────────────────
   useEffect(() => {
@@ -981,12 +1006,16 @@ export function AdminDashboard() {
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <Activity className="h-3.5 w-3.5 text-emerald-500" />
-          <span>{t('autoRefreshIn')} {autoRefreshCountdown}s</span>
+          {/* 0.6.127 — isolated 1Hz countdown leaf (no dashboard-wide re-render) */}
+          <AutoRefreshCountdown
+            label={t('autoRefreshIn')}
+            onFire={() => { fetchDashboard(); }}
+          />
           <Button
             variant="ghost"
             size="sm"
             className="h-6 px-2 text-[10px]"
-            onClick={() => { fetchDashboard(); setAutoRefreshCountdown(60); }}
+            onClick={() => { fetchDashboard(); }}
           >
             <RefreshCw className="h-3 w-3 me-1" />
             {t('refreshNow')}

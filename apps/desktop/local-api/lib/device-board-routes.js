@@ -1392,7 +1392,13 @@ function registerDeviceBoardRoutes(app, ctx) {
       if (device) queueEventData.deviceId = device.id
       try {
         broadcast('queue:walk-in', queueEventData)
-        broadcast('kiosk:kiosk:update', {
+        // 0.6.126 — REALTIME EVENT-NAME FIX: the old 'kiosk:kiosk:update' is a
+        // typo channel NO client ever joins (use-realtime listens for
+        // 'kiosk:update', the cloud emits 'kiosk:update'). Kiosks pinned to
+        // the LAN master silently lost every push from this site and fell
+        // back to their 10s/30s polls — the "customer takes time to appear /
+        // update" report. Same payload shape as the cloud emit.
+        broadcast('kiosk:update', {
           agencyId,
           action: 'kiosk-join',
           displayNumber: reservation.displayNumber,

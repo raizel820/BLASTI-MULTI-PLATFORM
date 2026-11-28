@@ -2381,6 +2381,7 @@ const en: Record<TranslationKeys, string> = {
   itIsYourTurn: "It's Your Turn!",
   imHere: "I'm Here",
   turnAlertSubtitle: 'Your turn has been called',
+  turnAlertStop: 'Stop',
 
   // ─── Agency Dashboard Enhancement ─────────────
   nowServingHero: 'Now Serving',

@@ -10,6 +10,7 @@
  */
 
 import { apiFetch } from './api-fetch'
+import { BLASTI_LOGO_DATA_URL } from './branding-logo'
 
 export interface InvoiceRecord {
   id: string
@@ -282,9 +283,10 @@ export async function fetchLogoDataUrl(): Promise<string> {
       reader.readAsDataURL(blob)
     })
   } catch {
-    // Fallback: inline SVG wordmark — data URLs keep working inside the
-    // isolated srcDoc/print iframe where relative paths do not resolve.
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="220" height="60" viewBox="0 0 220 60"><text x="110" y="40" font-family="Arial, sans-serif" font-size="34" font-weight="800" fill="#0f766e" text-anchor="middle">BLASTI</text></svg>`
-    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+    // Fallback: the REAL bundled app logo (base64 data URL). Data URLs keep
+    // working inside the isolated srcDoc/print iframe where relative paths do
+    // not resolve — and the invoice always carries the actual brand image,
+    // never a placeholder wordmark.
+    return BLASTI_LOGO_DATA_URL
   }
 }

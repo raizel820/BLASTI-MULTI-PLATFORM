@@ -15,9 +15,17 @@ import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypt
 const ALGORITHM = 'aes-256-cbc'
 const IV_LENGTH = 16
 
+// 0.6.127 perf — the key used to be re-derived with scryptSync (a ~50ms
+// event-loop stall) on EVERY encrypt/decrypt call, so every read of an
+// encrypted system setting froze all concurrent requests. Env vars are fixed
+// at boot — derive once and reuse.
+let _cachedKey: Buffer | null = null
+
 function getKey(): Buffer {
+  if (_cachedKey) return _cachedKey
   const secret = process.env.ENCRYPTION_KEY || process.env.NEXTAUTH_SECRET || 'fallback-dev-key-not-secure'
-  return scryptSync(secret, 'blast1-salt-v1', 32)
+  _cachedKey = scryptSync(secret, 'blast1-salt-v1', 32)
+  return _cachedKey
 }
 
 /**

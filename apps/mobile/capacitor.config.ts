@@ -50,8 +50,13 @@ const config: CapacitorConfig = {
     SplashScreen: {
       // Brief static splash only — the animated intro (AppIntroAnimation in the
       // web bundle) takes over as soon as the WebView paints.
-      launchShowDuration: 400,
+      // 0.6.127 — 400ms auto-hide uncovered the (black) window background
+      // BEFORE React hydration painted anything: every cold open flashed a
+      // black rectangle between the splash and the intro. 2.5s bridges the
+      // gap to the 2.75s web intro; a 300ms fade makes the handoff seamless.
+      launchShowDuration: 2500,
       launchAutoHide: true,
+      launchFadeOutDuration: 300,
       backgroundColor: '#10b981',
       showSpinner: true,
       spinnerColor: '#ffffff',
@@ -106,7 +111,11 @@ const config: CapacitorConfig = {
     // requirement, and the checked-in built assets config already carried
     // `true` (cap sync kept regressing it from this source value).
     allowMixedContent: true,
-    backgroundColor: '#FFFFFF',
+    // 0.6.127 — brand emerald (was #FFFFFF): the WebView background shows
+    // between splash hide and first paint; matching the splash/status bar
+    // color makes open + navigation read as one continuous surface instead
+    // of flashing a white (or black) rectangle.
+    backgroundColor: '#10b981',
     buildOptions: {
       keystorePath: undefined,
       keystoreAlias: undefined,
