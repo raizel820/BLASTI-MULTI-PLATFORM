@@ -21,7 +21,7 @@ public class MainActivity extends BridgeActivity {
      *  CALL — MainActivity temporarily applies setShowWhenLocked(true) +
      *  setTurnScreenOn(true) so the call layout renders over the keyguard
      *  (the incoming-call experience), while every other launch keeps the
-     *  safe pref-driven defaults (never show over the keyguard). */
+     *  safe pref-driven defaults (never show over the lock screen). */
     private static final String EXTRA_FROM_TURN_CALL = "blastiFromTurnCall";
 
     /** True while the activity is resumed — BlastiFirebaseMessagingService
@@ -32,14 +32,20 @@ public class MainActivity extends BridgeActivity {
         return appInForeground;
     }
 
+    /** 0.6.127 APK build fix: Capacitor 8.5.x BridgeActivity declares
+     *  onResume()/onPause() as PUBLIC (BridgeActivity.java:94/104). The
+     *  previous protected overrides assigned weaker access privileges and
+     *  failed :app:compileDebugJavaWithJavac on CI ("attempting to assign
+     *  weaker access privileges; was public"). onNewIntent stays protected
+     *  (matches BridgeActivity's protected declaration). */
     @Override
-    protected void onResume() {
+    public void onResume() {
         super.onResume();
         appInForeground = true;
     }
 
     @Override
-    protected void onPause() {
+    public void onPause() {
         appInForeground = false;
         super.onPause();
     }
